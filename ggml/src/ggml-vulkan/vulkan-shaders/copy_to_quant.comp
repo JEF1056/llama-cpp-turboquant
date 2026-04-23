@@ -451,10 +451,16 @@ void main() {
     }
 
     // Pack signs: 8 elements per byte via subgroup ballot
+    // subgroupBallot returns a uvec4 (128 bits); index the correct u32 word for
+    // lanes past 32 so this works at any implementation subgroup size in [8,128].
+    // On RADV RDNA3 the default compute subgroup size is 64, so half the signs
+    // bytes come from ballot.y; using only ballot.x silently corrupts them.
     uvec4 ballot = subgroupBallot(((idx >> 2u) & 1u) != 0u);
     if (sg_lane % 8u == 0u) {
-        uint local_byte = sg_lane / 8u;
-        data_q[db].signs[t / 8u] = uint8_t((ballot.x >> (local_byte * 8u)) & 0xFFu);
+        uint local_byte  = sg_lane / 8u;            // 0 .. subgroup_size/8 - 1
+        uint word        = local_byte >> 2u;        // which uvec4 component
+        uint bit_offset  = (local_byte & 3u) * 8u;  // byte offset within that u32
+        data_q[db].signs[t / 8u] = uint8_t((ballot[word] >> bit_offset) & 0xFFu);
     }
 
     // Step 7: reconstruction norm via subgroup reduction
