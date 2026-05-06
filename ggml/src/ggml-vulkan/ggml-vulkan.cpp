@@ -122,13 +122,15 @@ static bool is_pow2(uint32_t x) {
 
 #define GGML_VK_MAX_NODES 8192
 
-#define VK_CHECK(err, msg)                                                                                             \
-    do {                                                                                                               \
-        vk::Result err_ = (err);                                                                                       \
-        if (err_ != vk::Result::eSuccess) {                                                                            \
-            fprintf(stderr, "ggml_vulkan: %s error %s at %s:%d\n", #err, to_string(err_).c_str(), __FILE__, __LINE__); \
-            exit(1);                                                                                                   \
-        }                                                                                                              \
+#define VK_CHECK(err, msg)                                          \
+    do {                                                            \
+        vk::Result err_ = (err);                                    \
+        if (err_ != vk::Result::eSuccess) {                         \
+            fprintf(stderr, "ggml_vulkan: %s error %s at %s:%d\n",  \
+                #err, to_string(err_).c_str(), __FILE__, __LINE__); \
+            exit(1);                                                \
+        }                                                           \
+    } while (0)
     } while (0)
 
 #ifdef GGML_VULKAN_DEBUG
