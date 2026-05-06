@@ -1625,7 +1625,8 @@ struct vk_op_gated_delta_net_push_constants {
     uint32_t sv1, sv2, sv3;
     uint32_t sb1, sb2, sb3;
     uint32_t neq1, rq3;
-    float    scale;
+    float scale;
+    uint32_t keep_intermediates;
 };
 
 struct vk_op_ssm_scan_push_constants {
@@ -13031,22 +13032,30 @@ static void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context & 
         src_buf[i] = ggml_vk_tensor_subbuffer(ctx, dst->src[i]);
     }
 
-    const uint32_t sq1 = (uint32_t) (src_q->nb[1] / sizeof(float));
-    const uint32_t sq2 = (uint32_t) (src_q->nb[2] / sizeof(float));
-    const uint32_t sq3 = (uint32_t) (src_q->nb[3] / sizeof(float));
-    const uint32_t sv1 = (uint32_t) (src_v->nb[1] / sizeof(float));
-    const uint32_t sv2 = (uint32_t) (src_v->nb[2] / sizeof(float));
-    const uint32_t sv3 = (uint32_t) (src_v->nb[3] / sizeof(float));
-    const uint32_t sb1 = (uint32_t) (src_beta->nb[1] / sizeof(float));
-    const uint32_t sb2 = (uint32_t) (src_beta->nb[2] / sizeof(float));
-    const uint32_t sb3 = (uint32_t) (src_beta->nb[3] / sizeof(float));
+    const uint32_t sq1 = (uint32_t)(src_q->nb[1] / sizeof(float));
+    const uint32_t sq2 = (uint32_t)(src_q->nb[2] / sizeof(float));
+    const uint32_t sq3 = (uint32_t)(src_q->nb[3] / sizeof(float));
+    const uint32_t sv1 = (uint32_t)(src_v->nb[1] / sizeof(float));
+    const uint32_t sv2 = (uint32_t)(src_v->nb[2] / sizeof(float));
+    const uint32_t sv3 = (uint32_t)(src_v->nb[3] / sizeof(float));
+    const uint32_t sb1 = (uint32_t)(src_beta->nb[1] / sizeof(float));
+    const uint32_t sb2 = (uint32_t)(src_beta->nb[2] / sizeof(float));
+    const uint32_t sb3 = (uint32_t)(src_beta->nb[3] / sizeof(float));
 
-    const uint32_t neq1 = (uint32_t) src_q->ne[1];
-    const uint32_t rq3  = (uint32_t) (src_v->ne[3] / src_q->ne[3]);
+    const uint32_t neq1 = (uint32_t)src_q->ne[1];
+    const uint32_t rq3  = (uint32_t)(src_v->ne[3] / src_q->ne[3]);
 
-    const float                                scale = 1.0f / sqrtf((float) S_v);
-    const vk_op_gated_delta_net_push_constants pc    = { H,   n_tokens, n_seqs, s_off, sq1, sq2,  sq3, sv1,
-                                                         sv2, sv3,      sb1,    sb2,   sb3, neq1, rq3, scale };
+    const float scale = 1.0f / sqrtf((float)S_v);
+    const uint32_t keep_intermediates = (uint32_t)(ggml_get_op_params_i32(dst, 0) != 0);
+    const vk_op_gated_delta_net_push_constants pc = {
+        H, n_tokens, n_seqs, s_off,
+        sq1, sq2, sq3,
+        sv1, sv2, sv3,
+        sb1, sb2, sb3,
+        neq1, rq3,
+        scale,
+        keep_intermediates
+    };
 
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
                               { src_buf[0], src_buf[1], src_buf[2], src_buf[3], src_buf[4], src_buf[5], dst_buf }, pc,
@@ -19748,8 +19757,9 @@ static void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph *
             tensor_clone = ggml_rwkv_wkv7(ggml_ctx, src_clone[0], src_clone[1], src_clone[2], src_clone[3],
                                           src_clone[4], src_clone[5], src_clone[6]);
         } else if (tensor->op == GGML_OP_GATED_DELTA_NET) {
-            tensor_clone = ggml_gated_delta_net(ggml_ctx, src_clone[0], src_clone[1], src_clone[2], src_clone[3],
-                                                src_clone[4], src_clone[5]);
+            const bool keep_intermediates = (((const int32_t *) tensor->op_params)[0] != 0);
+            tensor_clone = ggml_gated_delta_net(ggml_ctx, src_clone[0], src_clone[1],
+            src_clone[2], src_clone[3], src_clone[4], src_clone[5], keep_intermediates);
         } else if (tensor->op == GGML_OP_OPT_STEP_ADAMW) {
             src_clone[0]->flags = tensor->src[0]->flags;
             tensor_clone =
