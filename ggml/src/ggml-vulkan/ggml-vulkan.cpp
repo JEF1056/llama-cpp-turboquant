@@ -131,7 +131,6 @@ static bool is_pow2(uint32_t x) {
             exit(1);                                                \
         }                                                           \
     } while (0)
-    } while (0)
 
 #ifdef GGML_VULKAN_DEBUG
 #    define VK_LOG_DEBUG(msg) std::cerr << msg << std::endl
@@ -5964,11 +5963,21 @@ static void ggml_vk_load_shaders(vk_device & device) {
                             cpy_f32_iq4_nl_len, cpy_f32_iq4_nl_data, "main", 2, sizeof(vk_op_unary_push_constants),
                             { 32, 1, 1 }, {}, 1);
 
-    SET_ROWS(_i32)
-    SET_ROWS(_i64)
-#undef SET_ROWS
-
-    ggml_vk_create_pipeline(device, device->pipeline_cpy_quant_f32[GGML_TYPE_Q1_0], "cpy_q1_0_f32", cpy_q1_0_f32_len,
+#define SET_ROWS(itype) \
+        ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [GGML_TYPE_F32],      "set_rows_f32" #itype,      set_rows_f32 ## itype ## _len,      set_rows_f32 ## itype ## _data,      "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {1}, 1, true); \
+        ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [GGML_TYPE_F16],      "set_rows_f16" #itype,      set_rows_f16 ## itype ## _len,      set_rows_f16 ## itype ## _data,      "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {1}, 1, true); \
+        ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [GGML_TYPE_BF16],     "set_rows_bf16" #itype,     set_rows_bf16 ## itype ## _len,     set_rows_bf16 ## itype ## _data,     "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {1}, 1, true); \
+        ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [GGML_TYPE_Q1_0],     "set_rows_q1_0" #itype,     set_rows_q1_0 ## itype ## _len,     set_rows_q1_0 ## itype ## _data,     "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {1}, 1, true); \
+        ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [GGML_TYPE_Q4_0],     "set_rows_q4_0" #itype,     set_rows_q4_0 ## itype ## _len,     set_rows_q4_0 ## itype ## _data,     "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {1}, 1, true); \
+        ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [GGML_TYPE_Q4_1],     "set_rows_q4_1" #itype,     set_rows_q4_1 ## itype ## _len,     set_rows_q4_1 ## itype ## _data,     "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {1}, 1, true); \
+        ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [GGML_TYPE_Q5_0],     "set_rows_q5_0" #itype,     set_rows_q5_0 ## itype ## _len,     set_rows_q5_0 ## itype ## _data,     "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {1}, 1, true); \
+        ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [GGML_TYPE_Q5_1],     "set_rows_q5_1" #itype,     set_rows_q5_1 ## itype ## _len,     set_rows_q5_1 ## itype ## _data,     "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {1}, 1, true); \
+        ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [GGML_TYPE_Q8_0],     "set_rows_q8_0" #itype,     set_rows_q8_0 ## itype ## _len,     set_rows_q8_0 ## itype ## _data,     "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {1}, 1, true); \
+        ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [GGML_TYPE_IQ4_NL],   "set_rows_iq4_nl" #itype,   set_rows_iq4_nl ## itype ## _len,   set_rows_iq4_nl ## itype ## _data,   "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {1}, 1, true); \
+        ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [GGML_TYPE_TURBO2_0], "set_rows_turbo2_0" #itype, set_rows_turbo2_0 ## itype ## _len, set_rows_turbo2_0 ## itype ## _data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {1}, 1, true); \
+        ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [GGML_TYPE_TURBO3_0], "set_rows_turbo3_0" #itype, set_rows_turbo3_0 ## itype ## _len, set_rows_turbo3_0 ## itype ## _data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {1}, 1, true); \
+        ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [GGML_TYPE_TURBO4_0], "set_rows_turbo4_0" #itype, set_rows_turbo4_0 ## itype ## _len, set_rows_turbo4_0 ## itype ## _data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {1}, 1, true); \
+        ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [GGML_TYPE_TQ4_1S],   "set_rows_tq4_1s" #itype,   set_rows_tq4_1s ## itype ## _len,   set_rows_tq4_1s ## itype ## _data,   "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {1}, 1, true);
 
     SET_ROWS(_i32)
     SET_ROWS(_i64)
@@ -12253,6 +12262,7 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx,
                            ggml_tensor *             dst,
                            ggml_op                   op,
                            PC &&                     pc) {
+    (void)subctx;
     VK_LOG_DEBUG(
         "ggml_vk_op_f32((" << src0 << ", name=" << src0->name << ", type=" << src0->type << ", ne0=" << src0->ne[0]
                            << ", ne1=" << src0->ne[1] << ", ne2=" << src0->ne[2] << ", ne3=" << src0->ne[3]
@@ -12321,6 +12331,8 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx,
 
     std::array<uint32_t, 3> elements;
 
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wswitch"
     switch (op) {
         case GGML_OP_NORM:
         case GGML_OP_RMS_NORM_BACK:
@@ -12466,136 +12478,6 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx,
                 elements = { ne, 1, 1 };
             }
             break;
-            }
-            break;
-        case GGML_OP_TIMESTEP_EMBEDDING:
-            {
-                const uint32_t dim       = dst->op_params[0];
-                uint32_t       half_ceil = (dim + 1) / 2;
-                elements                 = { half_ceil, (uint32_t) src0->ne[0], 1 };
-            }
-            break;
-        case GGML_OP_CONV_TRANSPOSE_1D:
-            {
-                elements = { uint32_t(src0->ne[1]), 1, 1 };  // parallelize in {Cout, 1, 1}
-            }
-            break;
-        case GGML_OP_POOL_2D:
-            {
-                const uint32_t N  = dst->ne[3];
-                const uint32_t OC = dst->ne[2];
-                const uint32_t OH = dst->ne[1];
-                const uint32_t OW = dst->ne[0];
-                elements          = { N * OC * OH * OW, 1, 1 };
-            }
-            break;
-        case GGML_OP_CONV_2D:
-        case GGML_OP_CONV_TRANSPOSE_2D:
-            if constexpr (std::is_same_v<PC, vk_op_conv2d_push_constants>) {
-                const uint32_t       NPQ        = pc.N * pc.OH * pc.OW;
-                const vk_conv_shapes shape      = ggml_vk_conv_select_shape(ctx, pc.Cout, NPQ);
-                const uint32_t       NPQ_blocks = CEIL_DIV(NPQ, vk_conv_block_sizes[shape].NPQ);
-
-                elements = { pc.Cout, NPQ_blocks, 1 };
-                if (elements[1] > 512) {
-                    elements[2] = CEIL_DIV(elements[1], 512);
-                    elements[1] = 512;
-                }
-            } else {
-                GGML_ABORT("invalid push constant type for CONV_2D");
-            }
-            break;
-        case GGML_OP_ADD:
-        case GGML_OP_SUB:
-        case GGML_OP_DIV:
-        case GGML_OP_MUL:
-        case GGML_OP_ADD1:
-        case GGML_OP_ARANGE:
-        case GGML_OP_FILL:
-        case GGML_OP_SCALE:
-        case GGML_OP_SQR:
-        case GGML_OP_SQRT:
-        case GGML_OP_SIN:
-        case GGML_OP_COS:
-        case GGML_OP_LOG:
-        case GGML_OP_TRI:
-        case GGML_OP_DIAG:
-        case GGML_OP_CLAMP:
-        case GGML_OP_PAD:
-        case GGML_OP_ROLL:
-        case GGML_OP_REPEAT:
-        case GGML_OP_REPEAT_BACK:
-        case GGML_OP_CPY:
-        case GGML_OP_CONCAT:
-        case GGML_OP_UPSCALE:
-        case GGML_OP_UNARY:
-        case GGML_OP_GLU:
-        case GGML_OP_CONV_2D_DW:
-            {
-                uint32_t ne = ggml_nelements(dst);
-                if (op == GGML_OP_CPY && ggml_is_quantized(src0->type) && ggml_is_quantized(dst->type)) {
-                    // Convert from number of logical elements to 2- or 4-byte units.
-                    ne /= ggml_blck_size(src0->type);
-                    if ((ggml_type_size(src0->type) % 4) == 0) {
-                        ne *= ggml_type_size(src0->type) / 4;
-                    } else {
-                        ne *= ggml_type_size(src0->type) / 2;
-                    }
-                }
-                // copy_to_quant has block size of 32, and each thread does QUANT_K elements.
-                // Splitting into 512x512xZ wouldn't work well since each workgroup does 1024 elements.
-                // So divide by block size here before splitting into 512x512 groups.
-                if (op == GGML_OP_CPY && !ggml_is_quantized(src0->type) && ggml_is_quantized(dst->type)) {
-                    ne = CEIL_DIV(ne, ggml_blck_size(dst->type));
-                }
-                if (ne > 262144) {
-                    elements = { 512, 512, CEIL_DIV(ne, 262144) };
-                } else if (ne > 512) {
-                    elements = { 512, CEIL_DIV(ne, 512), 1 };
-                } else {
-                    elements = { ne, 1, 1 };
-                }
-
-                if (pipeline == ctx->device->pipeline_cpy_transpose_32 ||
-                    pipeline == ctx->device->pipeline_cpy_transpose_16) {
-                    // 32x32 tiles
-                    elements[0] = (uint32_t) CEIL_DIV(dst->ne[0], 32);
-                    elements[1] = (uint32_t) CEIL_DIV(dst->ne[1], 32);
-                    elements[2] = (uint32_t) (dst->ne[2] * dst->ne[3]);
-                    elements[0] = std::min(elements[0], ctx->device->properties.limits.maxComputeWorkGroupCount[0]);
-                    elements[1] = std::min(elements[1], ctx->device->properties.limits.maxComputeWorkGroupCount[1]);
-                    elements[2] = std::min(elements[2], ctx->device->properties.limits.maxComputeWorkGroupCount[2]);
-                }
-            }
-            break;
-        case GGML_OP_ADD_ID:
-            {
-                elements = { (uint32_t) ne01, (uint32_t) ne02, 1 };
-            }
-            break;
-        case GGML_OP_SET_ROWS:
-            {
-                uint32_t ne = ggml_nelements(src0);
-                if (dst->type == GGML_TYPE_TURBO3_0) {
-                    ne = ne / 128;
-                } else if (dst->type == GGML_TYPE_TQ4_1S) {
-                    ne = ne / 32;
-                } else if (ggml_is_quantized(dst->type)) {
-                    // quants run 32 threads each doing QUANT_K elements
-                    ne = CEIL_DIV(ne, 32 * ggml_blck_size(dst->type));
-                } else {
-                    // scalar types do one element per thread, running 512 threads
-                    ne = CEIL_DIV(ne, 512);
-                }
-                if (ne > 262144) {
-                    elements = { 512, 512, CEIL_DIV(ne, 262144) };
-                } else if (ne > 512) {
-                    elements = { 512, CEIL_DIV(ne, 512), 1 };
-                } else {
-                    elements = { ne, 1, 1 };
-                }
-            }
-            break;
         case GGML_OP_SSM_CONV:
             {
                 const uint32_t nr  = src0->ne[1];
@@ -12608,6 +12490,7 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx,
             elements = { (uint32_t) ggml_nelements(src0), 1, 1 };
             break;
     }
+#pragma GCC diagnostic pop
 
     if (op == GGML_OP_ADD || op == GGML_OP_RMS_NORM) {
         vk_subbuffer a_buf = src0_buf;
