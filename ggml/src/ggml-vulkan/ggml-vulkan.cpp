@@ -12479,6 +12479,106 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx,
                 elements = { ne, 1, 1 };
             }
             break;
+        case GGML_OP_TIMESTEP_EMBEDDING:
+            {
+                const uint32_t dim       = dst->op_params[0];
+                uint32_t       half_ceil = (dim + 1) / 2;
+                elements                 = { half_ceil, (uint32_t) src0->ne[0], 1 };
+            }
+            break;
+        case GGML_OP_CONV_TRANSPOSE_1D:
+            {
+                elements = { uint32_t(src0->ne[1]), 1, 1 };  // parallelize in {Cout, 1, 1}
+            }
+            break;
+        case GGML_OP_POOL_2D:
+            {
+                const uint32_t N  = dst->ne[3];
+                const uint32_t OC = dst->ne[2];
+                const uint32_t OH = dst->ne[1];
+                const uint32_t OW = dst->ne[0];
+                elements          = { N * OC * OH * OW, 1, 1 };
+            }
+            break;
+        case GGML_OP_CONV_2D:
+        case GGML_OP_CONV_TRANSPOSE_2D:
+            if constexpr (std::is_same_v<PC, vk_op_conv2d_push_constants>) {
+                const uint32_t       NPQ        = pc.N * pc.OH * pc.OW;
+                const vk_conv_shapes shape      = ggml_vk_conv_select_shape(ctx, pc.Cout, NPQ);
+                const uint32_t       NPQ_blocks = CEIL_DIV(NPQ, vk_conv_block_sizes[shape].NPQ);
+
+                elements = { pc.Cout, NPQ_blocks, 1 };
+                if (elements[1] > 512) {
+                    elements[2] = CEIL_DIV(elements[1], 512);
+                    elements[1] = 512;
+                }
+            } else {
+                GGML_ABORT("invalid push constant type for CONV_2D");
+            }
+            break;
+        case GGML_OP_ADD:
+        case GGML_OP_SUB:
+        case GGML_OP_DIV:
+        case GGML_OP_MUL:
+        case GGML_OP_ADD1:
+        case GGML_OP_ARANGE:
+        case GGML_OP_FILL:
+        case GGML_OP_SCALE:
+        case GGML_OP_SQR:
+        case GGML_OP_SQRT:
+        case GGML_OP_SIN:
+        case GGML_OP_COS:
+        case GGML_OP_LOG:
+        case GGML_OP_TRI:
+        case GGML_OP_DIAG:
+        case GGML_OP_CLAMP:
+        case GGML_OP_PAD:
+        case GGML_OP_ROLL:
+        case GGML_OP_REPEAT:
+        case GGML_OP_REPEAT_BACK:
+        case GGML_OP_CPY:
+        case GGML_OP_CONCAT:
+        case GGML_OP_UPSCALE:
+        case GGML_OP_UNARY:
+        case GGML_OP_GLU:
+        case GGML_OP_CONV_2D_DW:
+            {
+                uint32_t ne = ggml_nelements(dst);
+                if (op == GGML_OP_CPY && ggml_is_quantized(src0->type) && ggml_is_quantized(dst->type)) {
+                    // Convert from number of logical elements to 2- or 4-byte units.
+                    ne /= ggml_blck_size(src0->type);
+                    if ((ggml_type_size(src0->type) % 4) == 0) {
+                        ne *= ggml_type_size(src0->type) / 4;
+                    } else {
+                        ne *= ggml_type_size(src0->type) / 2;
+                    }
+                }
+                // copy_to_quant has block size of 32, and each thread does QUANT_K elements.
+                // Splitting into 512x512xZ wouldn't work well since each workgroup does 1024 elements.
+                // So divide by block size here before splitting into 512x512 groups.
+                if (op == GGML_OP_CPY && !ggml_is_quantized(src0->type) && ggml_is_quantized(dst->type)) {
+                    ne = CEIL_DIV(ne, ggml_blck_size(dst->type));
+                }
+                if (ne > 262144) {
+                    elements = { 512, 512, CEIL_DIV(ne, 262144) };
+                } else if (ne > 512) {
+                    elements = { 512, CEIL_DIV(ne, 512), 1 };
+                } else {
+                    elements = { ne, 1, 1 };
+                }
+
+                if (pipeline == ctx->device->pipeline_cpy_transpose_32 ||
+                    pipeline == ctx->device->pipeline_cpy_transpose_16) {
+                    // 32x32 tiles
+                    elements[0] = (uint32_t) CEIL_DIV(dst->ne[0], 32);
+                    elements[1] = (uint32_t) CEIL_DIV(dst->ne[1], 32);
+                    elements[2] = (uint32_t) (dst->ne[2] * dst->ne[3]);
+                    elements[0] = std::min(elements[0], ctx->device->properties.limits.maxComputeWorkGroupCount[0]);
+                    elements[1] = std::min(elements[1], ctx->device->properties.limits.maxComputeWorkGroupCount[1]);
+                    elements[2] = std::min(elements[2], ctx->device->properties.limits.maxComputeWorkGroupCount[2]);
+                }
+            }
+            break;
         case GGML_OP_SSM_CONV:
             {
                 const uint32_t nr  = src0->ne[1];
