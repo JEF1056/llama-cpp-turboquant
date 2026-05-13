@@ -3435,6 +3435,13 @@ void llama_context::handle_mtp_for_ubatch(
     if (n_tokens == 0 || t == nullptr) {
         return;
     }
+    if (tokens == nullptr) {
+        // Image-embedding batches have tokens==nullptr (no token IDs, only float embeddings).
+        // Reset pending state so the MTP KV-cache doesn't try to continue from a position
+        // that was never fed to ctx_mtp (image patches are never decoded by ctx_mtp).
+        mtp.pending_pos = -1;
+        return;
+    }
     if (t->ne[1] != (int64_t) n_tokens) {
         return;
     }

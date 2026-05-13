@@ -892,6 +892,12 @@ private:
             }
             SRV_INF("loaded multimodal model, '%s'\n", mmproj_path.c_str());
 
+            if (params_base.speculative.has_mtp()) {
+                SRV_ERR("%s\n", "MTP speculative decoding (--spec-type mtp) cannot be used with "
+                                "--mmproj. Disable one or the other.");
+                return false;
+            }
+
             if (params_base.ctx_shift) {
                 params_base.ctx_shift = false;
                 SRV_WRN("%s\n", "ctx_shift is not supported by multimodal, it will be disabled");
