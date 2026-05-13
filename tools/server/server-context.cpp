@@ -893,9 +893,8 @@ private:
             SRV_INF("loaded multimodal model, '%s'\n", mmproj_path.c_str());
 
             if (params_base.speculative.has_mtp()) {
-                SRV_ERR("%s\n", "MTP speculative decoding (--spec-type mtp) cannot be used with "
-                                "--mmproj. Disable one or the other.");
-                return false;
+                SRV_INF("%s\n", "MTP speculative decoding active with multimodal — "
+                                "MTP will pause during image/audio processing and resume for text tokens");
             }
 
             if (params_base.ctx_shift) {
