@@ -5524,6 +5524,13 @@ class _Qwen35MtpMixin:
         if (n := self.hparams.get("mtp_num_hidden_layers", 0)) > 0:
             self.gguf_writer.add_nextn_predict_layers(n)
 
+    @classmethod
+    def filter_tensors(cls, item: tuple[str, Callable[[], Tensor]]) -> tuple[str, Callable[[], Tensor]] | None:
+        name, gen = item
+        if name.startswith("mtp."):
+            return name, gen
+        return super().filter_tensors(item)  # ty: ignore[unresolved-attribute]
+
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
         # Multimodal Qwen3.5/3.6 wrap the text model under `model.language_model.*`.
         if name.startswith("model.language_model."):
