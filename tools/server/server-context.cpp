@@ -778,14 +778,9 @@ private:
                 return false;
             }
 
-            if (params_base.n_parallel > 1) {
-                SRV_ERR("MTP currently supports only n_parallel=1; got %d\n", params_base.n_parallel);
-                return false;
-            }
-
             auto cparams_mtp = common_context_params_to_llama(params_base);
-            cparams_mtp.n_ctx     = llama_n_ctx_seq(ctx_tgt);
-            cparams_mtp.n_seq_max = 1;
+            cparams_mtp.n_ctx     = llama_n_ctx(ctx_tgt);
+            cparams_mtp.n_seq_max = params_base.n_parallel;
             cparams_mtp.n_rs_seq = 0;
 
             params_base.speculative.mtp.model   = model_mtp.get();

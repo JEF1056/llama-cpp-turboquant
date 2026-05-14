@@ -403,13 +403,11 @@ struct common_speculative_impl_mtp : public common_speculative_impl {
             smpl = common_sampler_init(model_mtp, sparams);
         }
 
-        // TODO: multiple seq support
         batch = llama_batch_init(/*n_tokens=*/ 1, /*embd=*/ n_embd, /*n_seq_max=*/ 1);
         batch.token = (llama_token *) malloc(sizeof(llama_token));
-        batch.n_tokens     = 1;
-        batch.n_seq_id[0]  = 1;
-        batch.seq_id[0][0] = 0;
-        batch.logits[0]    = 1;
+        batch.n_tokens    = 1;
+        batch.n_seq_id[0] = 1;
+        batch.logits[0]   = 1;
 
         llama_set_mtp(ctx_tgt, ctx_mtp);
 
@@ -483,6 +481,8 @@ struct common_speculative_impl_mtp : public common_speculative_impl {
         const int32_t cfg_n_max = std::max(1, draft_params.n_max);
         const int32_t n_max     = (dp.n_max > 0) ? std::min(dp.n_max, cfg_n_max) : cfg_n_max;
         const size_t  row_bytes = (size_t) n_embd * sizeof(float);
+
+        batch.seq_id[0][0] = seq_id;
 
         llama_token cond_tok = dp.id_last;
         llama_pos   pos      = llama_memory_seq_pos_max(llama_get_memory(ctx_mtp), seq_id) + 1;
