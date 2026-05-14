@@ -365,22 +365,33 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
     }
 };
 
-struct common_speculative_state_mtp : public common_speculative_state {
+struct common_speculative_impl_mtp : public common_speculative_impl {
+    common_params_speculative_draft draft_params;
+
     llama_context * ctx_tgt = nullptr;
     llama_context * ctx_mtp = nullptr;
 
-    llama_batch       batch;       // single token draft step
+    llama_batch       batch;
     common_sampler  * smpl = nullptr;
     int32_t           n_embd = 0;
 
-    uint16_t last_n_drafted  = 0;
-    int32_t  last_n_accepted = -1;
+    struct seq_state {
+        uint16_t last_n_drafted  = 0;
+        int32_t  last_n_accepted = -1;
+    };
+    std::vector<seq_state> seq_states;
 
-    common_speculative_state_mtp(enum common_speculative_type type,
-                                 llama_context * ctx_tgt,
-                                 llama_context * ctx_mtp)
-        : common_speculative_state(type), ctx_tgt(ctx_tgt), ctx_mtp(ctx_mtp) {
-        GGML_ASSERT(ctx_tgt && ctx_mtp);
+    common_speculative_impl_mtp(const common_params_speculative & params, uint32_t n_seq)
+        : common_speculative_impl(COMMON_SPECULATIVE_TYPE_MTP, n_seq)
+        , draft_params(params.draft)
+        , ctx_tgt(params.draft.ctx_tgt)
+    {
+        GGML_ASSERT(ctx_tgt);
+        GGML_ASSERT(params.mtp.model);
+
+        ctx_mtp = llama_init_from_model(params.mtp.model, params.mtp.cparams);
+        GGML_ASSERT(ctx_mtp);
+
         const llama_model * model_mtp = llama_get_model(ctx_mtp);
         n_embd = llama_model_n_embd(model_mtp);
 
@@ -401,10 +412,14 @@ struct common_speculative_state_mtp : public common_speculative_state {
         batch.logits[0]    = 1;
 
         llama_set_mtp(ctx_tgt, ctx_mtp);
+
+        seq_states.resize(n_seq);
     }
 
-    ~common_speculative_state_mtp() override {
+    ~common_speculative_impl_mtp() override {
         llama_set_mtp(ctx_tgt, nullptr);
+        free(batch.token);
+        batch.token = nullptr;
         llama_batch_free(batch);
         common_sampler_free(smpl);
         if (ctx_mtp) {
@@ -412,15 +427,17 @@ struct common_speculative_state_mtp : public common_speculative_state {
         }
     }
 
-    void begin(const llama_tokens & prompt) override {
-        last_n_accepted = -1;
-        last_n_drafted  = 0;
+    void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
+        GGML_ASSERT(seq_id < (llama_seq_id) seq_states.size());
+        auto & ss = seq_states[seq_id];
+        ss.last_n_accepted = -1;
+        ss.last_n_drafted  = 0;
 
         const int32_t N = (int32_t) prompt.size();
         if (N <= 0) {
             return;
         }
-        const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_mtp), 0);
+        const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_mtp), seq_id);
         if (pos_max < N - 1) {
             LOG_WRN("%s: ctx_mtp pos_max=%d < N-1=%d — "
                     "streaming hook may not be registered or not all prefill rows "
@@ -429,34 +446,46 @@ struct common_speculative_state_mtp : public common_speculative_state {
         }
     }
 
-    void draft(
-            const common_params_speculative & params,
-            const llama_tokens & prompt_tgt,
-            llama_token id_last,
-            llama_tokens & draft_tokens) override {
-        GGML_UNUSED(prompt_tgt);
+    bool process(const llama_batch & /*batch*/) override {
+        return true;
+    }
+
+    void draft(common_speculative_draft_params_vec & dparams) override {
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+            auto & dp = dparams[seq_id];
+            if (!dp.drafting) {
+                continue;
+            }
+            draft_one(seq_id, dp);
+        }
+    }
+
+    void draft_one(llama_seq_id seq_id, common_speculative_draft_params & dp) {
+        GGML_ASSERT(seq_id < (llama_seq_id) seq_states.size());
+        auto & ss = seq_states[seq_id];
+        auto & draft_tokens = *dp.result;
         draft_tokens.clear();
 
-        // accept with no-accepts (i.e. 0 accepts) returns early, but we still need to remove from the MTP kv-cache
-        // TODO: check if bug in other spec states
-        if (last_n_drafted > 0) {
-            const int32_t n_to_drop = (int32_t) last_n_drafted - 1;
+        // accept with no-accepts returns early, but we still need to remove from the MTP kv-cache
+        if (ss.last_n_drafted > 0) {
+            const int32_t n_to_drop = (int32_t) ss.last_n_drafted - 1;
             if (n_to_drop > 0) {
-                const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_mtp), 0);
+                const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_mtp), seq_id);
                 if (pos_max >= 0) {
                     const llama_pos drop_from = pos_max - n_to_drop + 1;
-                    llama_memory_seq_rm(llama_get_memory(ctx_mtp), 0, drop_from, -1);
+                    llama_memory_seq_rm(llama_get_memory(ctx_mtp), seq_id, drop_from, -1);
                 }
             }
-            last_n_drafted  = 0;
-            last_n_accepted = 0;
+            ss.last_n_drafted  = 0;
+            ss.last_n_accepted = 0;
         }
 
-        const int32_t n_max     = std::max(1, params.draft.n_max);
+        const int32_t cfg_n_max = std::max(1, draft_params.n_max);
+        const int32_t n_max     = (dp.n_max > 0) ? std::min(dp.n_max, cfg_n_max) : cfg_n_max;
         const size_t  row_bytes = (size_t) n_embd * sizeof(float);
 
-        llama_token cond_tok = id_last;
-        llama_pos   pos      = llama_memory_seq_pos_max(llama_get_memory(ctx_mtp), 0) + 1;
+        llama_token cond_tok = dp.id_last;
+        llama_pos   pos      = llama_memory_seq_pos_max(llama_get_memory(ctx_mtp), seq_id) + 1;
 
         // auto-regressive loop for MTP
         for (int32_t k = 0; k < n_max; ++k) {
@@ -464,12 +493,12 @@ struct common_speculative_state_mtp : public common_speculative_state {
             int32_t       src_row;
             if (k == 0) {
                 src = llama_context_get_t_h_pre_norm(ctx_tgt);
-                if (last_n_accepted < 0) {
+                if (ss.last_n_accepted < 0) {
                     // First draft after begin(): trunk's most recent decode is
                     // the last prefill ubatch; its last row is h_{N-1}.
                     src_row = (src && src->ne[1] > 0) ? (int32_t) src->ne[1] - 1 : 0;
                 } else {
-                    src_row = last_n_accepted;
+                    src_row = ss.last_n_accepted;
                 }
                 llama_synchronize(ctx_tgt);
             } else {
@@ -501,32 +530,30 @@ struct common_speculative_state_mtp : public common_speculative_state {
             ++pos;
         }
 
-        last_n_drafted = (uint16_t) draft_tokens.size();
+        ss.last_n_drafted = (uint16_t) draft_tokens.size();
+
+        if (draft_tokens.size() < (size_t) std::max(1, draft_params.n_min)) {
+            draft_tokens.clear();
+        }
     }
 
-    void accept(uint16_t n_accepted) override {
-        const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_mtp), 0);
-        const int32_t n_drafted_last = (int32_t) last_n_drafted;
+    void accept(llama_seq_id seq_id, uint16_t n_accepted) override {
+        GGML_ASSERT(seq_id < (llama_seq_id) seq_states.size());
+        auto & ss = seq_states[seq_id];
+        const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_mtp), seq_id);
+        const int32_t n_drafted_last = (int32_t) ss.last_n_drafted;
         const int32_t n_to_drop = std::max(0, n_drafted_last - (int32_t) n_accepted - 1);
         if (pos_max < 0) {
-            last_n_accepted = (int32_t) n_accepted;
+            ss.last_n_accepted = (int32_t) n_accepted;
             return;
         }
         if (n_to_drop > 0) {
             const llama_pos drop_from = pos_max - n_to_drop + 1;
-            llama_memory_seq_rm(llama_get_memory(ctx_mtp), /*seq_id=*/ 0,
+            llama_memory_seq_rm(llama_get_memory(ctx_mtp), seq_id,
                                 /*p0=*/ drop_from, /*p1=*/ -1);
         }
-        last_n_drafted = 0;
-        last_n_accepted = (int32_t) n_accepted;
-    }
-
-    int32_t n_max(const common_params_speculative & params) const override {
-        return std::max(1, params.draft.n_max);
-    }
-
-    int32_t n_min(const common_params_speculative & params) const override {
-        return std::max(1, params.draft.n_min);
+        ss.last_n_drafted = 0;
+        ss.last_n_accepted = (int32_t) n_accepted;
     }
 };
 
@@ -1111,8 +1138,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
                 break;
             }
             case COMMON_SPECULATIVE_TYPE_MTP: {
-                impls.push_back(std::make_unique<common_speculative_state_mtp>(
-                    config.type, ctx_tgt, ctx_mtp));
+                impls.push_back(std::make_unique<common_speculative_impl_mtp>(config.params, n_seq));
                 break;
             }
             case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE: {
