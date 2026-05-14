@@ -2225,8 +2225,7 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
                 GGML_ABORT("unsupported ne11");
         };
 
-        auto pipeline =
-            ggml_metal_library_get_pipeline_mul_mv_ext(lib, op->src[0]->type, op->src[1]->type, nsg, nxpsg, r1ptg);
+        auto pipeline = ggml_metal_library_get_pipeline_mul_mv_ext(lib, op, nsg, nxpsg, r1ptg);
 
         ggml_metal_kargs_mul_mv_ext args = {
             /*.ne00  =*/ne00,
@@ -2309,10 +2308,14 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
             ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op->src[1]), 2);
             ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op), 3);
 
-            const size_t smem = pipeline_mm.smem;
-            ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
-            ggml_metal_encoder_dispatch_threadgroups(enc, ((ne11 + 31) / 32), ((ne01 + 63) / 64), ne12 * ne13, 128, 1,
-                                                     1);
+            const size_t smem_mm = pipeline_mm.smem;
+            ggml_metal_encoder_set_threadgroup_memory_size(enc, smem_mm, 0);
+
+            const int nr0_mm = pipeline_mm.nr0;
+            const int nr1_mm = pipeline_mm.nr1;
+            const int nsg_mm = pipeline_mm.nsg;
+
+            ggml_metal_encoder_dispatch_threadgroups(enc, ((ne11 + nr1_mm - 1) / nr1_mm), ((ne01 + nr0_mm - 1) / nr0_mm), ne12 * ne13, 32, nsg_mm, 1);
 
             // Memory barrier between matmul and unrotate
             ggml_metal_op_concurrency_reset(ctx);
@@ -2362,8 +2365,7 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
             const int nr1 = pipeline.nr1;
             const int nsg = pipeline.nsg;
 
-            ggml_metal_encoder_dispatch_threadgroups(enc, ((ne11 + nr1 - 1) / nr1), ((ne01 + nr0 - 1) / nr0),
-                                                     ne12 * ne13, 32, nsg, 1);
+            ggml_metal_encoder_dispatch_threadgroups(enc, ((ne11 + nr1 - 1) / nr1), ((ne01 + nr0 - 1) / nr0), ne12 * ne13, 32, nsg, 1);
         }
     } else {
         auto pipeline = ggml_metal_library_get_pipeline_mul_mv(lib, op);
