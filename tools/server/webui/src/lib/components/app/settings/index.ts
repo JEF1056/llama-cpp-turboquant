@@ -48,6 +48,13 @@ export { default as SettingsFooter } from './SettingsFooter.svelte';
 export { default as SettingsChatImportExportTab } from './SettingsChat/SettingsChatImportExportTab.svelte';
 
 /**
+ * Settings Backup panel.
+ * Provides UI for exporting and importing all settings configs,
+ * separate from conversation import/export.
+ */
+export { default as SettingsChatSettingsBackupTab } from './SettingsChat/SettingsChatSettingsBackupTab.svelte';
+
+/**
  * Section wrapper for import/export sections. Displays a title, description,
  * icon button, and optional summary of recent actions.
  */

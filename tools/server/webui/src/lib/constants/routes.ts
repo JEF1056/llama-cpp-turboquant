@@ -9,7 +9,8 @@ export const SETTINGS_SECTION_SLUGS = {
 	AGENTIC: 'agentic',
 	DEVELOPER: 'developer',
 	TOOLS: 'tools',
-	IMPORT_EXPORT: 'import-export'
+	IMPORT_EXPORT: 'import-export',
+	SETTINGS_BACKUP: 'settings-backup'
 } as const;
 
 export const ROUTES = {
