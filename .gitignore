@@ -151,6 +151,7 @@ flake.lock
 
 # IDE
 
+/.weave/
 /*.code-workspace
 /.windsurf/
 # emscripten
