@@ -1,0 +1,69 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "agents": {
+    "loom": {
+      "model": "llama/qwenopus3.6-27b",
+      "fallback_models": [
+        "opencode/qwen3.6-plus-free",
+        "opencode/minimax-m2.5-free",
+        "opencode/big-pickle"
+      ]
+    },
+    "tapestry": {
+      "model": "llama/qwenopus3.6-27b",
+      "fallback_models": [
+        "opencode/qwen3.6-plus-free",
+        "opencode/minimax-m2.5-free",
+        "opencode/big-pickle"
+      ]
+    },
+    "shuttle": {
+      "model": "llama/qwenopus3.6-27b",
+      "fallback_models": [
+        "opencode/qwen3.6-plus-free",
+        "opencode/minimax-m2.5-free",
+        "opencode/big-pickle"
+      ]
+    },
+    "pattern": {
+      "model": "llama/qwenopus3.6-27b",
+      "fallback_models": [
+        "opencode/qwen3.6-plus-free",
+        "opencode/minimax-m2.5-free",
+        "opencode/big-pickle"
+      ]
+    },
+    "thread": {
+      "model": "llama/qwenopus3.6-27b",
+      "fallback_models": [
+        "opencode/qwen3.6-plus-free",
+        "opencode/minimax-m2.5-free",
+        "opencode/big-pickle"
+      ]
+    },
+    "spindle": {
+      "model": "llama/qwenopus3.6-27b",
+      "fallback_models": [
+        "opencode/qwen3.6-plus-free",
+        "opencode/minimax-m2.5-free",
+        "opencode/big-pickle"
+      ]
+    },
+    "weft": {
+      "model": "llama/qwenopus3.6-27b",
+      "fallback_models": [
+        "opencode/qwen3.6-plus-free",
+        "opencode/minimax-m2.5-free",
+        "opencode/big-pickle"
+      ]
+    },
+    "warp": {
+      "model": "llama/qwenopus3.6-27b",
+      "fallback_models": [
+        "opencode/qwen3.6-plus-free",
+        "opencode/minimax-m2.5-free",
+        "opencode/big-pickle"
+      ]
+    }
+  }
+}

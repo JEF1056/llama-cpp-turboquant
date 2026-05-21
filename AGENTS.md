@@ -108,3 +108,78 @@ To conserve context space, load these resources as needed:
 - [Jinja engine](common/jinja/README.md)
 - [How to add a new model](docs/development/HOWTO-add-model.md)
 - [PR template](.github/pull_request_template.md)
+
+## opencode.json
+
+The `opencode.json` at the repo root configures the LLM provider for OpenCode sessions — it points at `http://localhost:8080/v1` with the `qwenopus3.6-27b` model and a 150K context window. No additional instructions are needed beyond what's in this file.
+
+## Anti-Loop Discipline
+
+These rules prevent the agent from getting stuck re-reading files or repeating tool calls.
+
+- **Never read the same file twice in a single conversation.** If you already read a file, use what you have in context. If you need a specific section, use `grep` to find the relevant lines — do not re-read the whole file.
+- **Check context before calling Read.** Before invoking any file-read tool, check whether you already have the file contents in context.
+- **If you notice you're re-reading a file, stop.** Summarize what you already know, then proceed with the task instead of gathering more context.
+- **Prefer targeted searches over full reads.** Use `grep`/`glob` to locate specific code before reading entire files.
+- **Track which files you've read.** Keep a mental note of files already examined. If compaction prunes earlier turns, rely on summaries you've already written.
+
+## Git operations
+Prefer to use `gh` (github CLI) and `git` commands for git operations where possible, instead of searching the web.
+
+## MCP Vs Builtin tools
+Prefer MCP tools over builtin tools, like webfetch and websearch, or using shell, when available.
+
+## 12 Rules
+
+These rules apply to every task unless explicitly overridden. Bias: caution over speed on non-trivial work.
+
+### Rule 1 - Think Before Coding
+State assumptions explicitly. Ask rather than guess.
+Push back when a simpler approach exists. Stop when confused.
+
+### Rule 2 - Simplicity First
+Minimum code that solves the problem. Nothing speculative.
+No abstractions for single-use code.
+
+### Rule 3 - Surgical Changes
+Touch only what you must. Don't improve adjacent code.
+Match existing style. Don't refactor what isn't broken.
+
+### Rule 4 - Goal-Driven Execution
+Define success criteria. Loop until verified.
+Strong success criteria let Claude loop independently.
+
+### Rule 5 - Use the model only for judgment calls
+Use for: classification, drafting, summarization, extraction.
+Do NOT use for: routing, retries, deterministic transforms.
+If code can answer, code answers.
+
+### Rule 6 - Token budgets are not advisory
+Per-task: 4,000 tokens. Per-session: 30,000 tokens.
+If approaching budget, summarize and start fresh.
+Surface the breach. Do not silently overrun.
+
+### Rule 7 - Surface conflicts, don't average them
+If two patterns contradict, pick one (more recent / more tested).
+Explain why. Flag the other for cleanup.
+
+### Rule 8 - Read before you write
+Before adding code, read exports, immediate callers, shared utilities.
+If unsure why existing code is structured a certain way, ask.
+
+### Rule 9 - Tests verify intent, not just behavior
+Tests must encode WHY behavior matters, not just WHAT it does.
+A test that can't fail when business logic changes is wrong.
+
+### Rule 10 - Checkpoint after every significant step
+Summarize what was done, what's verified, what's left.
+Don't continue from a state you can't describe back.
+
+### Rule 11 - Match the codebase's conventions, even if you disagree
+Conformance > taste inside the codebase.
+If you think a convention is harmful, surface it. Don't fork silently.
+
+### Rule 12 - Fail loud
+"Completed" is wrong if anything was skipped silently.
+"Tests pass" is wrong if any were skipped.
+Default to surfacing uncertainty, not hiding it.
