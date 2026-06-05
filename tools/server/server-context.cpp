@@ -3103,6 +3103,12 @@ private:
                             for (int offset : checkpoint_offsets) {
                                 const int n_last = std::min(n_batch, offset);
                                 if (slot.task->n_tokens() == slot.prompt.n_tokens() + n_last) {
+                                    // do not split mid-image: skip the split if the next token to
+                                    // be added is part of a media chunk (NULL placeholder). Let the
+                                    // image complete in its own iteration before checkpointing.
+                                    if (input_tokens[slot.prompt.n_tokens()] == LLAMA_TOKEN_NULL) {
+                                        break;
+                                    }
                                     should_break = true;
                                     break;
                                 }
@@ -3162,8 +3168,12 @@ private:
                         (llama_model_is_recurrent(model_tgt) || llama_model_is_hybrid(model_tgt)) ? 4 : 64;
                     do_checkpoint = do_checkpoint && (pos_min >= 0 && slot.prompt.n_tokens() >= checkpoint_min_tokens);
 
-                    // do not checkpoint after mtmd chunks
-                    do_checkpoint = do_checkpoint && !has_mtmd;
+                    // Allow checkpointing after mtmd chunks: has_mtmd is true only for the
+                    // iteration that processed image embeddings. The checkpoint is placed
+                    // *before* llama_decode() (see comment below), so the boundary is always
+                    // between fully-written image data and the next text batch — never
+                    // mid-image. The chunk-boundary guard above ensures the batch-split
+                    // offsets do not land inside a NULL-token image span.
 
                     // no need to create checkpoints that are too close together
                     do_checkpoint = do_checkpoint && (slot.prompt.checkpoints.empty() || slot.prompt.n_tokens() - n_tokens_cur > slot.prompt.checkpoints.back().n_tokens + checkpoint_min_tokens);

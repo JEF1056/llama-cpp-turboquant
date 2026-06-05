@@ -173,6 +173,9 @@ public:
 
     int32_t s_copy(int i) const;
 
+    // number of sequence tokens in subsequent ubatches (for rollback snapshot slot remapping)
+    uint32_t get_rs_tokens_after() const;
+
 private:
     const llama_memory_status status;
 
@@ -181,6 +184,10 @@ private:
     size_t i_next = 0;
 
     std::vector<llama_ubatch> ubatches;
+
+    // per-ubatch cumulative n_seq_tokens from subsequent ubatches
+    // enables correct snapshot cache slot mapping when split_equal splits a sequence across ubatches
+    std::vector<uint32_t> rs_tokens_after;
 
     //
     // data needed for building the compute graph for the current ubatch:
