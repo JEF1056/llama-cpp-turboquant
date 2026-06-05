@@ -79,6 +79,7 @@ enum server_state {
 static bool slot_checkpoints_save(const std::string & filepath,
                                   const std::list<common_prompt_checkpoint> & checkpoints) {
     if (checkpoints.empty()) {
+        SRV_DBG("slot checkpoints: nothing to save alongside %s (no checkpoints)\n", filepath.c_str());
         return true;
     }
 
@@ -98,6 +99,7 @@ static bool slot_checkpoints_save(const std::string & filepath,
     write_u32(1);           // version
     write_u32((uint32_t) checkpoints.size());
 
+    size_t total_bytes = 0;
     for (const auto & ckpt : checkpoints) {
         write_i32(ckpt.pos_min);
         write_i32(ckpt.pos_max);
@@ -106,15 +108,18 @@ static bool slot_checkpoints_save(const std::string & filepath,
         write_u64((uint64_t) ckpt.data_tgt.size());
         if (!ckpt.data_tgt.empty()) {
             ofs.write(reinterpret_cast<const char *>(ckpt.data_tgt.data()), ckpt.data_tgt.size());
+            total_bytes += ckpt.data_tgt.size();
         }
 
         write_u64((uint64_t) ckpt.data_dft.size());
         if (!ckpt.data_dft.empty()) {
             ofs.write(reinterpret_cast<const char *>(ckpt.data_dft.data()), ckpt.data_dft.size());
+            total_bytes += ckpt.data_dft.size();
         }
     }
 
-    SRV_INF("saved %zu checkpoints to %s\n", checkpoints.size(), ckpt_path.c_str());
+    SRV_INF("saved %zu context checkpoint(s) to %s (%.2f MiB)\n",
+            checkpoints.size(), ckpt_path.c_str(), total_bytes / 1048576.0);
     return ofs.good();
 }
 
@@ -175,7 +180,12 @@ static bool slot_checkpoints_load(const std::string & filepath,
         checkpoints.push_back(std::move(ckpt));
     }
 
-    SRV_INF("loaded %zu checkpoints from %s\n", checkpoints.size(), ckpt_path.c_str());
+    size_t total_bytes = 0;
+    for (const auto & ckpt : checkpoints) {
+        total_bytes += ckpt.data_tgt.size() + ckpt.data_dft.size();
+    }
+    SRV_INF("loaded %zu context checkpoint(s) from %s (%.2f MiB)\n",
+            checkpoints.size(), ckpt_path.c_str(), total_bytes / 1048576.0);
     return true;
 }
 
@@ -1077,6 +1087,26 @@ private:
 
         if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL) {
             SRV_WRN("%s", "speculative decoding will use checkpoints\n");
+        }
+
+        if (params_base.n_ctx_checkpoints > 0) {
+            bool is_recurrent_or_hybrid =
+                llama_model_is_recurrent(model_tgt) || llama_model_is_hybrid(model_tgt);
+            if (params_base.checkpoint_every_nt > 0) {
+                SRV_INF("context checkpoints enabled: max=%d, interval=%d tokens%s\n",
+                        params_base.n_ctx_checkpoints,
+                        params_base.checkpoint_every_nt,
+                        is_recurrent_or_hybrid ? " [recurrent/hybrid model — checkpoints required for slot restore]" : "");
+            } else {
+                SRV_INF("context checkpoints enabled: max=%d, end-of-prompt only%s\n",
+                        params_base.n_ctx_checkpoints,
+                        is_recurrent_or_hybrid ? " [recurrent/hybrid model — checkpoints required for slot restore]" : "");
+            }
+        } else {
+            if (llama_model_is_recurrent(model_tgt) || llama_model_is_hybrid(model_tgt)) {
+                SRV_WRN("%s", "context checkpoints disabled (--ctx-checkpoints 0) on a recurrent/hybrid model "
+                        "— slot restore after model switch will require full re-prefill\n");
+            }
         }
 
         // initialize slots

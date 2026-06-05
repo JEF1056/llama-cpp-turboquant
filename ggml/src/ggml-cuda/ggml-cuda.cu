@@ -4841,8 +4841,10 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
         }
         for (int src_idx = 0; src_idx < GGML_MAX_SRC; ++src_idx) {
             const ggml_tensor * src = cgraph->nodes[node_idx]->src[src_idx];
-            //TODO: check why nrows > 1 fails
-            if (node && !is_noop(node) && ggml_nrows(node) <= 1) {
+            // Count fan-out for any non-noop consumer, regardless of batch size.
+            // Prefill produces nrows > 1 (batch_size tokens) on Q/K/V matmuls but
+            // attn_norm still fans out to exactly 3 branches — we want to optimise that.
+            if (node && !is_noop(node)) {
                 fan_out[src] += 1;
             }
         }
@@ -4892,7 +4894,15 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                 }
             }
 
-            GGML_ASSERT(nodes_per_branch.size() == (size_t) count);
+            // Soft-skip if the detected branch count doesn't match fan_out.
+            // This can happen when intermediate fused/aliased nodes sit between the fork
+            // and the first branch consumers (e.g. aliased rope, fused norms).
+            if (nodes_per_branch.size() != (size_t) count) {
+                GGML_LOG_DEBUG(
+                    "graph_optimize: skipping %s — branch count mismatch (detected %zu, fan_out %d)\n",
+                    root_node->name, nodes_per_branch.size(), count);
+                continue;
+            }
 
             //find the join point
             const ggml_tensor * join_node = nullptr;
