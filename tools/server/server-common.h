@@ -196,11 +196,6 @@ public:
 
     llama_tokens get_text_tokens() const;
 
-    // Returns the raw token vector including LLAMA_TOKEN_NULL placeholders.
-    // Unlike get_tokens(), this is safe to call when has_mtmd is true.
-    // Use this for KV state serialization where token_count must equal KV cell count.
-    const llama_tokens & get_tokens_raw() const { return tokens; }
-
     // for compatibility with speculative decoding
     void set_token(llama_pos pos, llama_token id);
 

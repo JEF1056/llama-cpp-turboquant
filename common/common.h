@@ -648,7 +648,6 @@ struct common_params {
     bool log_json = false;
 
     std::string slot_save_path;
-    int32_t slot_flush_interval = 0; // seconds between periodic idle KV-cache flushes to disk (0 = disabled)
     std::string media_path; // path to directory for loading media files
 
     float   slot_prompt_similarity        = 0.1f;
@@ -705,21 +704,6 @@ struct common_params {
     llama_progress_callback load_progress_callback = NULL;
     void *                  load_progress_callback_user_data = NULL;
     bool no_alloc = false; // Don't allocate model buffers
-
-    // TriAttention KV cache eviction (arXiv 2604.04921)
-    std::string triattention_stats;                // path to .triattention calibration file
-    int32_t     triattention_budget       = 2048;  // max KV entries to retain after pruning
-    int32_t     triattention_window       = 128;   // pruning interval (divide_length) in tokens
-    int32_t     triattention_offset_max   = 65536; // max geometric offset for scoring
-    int32_t     triattention_mode         = 0;     // 0=global, 1=per-kv-head, 2=per-layer-head
-    int32_t     triattention_trigger      = 0;     // 0=interval, 1=slack
-    int32_t     triattention_agg          = 0;     // 0=mean, 1=max
-    int32_t     triattention_seed         = 0;     // RNG seed for tie-breaking (-1 to disable)
-    bool        triattention_normalize    = false;  // z-score normalize per head
-    bool        triattention_protect_prefill = true; // never evict prompt tokens
-    bool        triattention_disable_mlr  = false;  // ablation: disable MLR weighting
-    bool        triattention_disable_trig = false;  // ablation: norm-only scoring
-    bool        triattention_log          = true;   // log pruning events to stderr (use --no-triattention-log to silence)
 };
 
 // call once at the start of a program if it uses libcommon

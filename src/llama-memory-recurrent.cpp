@@ -416,9 +416,15 @@ llama_memory_context_ptr llama_memory_recurrent::init_batch(llama_batch_allocr &
                 // if all tokens are output, split by sequence
                 ubatch = balloc.split_seq(n_ubatch);
             } else {
-                // TODO: non-sequential equal split can be done if using unified KV cache
-                //       for simplicity, we always use sequential equal split for now
-                ubatch = balloc.split_equal(n_ubatch, true);
+                if (n_rs_seq > 0) {
+                    // [TAG_RECURRENT_ROLLBACK_SPLITS]
+                    // TODO: recurrent state rollback does not support equal splits
+                    ubatch = balloc.split_seq(n_ubatch);
+                } else {
+                    // TODO: non-sequential equal split can be done if using unified KV cache
+                    //       for simplicity, we always use sequential equal split for now
+                    ubatch = balloc.split_equal(n_ubatch, true);
+                }
             }
 
             if (ubatch.n_tokens == 0) {
@@ -1171,17 +1177,7 @@ llama_memory_recurrent_context::llama_memory_recurrent_context(
 
 llama_memory_recurrent_context::llama_memory_recurrent_context(
         llama_memory_recurrent * mem,
-        std::vector<llama_ubatch> ubatches) : status(LLAMA_MEMORY_STATUS_SUCCESS), mem(mem), ubatches(std::move(ubatches)) {
-    // compute per-ubatch cumulative n_seq_tokens from subsequent ubatches
-    // this allows snapshot extraction loops to remap kernel output slots to global cache positions
-    // when split_equal splits a single sequence's tokens across multiple ubatches
-    rs_tokens_after.resize(this->ubatches.size(), 0);
-    uint32_t acc = 0;
-    for (int i = (int) this->ubatches.size() - 1; i >= 0; --i) {
-        rs_tokens_after[i] = acc;
-        acc += this->ubatches[i].n_seq_tokens;
-    }
-}
+        std::vector<llama_ubatch> ubatches) : status(LLAMA_MEMORY_STATUS_SUCCESS), mem(mem), ubatches(std::move(ubatches)) {}
 
 llama_memory_recurrent_context::~llama_memory_recurrent_context() = default;
 
@@ -1263,11 +1259,4 @@ int32_t llama_memory_recurrent_context::s_copy(int i) const {
         }
     }
     return (int32_t)(idx * mem->size) + src0;
-}
-
-uint32_t llama_memory_recurrent_context::get_rs_tokens_after() const {
-    if (rs_tokens_after.empty()) {
-        return 0;
-    }
-    return rs_tokens_after[i_next];
 }

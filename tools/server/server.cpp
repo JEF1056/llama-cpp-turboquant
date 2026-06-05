@@ -86,33 +86,12 @@ int llama_server(int argc, char ** argv) {
         return 1;
     }
 
-    // router server never loads a model and must not touch the GPU:
-    // skip llama_backend_init() entirely so the CUDA primary context
-    // stays uncreated.  Child processes spawned by the router call
-    // llama_backend_init() on their own.
-    const bool is_router_server = params.model.path.empty();
-    if (!is_router_server) {
-        // Set an abort callback that prints a structured error message to
-        // stdout before abort() kills the process.  The parent's log thread
-        // (in router mode) reads stdout via a pipe and parses
-        // CMD_CHILD_TO_ROUTER_ERROR to capture the error for /v1/models.
-        // fflush(stdout) is essential: abort() does not flush stdio buffers.
-        ggml_set_abort_callback([](const char * msg) {
-            // Flatten multi-line messages so the fgets parser captures
-            // the full error, not just the first line.
-            char flat[4096];
-            size_t i;
-            for (i = 0; i < sizeof(flat) - 1 && msg[i]; i++) {
-                flat[i] = (msg[i] == '\n') ? ' ' : msg[i];
-            }
-            flat[i] = '\0';
-            fprintf(stdout, "%s%s\n", CMD_CHILD_TO_ROUTER_ERROR, flat);
-            fflush(stdout);
-        });
+    llama_backend_init();
+    llama_numa_init(params.numa);
 
-        llama_backend_init();
-        llama_numa_init(params.numa);
-    }
+    // router server never loads a model and must not touch the GPU
+    // skip device enumeration so the CUDA primary context stays uncreated
+    const bool is_router_server = params.model.path.empty();
     common_params_print_info(params, !is_router_server);
 
     // validate batch size for embeddings
@@ -369,10 +348,6 @@ int llama_server(int argc, char ** argv) {
 
         // this call blocks the main thread until queue_tasks.terminate() is called
         ctx_server.start_loop();
-
-        // Persist slot KV cache to disk on graceful shutdown (SIGTERM/SIGINT).
-        // Queue is terminated at this point so no concurrent slot access.
-        ctx_server.save_slots_on_shutdown();
 
         clean_up();
         if (ctx_http.thread.joinable()) {

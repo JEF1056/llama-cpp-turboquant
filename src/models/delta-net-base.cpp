@@ -496,26 +496,15 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
 
         ggml_build_forward_expand(gf, ggml_cpy(ctx0, conv_state_last, conv_state_update));
     } else {
-        // [TAG_RECURRENT_ROLLBACK_SPLITS] conv state snapshots with cross-ubatch support
-        // Same logic as the attention state extraction: rs_tokens_after offsets the cache slot
-        // so that snapshots from earlier ubatches land in the correct global positions.
-        const uint32_t rs_after = mctx_cur->get_rs_tokens_after();
+        // [TAG_RECURRENT_ROLLBACK_SPLITS]
+        // TODO: this logic incorrectly assumes that the last (n_rs_seq + 1) tokens of a sequence in a batch are
+        //       inside the same ubatch. currently with `split_equal()` this is not correct
 
         const int64_t K = (int64_t) cparams.n_rs_seq + 1;
-        const int64_t n_seq_tokens = conv_input->ne[0] - conv_states->ne[0]; // = ubatch.n_seq_tokens
 
         for (int64_t t = 1; t <= K; ++t) {
-            // skip snapshots from positions before this ubatch's tokens
-            if (t <= K - n_seq_tokens) {
-                continue;
-            }
-
-            const int64_t global_slot = (K - t) + (int64_t) rs_after;
-            if (global_slot >= K) {
-                continue; // too old to fit in our K cache slots
-            }
-
-            const int64_t s_idx = n_seq_tokens - K + t; // always > 0 given t > K - n_seq_tokens
+            const int64_t s_idx  = std::max<int64_t>(0, conv_input->ne[0] - conv_states->ne[0] - K + t);
+            const int64_t s_slot = K - t;
 
             ggml_tensor * conv_state_last =
                 ggml_view_3d(ctx0, conv_input,
@@ -527,7 +516,7 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
                 ggml_view_2d(ctx0,
                         conv_states_all, row_count, n_seqs,
                         conv_states_all->nb[1],
-                        (global_slot * mem_size + kv_head) * row_size);
+                        (s_slot * mem_size + kv_head) * row_size);
 
             ggml_build_forward_expand(gf, ggml_cpy(ctx0, conv_state_last, conv_state_update));
         }
@@ -597,24 +586,9 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
         0);
     cb(output, "attn_output", il);
 
-    // [TAG_RECURRENT_ROLLBACK_SPLITS] snapshot extraction with cross-ubatch support
-    // The fused kernel writes K snapshot slots in its output, but only slots [K - n_seq_tokens, K-1]
-    // are valid (the rest are uninitialized when n_seq_tokens < K).
-    // When split_equal splits a sequence across ubatches, rs_tokens_after tells us how many
-    // sequence tokens come in subsequent ubatches, so we can offset cache slot positions accordingly.
-    const uint32_t rs_after = mctx_cur->get_rs_tokens_after();
     const size_t row_size = hparams.n_embd_s() * ggml_element_size(ssm_states_all);
     for (int64_t k_i = 0; k_i < K; ++k_i) {
-        // skip kernel output slots that weren't written (uninitialized)
-        if (k_i < K - n_seq_tokens) {
-            continue;
-        }
-
-        const uint32_t global_cache_slot = (uint32_t) (K - 1 - k_i) + rs_after;
-        if (global_cache_slot >= (uint32_t) K) {
-            continue; // this snapshot is too old to fit in our K cache slots
-        }
-
+        const uint32_t cache_slot = (uint32_t) (K - 1 - k_i);
         ggml_tensor * src = ggml_view_4d(ctx0, gdn_out,
             S_v, S_v, H_v, n_seqs,
             ggml_row_size(gdn_out->type, S_v),
@@ -624,7 +598,7 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
 
         ggml_tensor * dst = ggml_view_2d(ctx0, ssm_states_all,
             hparams.n_embd_s(), n_seqs, ssm_states_all->nb[1],
-            ((size_t) global_cache_slot * mem_size + kv_head) * row_size);
+            ((size_t) cache_slot * mem_size + kv_head) * row_size);
 
         ggml_build_forward_expand(gf, ggml_cpy(ctx0, src, dst));
     }

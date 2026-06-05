@@ -12,8 +12,6 @@ struct llama_cparams;
 struct llama_hparams;
 struct llama_model;
 struct llama_context;
-struct triattention_state;
-struct triattention_config;
 
 //
 // llama_kv_cache
@@ -110,7 +108,7 @@ public:
         const layer_filter_cb & filter,
         const  layer_reuse_cb & reuse);
 
-    ~llama_kv_cache();
+    ~llama_kv_cache() = default;
 
     //
     // llama_memory_i
@@ -219,22 +217,6 @@ public:
     void set_input_k_rot(ggml_tensor * dst) const;
     void set_input_v_rot(ggml_tensor * dst) const;
 
-    //
-    // TriAttention KV cache eviction
-    //
-
-    // Initialize TriAttention on this cache. Called after construction.
-    // Does nothing if stats_path is nullptr or empty.
-    void init_triattention(const char * stats_path, const triattention_config * cfg);
-
-    // Attempt TriAttention pruning if conditions are met (trigger check + prune).
-    // Called automatically from apply_ubatch(). Can also be called explicitly.
-    // Returns number of cells evicted, 0 if no pruning, -1 on error.
-    int32_t triattention_try_prune();
-
-    // Check if TriAttention is active on this cache.
-    bool has_triattention() const;
-
 private:
     const llama_model & model;
     const llama_hparams & hparams;
@@ -306,9 +288,6 @@ private:
 
     // model layer id -> KV cache layer id
     std::unordered_map<int32_t, int32_t> map_layer_ids;
-
-    // TriAttention eviction state (nullptr if not enabled)
-    triattention_state * triattention_st = nullptr;
 
     size_t total_size() const;
 

@@ -202,12 +202,6 @@ void server_queue::start_loop(int64_t idle_sleep_ms) {
                 if (res) {
                     break; // new task arrived or terminate
                 }
-                // idle tick: fire periodic callback (e.g. slot KV flush)
-                if (callback_periodic) {
-                    lock.unlock();
-                    callback_periodic();
-                    lock.lock();
-                }
                 // otherwise, loop again to check sleeping condition
             }
         }
