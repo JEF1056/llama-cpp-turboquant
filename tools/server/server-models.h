@@ -136,6 +136,7 @@ private:
     std::vector<std::string> base_env;
     common_preset base_preset; // base preset from llama-server CLI args
 
+
     void update_meta(const std::string & name, const server_model_meta & meta);
 
     // unload least recently used models if the limit is reached
@@ -144,8 +145,23 @@ private:
     // not thread-safe, caller must hold mutex
     void add_model(server_model_meta && meta);
 
+    // Extract the effective --slot-save-path from a model's rendered args.
+    // Returns empty string if not set.
+    static std::string get_model_slot_save_path(const server_model_meta & meta);
+
+    // Save all active slots of a child to disk via its HTTP API.
+    // No-op if the model has no --slot-save-path configured.
+    // Intended to be called before sending CMD_ROUTER_TO_CHILD_EXIT.
+    void save_slots_to_disk(const std::string & model_name, int port);
+
+    // Restore previously saved slots for a model from disk.
+    // No-op if the model has no --slot-save-path configured or no save files exist.
+    // Intended to be called after the child reports READY.
+    void restore_slots_from_disk(const std::string & model_name, int port);
+
 public:
     server_models(const common_params & params, int argc, char ** argv);
+
 
     // (re-)load the list of models from various sources and prepare the metadata mapping
     // - if this is called the first time, simply populate the metadata

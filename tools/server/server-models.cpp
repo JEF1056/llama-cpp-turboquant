@@ -686,6 +686,191 @@ std::vector<server_model_meta> server_models::get_all_meta() {
     return result;
 }
 
+// Sanitize a model name for use as part of a filename.
+// Replaces characters that are unsafe on common filesystems with '_'.
+static std::string sanitize_model_name_for_path(const std::string & name) {
+    std::string out = name;
+    for (char & c : out) {
+        if (c == '/' || c == '\\' || c == ':' || c == '*' || c == '?' || c == '"' || c == '<' || c == '>' || c == '|') {
+            c = '_';
+        }
+    }
+    return out;
+}
+
+// Perform a synchronous HTTP POST to the child server's slot save/restore endpoint.
+// Returns the parsed JSON body on success (2xx), or an empty object on failure.
+static json child_http_post(int port, const std::string & path, const json & body, int32_t timeout_s = 300) {
+    httplib::ClientImpl cli(CHILD_ADDR, port);
+    cli.set_connection_timeout(timeout_s, 0);
+    cli.set_read_timeout(timeout_s, 0);
+    cli.set_write_timeout(timeout_s, 0);
+
+    std::string body_str = safe_json_to_str(body);
+    auto res = cli.Post(path, body_str, "application/json");
+    if (!res || res->status < 200 || res->status >= 300) {
+        int status = res ? res->status : -1;
+        SRV_WRN("child HTTP POST %s failed with status %d\n", path.c_str(), status);
+        return json{};
+    }
+    try {
+        return json::parse(res->body);
+    } catch (...) {
+        return json{};
+    }
+}
+
+// Perform a synchronous HTTP GET to the child server.
+// Returns the parsed JSON body on success, or an empty object on failure.
+static json child_http_get(int port, const std::string & path, int32_t timeout_s = 30) {
+    httplib::ClientImpl cli(CHILD_ADDR, port);
+    cli.set_connection_timeout(timeout_s, 0);
+    cli.set_read_timeout(timeout_s, 0);
+    cli.set_write_timeout(timeout_s, 0);
+
+    auto res = cli.Get(path);
+    if (!res || res->status < 200 || res->status >= 300) {
+        int status = res ? res->status : -1;
+        SRV_WRN("child HTTP GET %s failed with status %d\n", path.c_str(), status);
+        return json{};
+    }
+    try {
+        return json::parse(res->body);
+    } catch (...) {
+        return json{};
+    }
+}
+
+std::string server_models::get_model_slot_save_path(const server_model_meta & meta) {
+    // Scan the model's rendered args for --slot-save-path VALUE.
+    for (size_t i = 0; i + 1 < meta.args.size(); ++i) {
+        if (meta.args[i] == "--slot-save-path") {
+            return meta.args[i + 1];
+        }
+    }
+    return {};
+}
+
+void server_models::save_slots_to_disk(const std::string & model_name, int port) {
+    // Get the model's effective slot-save-path from its rendered args.
+    std::string slot_save_path;
+    {
+        std::lock_guard<std::mutex> lk(mutex);
+        auto it = mapping.find(model_name);
+        if (it != mapping.end()) {
+            slot_save_path = get_model_slot_save_path(it->second.meta);
+        }
+    }
+    if (slot_save_path.empty()) {
+        return;
+    }
+    SRV_INF("saving KV cache slots for model '%s' before unload\n", model_name.c_str());
+
+    // Discover slot IDs from the child's /slots endpoint
+    json slots_info = child_http_get(port, "/slots");
+    if (!slots_info.is_array() || slots_info.empty()) {
+        SRV_WRN("could not retrieve slot list from model '%s' (port %d), skipping KV save\n", model_name.c_str(), port);
+        return;
+    }
+
+    std::string safe_name = sanitize_model_name_for_path(model_name);
+    int saved = 0;
+    for (const auto & slot : slots_info) {
+        if (!slot.is_object()) continue;
+        int id = json_value(slot, "id", -1);
+        if (id < 0) continue;
+
+        std::string filename = safe_name + "_slot" + std::to_string(id) + ".bin";
+        json req_body = {{"filename", filename}};
+        std::string endpoint = "/slots/" + std::to_string(id) + "?action=save";
+        json result = child_http_post(port, endpoint, req_body, base_params.timeout_write);
+        if (result.empty()) {
+            SRV_WRN("failed to save slot %d for model '%s'\n", id, model_name.c_str());
+        } else {
+            double t_save_ms = 0.0;
+            if (result.contains("timings") && result["timings"].is_object()) {
+                t_save_ms = json_value(result["timings"], "save_ms", 0.0);
+            }
+            SRV_INF("saved slot %d for model '%s' to '%s' (%.1f ms)\n",
+                id, model_name.c_str(), filename.c_str(), t_save_ms);
+            saved++;
+        }
+    }
+    SRV_INF("saved %d slot(s) for model '%s'\n", saved, model_name.c_str());
+}
+
+void server_models::restore_slots_from_disk(const std::string & model_name, int port) {
+    // Get the model's effective slot-save-path from its rendered args.
+    std::string slot_save_path;
+    {
+        std::lock_guard<std::mutex> lk(mutex);
+        auto it = mapping.find(model_name);
+        if (it != mapping.end()) {
+            slot_save_path = get_model_slot_save_path(it->second.meta);
+        }
+    }
+    if (slot_save_path.empty()) {
+        return;
+    }
+    // Ensure trailing separator
+    if (slot_save_path.back() != DIRECTORY_SEPARATOR) {
+        slot_save_path += DIRECTORY_SEPARATOR;
+    }
+
+    std::string safe_name = sanitize_model_name_for_path(model_name);
+
+    // Enumerate save files for this model in its slot_save_path directory.
+    // Files are named: {safe_model_name}_slot{id}.bin
+    std::vector<std::pair<int, std::string>> to_restore; // (slot_id, filename)
+    try {
+        std::filesystem::path dir(slot_save_path);
+        for (const auto & entry : std::filesystem::directory_iterator(dir)) {
+            if (!entry.is_regular_file()) continue;
+            std::string fname = entry.path().filename().string();
+            // Match: {safe_name}_slot{N}.bin
+            std::string prefix = safe_name + "_slot";
+            std::string suffix = ".bin";
+            if (fname.size() <= prefix.size() + suffix.size()) continue;
+            if (fname.substr(0, prefix.size()) != prefix) continue;
+            if (fname.substr(fname.size() - suffix.size()) != suffix) continue;
+            std::string id_str = fname.substr(prefix.size(), fname.size() - prefix.size() - suffix.size());
+            try {
+                int id = std::stoi(id_str);
+                to_restore.emplace_back(id, fname);
+            } catch (...) {
+                // not a valid slot id
+            }
+        }
+    } catch (const std::exception & e) {
+        SRV_WRN("failed to scan slot save directory for model '%s': %s\n", model_name.c_str(), e.what());
+        return;
+    }
+
+    if (to_restore.empty()) {
+        return;
+    }
+
+    SRV_INF("restoring %zu KV cache slot(s) for model '%s' after load\n", to_restore.size(), model_name.c_str());
+    int restored = 0;
+    for (const auto & [id, filename] : to_restore) {
+        json req_body = {{"filename", filename}};
+        std::string endpoint = "/slots/" + std::to_string(id) + "?action=restore";
+        json result = child_http_post(port, endpoint, req_body, base_params.timeout_read);
+        if (result.empty()) {
+            SRV_WRN("failed to restore slot %d for model '%s' from '%s'\n", id, model_name.c_str(), filename.c_str());
+        } else {
+            double t_restore_ms = 0.0;
+            if (result.contains("timings") && result["timings"].is_object()) {
+                t_restore_ms = json_value(result["timings"], "restore_ms", 0.0);
+            }
+            SRV_INF("restored slot %d for model '%s' from '%s' (%.1f ms)\n",
+                id, model_name.c_str(), filename.c_str(), t_restore_ms);
+            restored++;
+        }
+    }
+    SRV_INF("restored %d slot(s) for model '%s'\n", restored, model_name.c_str());
+}
+
 void server_models::unload_lru() {
     if (base_params.models_max <= 0) {
         return; // no limit
@@ -805,12 +990,31 @@ void server_models::load(const std::string & name) {
             // also handle status report from child process
             std::vector<char> vec_buf(128 * 1024); // large buffer for storing info
             char * buffer = vec_buf.data();
+            // Track first READY signal so we restore on initial load only,
+            // not on every wake-from-sleep (child re-sends READY on wake).
+            bool first_ready = true;
             if (stdout_file) {
                 while (fgets(buffer, vec_buf.size(), stdout_file) != nullptr) {
                     LOG("[%5d] %s", port, buffer);
                     std::string str(buffer);
                     if (string_starts_with(buffer, CMD_CHILD_TO_ROUTER_READY)) {
-                        this->update_status(name, SERVER_MODEL_STATUS_LOADED, 0);
+                        if (first_ready) {
+                            first_ready = false;
+                            // Restore previously saved KV cache on a dedicated thread so that:
+                            // 1. log_thread keeps draining stdout (prevents the child's pipe from
+                            //    filling and deadlocking during the potentially long restore I/O).
+                            // 2. Status stays LOADING during restore so ensure_model_ready() keeps
+                            //    waiting; we only flip to LOADED after restore completes, which
+                            //    prevents an incoming request from racing in and occupying the slot
+                            //    before the restore task is dispatched.
+                            std::thread([this, name, port]() {
+                                this->restore_slots_from_disk(name, port);
+                                this->update_status(name, SERVER_MODEL_STATUS_LOADED, 0);
+                            }).detach();
+                        } else {
+                            // Wake from sleep: child is already loaded, just update status.
+                            this->update_status(name, SERVER_MODEL_STATUS_LOADED, 0);
+                        }
                     } else if (string_starts_with(buffer, CMD_CHILD_TO_ROUTER_ERROR)) {
                         SRV_ERR("model name=%s loading error: %s\n", name.c_str(), buffer);
                         this->update_status(name, SERVER_MODEL_STATUS_UNLOADED, 1);
@@ -857,6 +1061,8 @@ void server_models::load(const std::string & name) {
                 return;
             }
             SRV_INF("stopping model instance name=%s\n", name.c_str());
+            // save KV cache slots before stopping the child (best-effort, happens outside the mutex)
+            this->save_slots_to_disk(name, port);
             // send interrupt to child process
             fprintf(stdin_file, "%s\n", CMD_ROUTER_TO_CHILD_EXIT);
             fflush(stdin_file);

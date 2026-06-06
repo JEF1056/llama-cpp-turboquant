@@ -648,6 +648,7 @@ struct common_params {
     bool log_json = false;
 
     std::string slot_save_path;
+    int32_t slot_flush_interval = 0; // seconds between periodic idle KV-cache flushes to disk (0 = disabled)
     std::string media_path; // path to directory for loading media files
 
     float   slot_prompt_similarity        = 0.1f;

@@ -370,6 +370,10 @@ int llama_server(int argc, char ** argv) {
         // this call blocks the main thread until queue_tasks.terminate() is called
         ctx_server.start_loop();
 
+        // Persist slot KV cache to disk on graceful shutdown (SIGTERM/SIGINT).
+        // Queue is terminated at this point so no concurrent slot access.
+        ctx_server.save_slots_on_shutdown();
+
         clean_up();
         if (ctx_http.thread.joinable()) {
             ctx_http.thread.join();

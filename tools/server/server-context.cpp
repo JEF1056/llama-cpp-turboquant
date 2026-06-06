@@ -1231,6 +1231,58 @@ private:
             handle_sleeping_state(sleeping);
         });
 
+        // Periodic slot KV-cache flush to disk.
+        // Fires on each ~1 s idle tick when no tasks are pending.
+        // Only active when --slot-flush-interval > 0 and --slot-save-path is set.
+        // The callback runs on the queue thread so slots are guaranteed idle.
+        if (params_base.slot_flush_interval > 0 && !params_base.slot_save_path.empty()) {
+            const int64_t flush_interval_ms = (int64_t)params_base.slot_flush_interval * 1000;
+            SRV_INF("slot flush enabled: interval=%d s, path=%s\n",
+                params_base.slot_flush_interval, params_base.slot_save_path.c_str());
+            // Sanitize model_name for use in filenames (same set of unsafe chars
+            // as sanitize_model_name_for_path in server-models.cpp).
+            std::string safe_model_name = model_name;
+            for (char & c : safe_model_name) {
+                if (c == '/' || c == '\\' || c == ':' || c == '*' || c == '?' ||
+                    c == '"' || c == '<'  || c == '>' || c == '|') {
+                    c = '_';
+                }
+            }
+            // last_flush_ms is captured by value so it persists across ticks.
+            queue_tasks.on_periodic([this, flush_interval_ms, safe_model_name,
+                                     last_flush_ms = (int64_t)0]() mutable {
+                int64_t now = ggml_time_ms();
+                if (now - last_flush_ms < flush_interval_ms) {
+                    return;
+                }
+                last_flush_ms = now;
+                for (server_slot & slot : slots) {
+                    if (slot.is_processing()) {
+                        continue; // skip — deferred saves stall the queue thread
+                    }
+                    if (slot.prompt.n_tokens() == 0) {
+                        continue; // nothing to save
+                    }
+                    const llama_tokens & tokens = slot.prompt.tokens.get_tokens();
+                    // Filename matches the router-side pattern used by save_slots_to_disk
+                    // and scanned by restore_slots_from_disk: {safe_model_name}_slot{id}.bin
+                    std::string filename = safe_model_name + "_slot" + std::to_string(slot.id) + ".bin";
+                    std::string filepath = params_base.slot_save_path + filename;
+                    SLT_INF(slot, "periodic flush: saving %zu tokens to %s\n",
+                        tokens.size(), filepath.c_str());
+                    size_t nwrite = llama_state_seq_save_file(
+                        ctx_tgt, filepath.c_str(), slot.id,
+                        tokens.data(), tokens.size());
+                    if (nwrite == 0) {
+                        SLT_WRN(slot, "periodic flush: failed to save slot to %s\n", filepath.c_str());
+                    } else {
+                        slot_checkpoints_save(filepath, slot.prompt.checkpoints);
+                        SLT_INF(slot, "periodic flush: saved %zu bytes\n", nwrite);
+                    }
+                }
+            });
+        }
+
         metrics.init();
 
         if (params_base.cache_idle_slots) {
@@ -3642,6 +3694,51 @@ void server_context::start_loop() {
 
 void server_context::terminate() {
     impl->queue_tasks.terminate();
+}
+
+void server_context::save_slots_on_shutdown() {
+    auto & p = impl->params_base;
+    if (p.slot_save_path.empty()) {
+        return;
+    }
+    if (impl->sleeping || impl->ctx_tgt == nullptr) {
+        // model is not loaded (sleeping state), nothing to save
+        return;
+    }
+
+    // Sanitize model name the same way the periodic flush and router do.
+    std::string safe_model_name = impl->model_name;
+    for (char & c : safe_model_name) {
+        if (c == '/' || c == '\\' || c == ':' || c == '*' || c == '?' ||
+            c == '"' || c == '<'  || c == '>' || c == '|') {
+            c = '_';
+        }
+    }
+
+    int saved = 0;
+    for (server_slot & slot : impl->slots) {
+        if (slot.prompt.n_tokens() == 0) {
+            continue; // nothing to save
+        }
+        const llama_tokens & tokens = slot.prompt.tokens.get_tokens();
+        std::string filename = safe_model_name + "_slot" + std::to_string(slot.id) + ".bin";
+        std::string filepath = p.slot_save_path + filename;
+        SRV_INF("shutdown save: saving slot %d (%zu tokens) to %s\n",
+            slot.id, tokens.size(), filepath.c_str());
+        size_t nwrite = llama_state_seq_save_file(
+            impl->ctx_tgt, filepath.c_str(), slot.id,
+            tokens.data(), tokens.size());
+        if (nwrite == 0) {
+            SRV_WRN("shutdown save: failed to save slot %d to %s\n", slot.id, filepath.c_str());
+        } else {
+            slot_checkpoints_save(filepath, slot.prompt.checkpoints);
+            slot_mtmd_save(filepath, slot.prompt.tokens);
+            saved++;
+        }
+    }
+    if (saved > 0) {
+        SRV_INF("shutdown save: saved %d slot(s) to %s\n", saved, p.slot_save_path.c_str());
+    }
 }
 
 llama_context * server_context::get_llama_context() const {

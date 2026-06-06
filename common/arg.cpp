@@ -3097,6 +3097,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--slot-flush-interval"}, "SECONDS",
+        "periodically flush idle slot KV cache to disk every N seconds while model is loaded (requires --slot-save-path; 0 = disabled, default: 0)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("--slot-flush-interval must be >= 0");
+            }
+            params.slot_flush_interval = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--media-path"}, "PATH",
         "directory for loading local media files; files can be accessed via file:// URLs using relative paths (default: disabled)",
         [](common_params & params, const std::string & value) {
