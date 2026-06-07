@@ -1483,7 +1483,8 @@ private:
                         slot_checkpoints_save(filepath, slot.prompt.checkpoints);
                         slot_mtmd_save(filepath, slot.prompt.tokens);
                         prev_n = tokens.size();
-                        SLT_INF(slot, "periodic flush: saved %zu bytes\n", nwrite);
+                        SLT_INF(slot, "periodic flush: saved %zu bytes (%zu tokens) to %s\n",
+                            nwrite, tokens.size(), filepath.c_str());
                     }
                 }
             });
@@ -2583,10 +2584,15 @@ private:
                     // Use get_tokens_raw() so token_count == KV cell count for mtmd slots
                     const llama_tokens & tokens = slot->prompt.tokens.get_tokens_raw();
                     const size_t nwrite = llama_state_seq_save_file(ctx_tgt, filepath.c_str(), slot->id, tokens.data(), token_count);
-
-                    // persist context checkpoints and mtmd chunk metadata alongside the slot state
-                    slot_checkpoints_save(filepath, slot->prompt.checkpoints);
-                    slot_mtmd_save(filepath, slot->prompt.tokens);
+                    if (nwrite == 0) {
+                        SRV_WRN("slot save: failed to write KV state to %s (slot %d)\n", filepath.c_str(), slot->id);
+                    } else {
+                        SRV_INF("slot save: wrote %zu bytes (%zu tokens) to %s (slot %d)\n",
+                                nwrite, token_count, filepath.c_str(), slot->id);
+                        // persist context checkpoints and mtmd chunk metadata alongside the slot state
+                        slot_checkpoints_save(filepath, slot->prompt.checkpoints);
+                        slot_mtmd_save(filepath, slot->prompt.tokens);
+                    }
 
                     const int64_t t_end = ggml_time_us();
                     const double t_save_ms = (t_end - t_start) / 1000.0;
@@ -2627,10 +2633,14 @@ private:
                     size_t nread = llama_state_seq_load_file(ctx_tgt, filepath.c_str(), slot->id, tokens.data(), tokens.size(), &token_count);
                     if (nread == 0) {
                         slot->prompt.tokens.clear(); // KV may already been invalidated?
+                        SRV_WRN("slot restore: failed to load KV state from %s (slot %d) — no space or invalid file\n",
+                                filepath.c_str(), slot->id);
                         send_error(task, "Unable to restore slot, no available space in KV cache or invalid slot save file", ERROR_TYPE_INVALID_REQUEST);
                         break;
                     }
                     tokens.resize(token_count);
+                    SRV_INF("slot restore: read %zu bytes (%zu tokens) from %s (slot %d)\n",
+                            nread, token_count, filepath.c_str(), slot->id);
 
                     // Restore context checkpoints and rebuild server_tokens (including any
                     // multimodal chunk metadata from the .mtmd sidecar if present).
@@ -3932,8 +3942,9 @@ void server_context::save_slots_on_shutdown() {
             impl->ctx_tgt, filepath.c_str(), slot.id,
             tokens.data(), tokens.size());
         if (nwrite == 0) {
-            SRV_WRN("shutdown save: failed to save slot %d to %s\n", slot.id, filepath.c_str());
+            SRV_WRN("shutdown save: failed to write KV state to %s (slot %d)\n", filepath.c_str(), slot.id);
         } else {
+            SRV_INF("shutdown save: wrote %zu bytes to %s (slot %d)\n", nwrite, filepath.c_str(), slot.id);
             slot_checkpoints_save(filepath, slot.prompt.checkpoints);
             slot_mtmd_save(filepath, slot.prompt.tokens);
             saved++;
