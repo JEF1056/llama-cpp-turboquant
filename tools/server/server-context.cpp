@@ -1467,6 +1467,7 @@ private:
                         // Cache unchanged since last flush — skip the write.
                         continue;
                     }
+
                     // Filename matches the router-side pattern used by save_slots_to_disk
                     // and scanned by restore_slots_from_disk: {safe_model_name}_slot{id}.bin
                     std::string filename = safe_model_name + "_slot" + std::to_string(slot.id) + ".bin";
