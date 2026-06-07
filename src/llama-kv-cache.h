@@ -196,7 +196,8 @@ public:
     slot_info find_slot(const llama_ubatch & ubatch, bool cont) const;
 
     // emplace the ubatch context into slot: [sinfo.idxs[0...ubatch.n_tokens - 1]]
-    void apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch);
+    // is_restore: if true, skip the TriAttention prefix_length heuristic (used during state_read)
+    void apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch, bool is_restore = false);
 
     //
     // input API

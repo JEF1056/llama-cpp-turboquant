@@ -1298,7 +1298,7 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
     return res;
 }
 
-void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch) {
+void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch, bool is_restore) {
     // keep track of the max sequence position that we would overwrite with this ubatch
     // for non-SWA cache, this would be always empty
     llama_seq_id seq_pos_max_rm[LLAMA_MAX_SEQ];
@@ -1374,9 +1374,11 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
 
     // TriAttention: set prefix length and check if pruning should trigger
     if (triattention_st != nullptr) {
-        // Set prefix_length once on the first prompt batch (contains position 0, >1 token).
-        // This enables prefix protection during pruning so prompt tokens are never evicted.
-        if (triattention_st->prefix_length == 0 && ubatch.n_tokens > 1) {
+        // Set prefix_length once on the first genuine prompt batch (contains position 0, >1 token).
+        // Skip during slot restore (is_restore=true): restoring a sequence that starts at pos 0
+        // would otherwise incorrectly reset prefix_length mid-session, mis-protecting the wrong
+        // tokens in subsequent prune rounds.
+        if (!is_restore && triattention_st->prefix_length == 0 && ubatch.n_tokens > 1) {
             bool has_pos_zero = false;
             llama_pos max_batch_pos = 0;
             for (uint32_t i = 0; i < ubatch.n_tokens; i++) {
@@ -2125,18 +2127,26 @@ ggml_tensor * llama_kv_cache::build_rope_shift(
     ggml_tensor * tmp;
 
     if (ggml_is_quantized(cur->type)) {
-        // dequantize to f32 -> RoPE -> quantize back
+        // dequantize to f32, apply RoPE, quantize back
         tmp = ggml_cast(ctx, cur, GGML_TYPE_F32);
 
-        // rotate back
-        tmp = ggml_mul_mat_aux(ctx, tmp, rot);
+        if (rot != nullptr) {
+            // TurboQuant rotation path: undo WHT rotation, apply RoPE, re-apply rotation
+            // rot is nullptr when attn_rot_k == false (the default), so this block only
+            // executes when LLAMA_ATTN_ROT_K_OVERRIDE=1 is set.
+            tmp = ggml_mul_mat_aux(ctx, tmp, rot);  // rotate back (R^T)
 
-        tmp = ggml_rope_ext(ctx, tmp,
-                shift, factors, n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
-                yarn_ext_factor, yarn_attn_factor, yarn_beta_fast, yarn_beta_slow);
+            tmp = ggml_rope_ext(ctx, tmp,
+                    shift, factors, n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
+                    yarn_ext_factor, yarn_attn_factor, yarn_beta_fast, yarn_beta_slow);
 
-        // rotate fwd
-        tmp = ggml_mul_mat_aux(ctx, tmp, rot);
+            tmp = ggml_mul_mat_aux(ctx, tmp, rot);  // rotate fwd (R)
+        } else {
+            // No WHT rotation: just apply RoPE directly on the dequantized keys
+            tmp = ggml_rope_ext(ctx, tmp,
+                    shift, factors, n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
+                    yarn_ext_factor, yarn_attn_factor, yarn_beta_fast, yarn_beta_slow);
+        }
 
         tmp = ggml_cpy(ctx, tmp, cur);
     } else {
@@ -2497,7 +2507,8 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
         // state_read_meta reads ext data (lines above) into ubatch.pos[i+n_tokens] (y)
         // and ubatch.pos[i+n_tokens*2] (x), and apply_ubatch calls cells.ext_set() when
         // ubatch.is_pos_2d() is true. The TODO comment below was stale and has been removed.
-        apply_ubatch(sinfo, ubatch);
+        // Pass is_restore=true to skip the TriAttention prefix_length heuristic during restore.
+        apply_ubatch(sinfo, ubatch, /*is_restore=*/true);
 
         LLAMA_LOG_DEBUG("%s: cell_count = %d, dest_seq_id = %d\n", __func__, cell_count, dest_seq_id);
 
@@ -2527,6 +2538,11 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
             io.read(&n_seq_id, sizeof(n_seq_id));
 
             cells.pos_set(i, pos);
+
+            // Notify TriAttention so cell_positions[] stays in sync.
+            // Without this, the shadow array remains all -1 after a full session
+            // restore (llama_load_session_file) and pruning silently stops firing.
+            triattention_on_token_added(triattention_st, i, pos);
 
             if (hparams.n_pos_per_embd() > 1) {
                 llama_kv_cell_ext ext;
