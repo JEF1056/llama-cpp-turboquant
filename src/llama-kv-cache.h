@@ -226,7 +226,12 @@ public:
 
     // Initialize TriAttention on this cache. Called after construction.
     // Does nothing if stats_path is nullptr or empty.
-    void init_triattention(const char * stats_path, const triattention_config * cfg);
+    // YaRN params are forwarded to triattention_init() so inverse-RoPE uses
+    // the correct per-frequency scaling when scoring cached keys.
+    void init_triattention(const char * stats_path, const triattention_config * cfg,
+                           float yarn_freq_scale = 1.0f, float yarn_ext_factor = 0.0f,
+                           float yarn_beta_fast = 32.0f, float yarn_beta_slow = 1.0f,
+                           uint32_t yarn_n_ctx_orig = 0);
 
     // Attempt TriAttention pruning if conditions are met (trigger check + prune).
     // Called automatically from apply_ubatch(). Can also be called explicitly.

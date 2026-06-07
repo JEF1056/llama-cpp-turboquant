@@ -307,27 +307,97 @@ static void triattention_free_calibration(triattention_calibration * cal) {
 // Precomputation at init time
 // ============================================================================
 
-// Build RoPE frequency array: omega[f] = rope_theta^(-2f/head_dim)
-// Paper Eq. 1: theta_f = base^{-2f/d}
-static void triattention_build_omega(float * omega, uint32_t freq_count, uint32_t head_dim, double rope_theta) {
+// YaRN ramp function: smooth interpolation between full scaling and no scaling.
+// Mirrors ggml rope.cu rope_yarn_ramp: returns 1.0 at low end, 0.0 at high end.
+//   low  = corr_dims[0] (fast correction dim, e.g. 0.0)
+//   high = corr_dims[1] (slow correction dim, e.g. 25.6 for Qwen3.5)
+//   i0   = dimension index (0, 2, 4, ... = 2*f for freq f)
+static float triattention_yarn_ramp(float low, float high, float i0) {
+    float y = (i0 / 2.0f - low) / fmaxf(1e-3f, high - low);
+    y = 1.0f - fminf(1.0f, fmaxf(0.0f, y));
+    return y;
+}
+
+// Compute YaRN correction dimension boundaries.
+// Mirrors ggml ggml_rope_yarn_corr_dims() in ggml.c.
+static void triattention_yarn_corr_dims(int n_dims, int n_ctx_orig, float freq_base,
+                                        float beta_fast, float beta_slow, float * dims) {
+    // corr_dim(n_rot) = n_dims * log(n_ctx_orig / (n_rot * 2pi)) / (2 * log(base))
+    auto corr_dim = [&](float n_rot) {
+        return (float)n_dims * logf((float)n_ctx_orig / (n_rot * 2.0f * (float)M_PI))
+               / (2.0f * logf(freq_base));
+    };
+    dims[0] = fmaxf(0.0f, floorf(corr_dim(beta_fast)));
+    dims[1] = fminf((float)(n_dims - 1), ceilf(corr_dim(beta_slow)));
+}
+
+// Build RoPE frequency array with YaRN scaling.
+// With YaRN, the effective angle at position p for frequency f is:
+//   theta_extrap = p * omega_plain[f]           (plain theta)
+//   theta_interp = freq_scale * theta_extrap    (interpolated)
+//   ramp = yarn_ramp(low, high, 2*f) * ext_factor
+//   theta = theta_interp*(1-ramp) + theta_extrap*ramp
+// The effective omega (angle per unit position) is:
+//   omega_eff[f] = omega_plain[f] * (freq_scale*(1-ramp) + ramp)
+// When ext_factor==0 (no YaRN extrapolation blending), this reduces to:
+//   omega_eff[f] = omega_plain[f] * freq_scale
+// When freq_scale==1.0 and ext_factor==0, this is the standard plain omega.
+//
+// Paper Eq. 1: theta_f = base^{-2f/d}; YaRN modifies the effective frequency.
+static void triattention_build_omega(float * omega, uint32_t freq_count, uint32_t head_dim,
+                                     double rope_theta,
+                                     float yarn_freq_scale, float yarn_ext_factor,
+                                     float yarn_beta_fast, float yarn_beta_slow,
+                                     uint32_t yarn_n_ctx_orig) {
+    // Compute YaRN correction boundaries (only if YaRN is active)
+    float corr_dims[2] = {0.0f, (float)(head_dim - 1)};
+    const bool use_yarn = (yarn_ext_factor != 0.0f || yarn_freq_scale != 1.0f)
+                          && yarn_n_ctx_orig > 0;
+    if (use_yarn && yarn_ext_factor != 0.0f) {
+        triattention_yarn_corr_dims((int)head_dim, (int)yarn_n_ctx_orig,
+                                    (float)rope_theta, yarn_beta_fast, yarn_beta_slow,
+                                    corr_dims);
+    }
+
     for (uint32_t f = 0; f < freq_count; f++) {
+        // Plain omega: base^(-2f/d)
         double exponent = -2.0 * (double)f / (double)head_dim;
-        omega[f] = (float)pow(rope_theta, exponent);
+        float omega_plain = (float)pow(rope_theta, exponent);
+
+        if (!use_yarn) {
+            omega[f] = omega_plain;
+        } else {
+            // YaRN effective scaling for this frequency dimension (i0 = 2*f)
+            float ramp = 0.0f;
+            if (yarn_ext_factor != 0.0f) {
+                ramp = triattention_yarn_ramp(corr_dims[0], corr_dims[1], 2.0f * (float)f)
+                       * yarn_ext_factor;
+            }
+            float eff_scale = yarn_freq_scale * (1.0f - ramp) + ramp;
+            omega[f] = omega_plain * eff_scale;
+        }
     }
 }
 
-// Build frequency scaling squared: freq_scale_sq[f] = cos^2(omega[f]*0) + sin^2(omega[f]*0)
-// For standard RoPE this is always 1.0, but for scaled RoPE (YaRN etc.)
-// the scaling factors at position 0 capture any frequency-dependent scaling.
-// Paper Section 3.2: "frequency scaling factor"
-static void triattention_build_freq_scale_sq(float * freq_scale_sq, const float * omega, uint32_t freq_count) {
+// Build frequency scaling squared: the mscale^2 factor for each frequency.
+// For standard RoPE: 1.0. For YaRN with ext_factor != 0:
+//   mscale = attn_factor * (1 + 0.1 * log(1/freq_scale)) when ext_factor != 0
+// The mscale modifies the dot product magnitude; freq_scale_sq = mscale^2.
+// (Paper Section 3.2: "frequency scaling factor" — in the TriAttention paper
+//  this is the amplitude correction term from the YaRN attention scale.)
+static void triattention_build_freq_scale_sq(float * freq_scale_sq, const float * omega,
+                                             uint32_t freq_count,
+                                             float yarn_freq_scale, float yarn_ext_factor,
+                                             float yarn_attn_factor) {
+    float mscale = 1.0f;
+    if (yarn_ext_factor != 0.0f && yarn_freq_scale != 1.0f) {
+        // YaRN attention magnitude correction (mirrors rope_yarn() in ggml)
+        mscale = yarn_attn_factor * (1.0f + 0.1f * logf(1.0f / yarn_freq_scale));
+    }
+    const float mscale_sq = mscale * mscale;
+    (void)omega;  // omega not needed here; mscale is uniform across frequencies
     for (uint32_t f = 0; f < freq_count; f++) {
-        // At position 0: cos(omega*0)=1, sin(omega*0)=0
-        // So freq_scale_sq = 1.0 for all standard RoPE variants.
-        // If we later support YaRN scaling, this would use the actual scaling factors.
-        float c = cosf(omega[f] * 0.0f);
-        float s = sinf(omega[f] * 0.0f);
-        freq_scale_sq[f] = c * c + s * s;
+        freq_scale_sq[f] = mscale_sq;
     }
 }
 
@@ -636,7 +706,12 @@ triattention_state * triattention_init(
     uint32_t kv_size,
     double   rope_theta,
     uint32_t head_dim,
-    uint32_t n_kv_heads)
+    uint32_t n_kv_heads,
+    float    yarn_freq_scale,
+    float    yarn_ext_factor,
+    float    yarn_beta_fast,
+    float    yarn_beta_slow,
+    uint32_t yarn_n_ctx_orig)
 {
     // Load calibration file
     triattention_calibration * cal = triattention_load_calibration(stats_path);
@@ -686,11 +761,23 @@ triattention_state * triattention_init(
     // Build precomputed arrays.
     // Use cal->head_dim (= rotary_dim from calibration file) for omega computation,
     // not the model's full head_dim — partial-rotary models may differ.
+    // Pass YaRN parameters so inverse-RoPE uses the same effective frequencies
+    // that were applied when writing K to the cache.
     state->omega = new float[fc];
-    triattention_build_omega(state->omega, fc, cal->head_dim, cal->rope_theta);
+    triattention_build_omega(state->omega, fc, cal->head_dim, cal->rope_theta,
+                             yarn_freq_scale, yarn_ext_factor,
+                             yarn_beta_fast, yarn_beta_slow, yarn_n_ctx_orig);
 
     state->freq_scale_sq = new float[fc];
-    triattention_build_freq_scale_sq(state->freq_scale_sq, state->omega, fc);
+    triattention_build_freq_scale_sq(state->freq_scale_sq, state->omega, fc,
+                                     yarn_freq_scale, yarn_ext_factor,
+                                     /* yarn_attn_factor= */ 1.0f);
+
+    if (yarn_freq_scale != 1.0f || yarn_ext_factor != 0.0f) {
+        fprintf(stderr, "[TriAttention] YaRN-aware omega: freq_scale=%.4f, ext_factor=%.4f, "
+                "beta=[%.1f, %.1f], n_ctx_orig=%u\n",
+                yarn_freq_scale, yarn_ext_factor, yarn_beta_fast, yarn_beta_slow, yarn_n_ctx_orig);
+    }
 
     // Geometric offsets — max 17 elements for offset_max=65536
     state->offsets = new float[32];  // generous allocation

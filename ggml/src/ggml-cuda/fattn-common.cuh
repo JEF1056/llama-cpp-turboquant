@@ -1547,6 +1547,11 @@ void launch_fattn(
         mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0
     );
     CUDA_CHECK(cudaGetLastError());
+#ifndef NDEBUG
+    // DEBUG: sync after fattn kernel to surface illegal memory access at the
+    // offending launch rather than deferring it to the next scheduler sync.
+    CUDA_CHECK(cudaStreamSynchronize(main_stream));
+#endif
 
     if (stream_k) {
         if ((int)blocks_num.x % ntiles_dst == 0 && (int)blocks_num.x > ntiles_dst) {

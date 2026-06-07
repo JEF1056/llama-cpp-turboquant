@@ -3885,7 +3885,15 @@ int32_t llama_triattention_init(
     cfg.disable_trig     = disable_trig;
     cfg.enable_logging   = enable_logging;
 
-    kv->init_triattention(stats_path, &cfg);
+    // Pass YaRN runtime params so TriAttention's inverse-RoPE uses the same
+    // per-frequency scaling that was applied when writing K to the KV cache.
+    const auto & cparams = ctx->get_cparams();
+    kv->init_triattention(stats_path, &cfg,
+                          cparams.rope_freq_scale,
+                          cparams.yarn_ext_factor,
+                          cparams.yarn_beta_fast,
+                          cparams.yarn_beta_slow,
+                          cparams.n_ctx_orig_yarn);
     return kv->has_triattention() ? 0 : -1;
 }
 

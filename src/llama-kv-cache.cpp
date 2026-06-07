@@ -2753,7 +2753,10 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
 // llama_kv_cache: TriAttention integration
 //
 
-void llama_kv_cache::init_triattention(const char * stats_path, const triattention_config * cfg) {
+void llama_kv_cache::init_triattention(const char * stats_path, const triattention_config * cfg,
+                                        float yarn_freq_scale, float yarn_ext_factor,
+                                        float yarn_beta_fast, float yarn_beta_slow,
+                                        uint32_t yarn_n_ctx_orig) {
     if (!stats_path || stats_path[0] == '\0') {
         return;
     }
@@ -2767,7 +2770,9 @@ void llama_kv_cache::init_triattention(const char * stats_path, const triattenti
     const uint32_t head_dim = hparams.n_embd_head_k(0);
     const uint32_t n_kv_heads = hparams.n_head_kv(0);
 
-    triattention_st = triattention_init(stats_path, cfg, kv_size, rope_theta, head_dim, n_kv_heads);
+    triattention_st = triattention_init(stats_path, cfg, kv_size, rope_theta, head_dim, n_kv_heads,
+                                        yarn_freq_scale, yarn_ext_factor,
+                                        yarn_beta_fast, yarn_beta_slow, yarn_n_ctx_orig);
     if (!triattention_st) {
         LLAMA_LOG_ERROR("%s: failed to initialize TriAttention from %s\n", __func__, stats_path);
     }

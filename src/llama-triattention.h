@@ -210,19 +210,29 @@ extern "C" {
 // The returned state must be freed with triattention_free().
 //
 // Parameters:
-//   stats_path  — path to .triattention binary calibration file
-//   cfg         — runtime configuration (copied into state)
-//   kv_size     — total KV cache capacity (number of cell slots)
-//   rope_theta  — model's RoPE theta for validation against calibration
-//   head_dim    — model's attention head dimension for validation
-//   n_kv_heads  — model's number of KV heads for validation
+//   stats_path     — path to .triattention binary calibration file
+//   cfg            — runtime configuration (copied into state)
+//   kv_size        — total KV cache capacity (number of cell slots)
+//   rope_theta     — model's RoPE theta for validation against calibration
+//   head_dim       — model's attention head dimension for validation
+//   n_kv_heads     — model's number of KV heads for validation
+//   yarn_freq_scale  — YaRN frequency scale (1/rope_scale), or 1.0 for no YaRN
+//   yarn_ext_factor  — YaRN ext_factor (0.0 for linear scaling only)
+//   yarn_beta_fast   — YaRN beta_fast correction boundary
+//   yarn_beta_slow   — YaRN beta_slow correction boundary
+//   yarn_n_ctx_orig  — YaRN original context length (e.g. 32768)
 triattention_state * triattention_init(
     const char * stats_path,
     const triattention_config * cfg,
     uint32_t kv_size,
     double   rope_theta,
     uint32_t head_dim,
-    uint32_t n_kv_heads);
+    uint32_t n_kv_heads,
+    float    yarn_freq_scale  = 1.0f,
+    float    yarn_ext_factor  = 0.0f,
+    float    yarn_beta_fast   = 32.0f,
+    float    yarn_beta_slow   = 1.0f,
+    uint32_t yarn_n_ctx_orig  = 0);
 
 // Free all memory associated with a TriAttention state.
 // Safe to call with nullptr.
