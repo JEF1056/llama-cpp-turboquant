@@ -2493,8 +2493,10 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
             return false;
         }
 
-        // TODO: we cannot yet restore llama_kv_cell_ext as the apply_ubatch() does not support it yet
-        //       see: https://github.com/ggml-org/llama.cpp/pull/16825#issuecomment-3460868350
+        // llama_kv_cell_ext (M-RoPE image spatial positions) IS restored:
+        // state_read_meta reads ext data (lines above) into ubatch.pos[i+n_tokens] (y)
+        // and ubatch.pos[i+n_tokens*2] (x), and apply_ubatch calls cells.ext_set() when
+        // ubatch.is_pos_2d() is true. The TODO comment below was stale and has been removed.
         apply_ubatch(sinfo, ubatch);
 
         LLAMA_LOG_DEBUG("%s: cell_count = %d, dest_seq_id = %d\n", __func__, cell_count, dest_seq_id);
