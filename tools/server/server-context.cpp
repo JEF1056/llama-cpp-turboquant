@@ -1420,17 +1420,33 @@ private:
                 }
             }
             // last_flush_ms is captured by value so it persists across ticks.
+            // Initialized to ggml_time_ms() so the first flush is deferred by a
+            // full interval rather than firing immediately on the first tick.
+            //
+            // last_flushed_n maps slot.id → token count at the time of the last
+            // successful flush.  A flush is skipped when the slot is still idle
+            // and the token count has not changed since the previous write —
+            // i.e. the on-disk file already matches the current KV cache.
+            // The stored count is reset to 0 whenever it exceeds the current
+            // token count so that a prompt reset (shrink) is never skipped.
             queue_tasks.on_periodic([this, flush_interval_ms, safe_model_name,
-                                     last_flush_ms = (int64_t)0]() mutable {
+                                     last_flush_ms    = ggml_time_ms(),
+                                     last_flushed_n   = std::unordered_map<int, size_t>{}]() mutable {
                 int64_t now = ggml_time_ms();
                 if (now - last_flush_ms < flush_interval_ms) {
                     return;
                 }
                 last_flush_ms = now;
-                for (server_slot & slot : slots) {
-                    if (slot.is_processing()) {
-                        continue; // skip — deferred saves stall the queue thread
+
+                // Only flush when every slot is idle — a flush during active
+                // inference stalls the queue thread with heavy disk I/O.
+                for (const server_slot & s : slots) {
+                    if (s.is_processing()) {
+                        return;
                     }
+                }
+
+                for (server_slot & slot : slots) {
                     if (slot.prompt.n_tokens() == 0) {
                         continue; // nothing to save
                     }
@@ -1438,6 +1454,19 @@ private:
                     // passed to llama_state_seq_save_file matches the KV cell count
                     // (LLAMA_TOKEN_NULL placeholders occupy real KV cells).
                     const llama_tokens & tokens = slot.prompt.tokens.get_tokens_raw();
+
+                    size_t & prev_n = last_flushed_n[slot.id];
+
+                    // Reset dirty marker if the prompt was cleared and refilled
+                    // with fewer tokens than the last flush (e.g. new conversation).
+                    if (tokens.size() < prev_n) {
+                        prev_n = 0;
+                    }
+
+                    if (tokens.size() == prev_n) {
+                        // Cache unchanged since last flush — skip the write.
+                        continue;
+                    }
                     // Filename matches the router-side pattern used by save_slots_to_disk
                     // and scanned by restore_slots_from_disk: {safe_model_name}_slot{id}.bin
                     std::string filename = safe_model_name + "_slot" + std::to_string(slot.id) + ".bin";
@@ -1452,6 +1481,7 @@ private:
                     } else {
                         slot_checkpoints_save(filepath, slot.prompt.checkpoints);
                         slot_mtmd_save(filepath, slot.prompt.tokens);
+                        prev_n = tokens.size();
                         SLT_INF(slot, "periodic flush: saved %zu bytes\n", nwrite);
                     }
                 }
