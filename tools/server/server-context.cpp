@@ -1012,6 +1012,11 @@ private:
     std::set<std::string> model_aliases; // additional names for the model
     std::set<std::string> model_tags;    // informational tags
 
+    // slot id → token count at the time of the last successful periodic flush.
+    // Used by save_slots_on_shutdown to skip slots whose on-disk file is already
+    // up to date, avoiding a redundant multi-hundred-MiB write at exit.
+    std::unordered_map<int, size_t> slot_last_flushed_n;
+
     bool sleeping = false;
 
     void destroy() {
@@ -1430,8 +1435,7 @@ private:
             // The stored count is reset to 0 whenever it exceeds the current
             // token count so that a prompt reset (shrink) is never skipped.
             queue_tasks.on_periodic([this, flush_interval_ms, safe_model_name,
-                                     last_flush_ms    = ggml_time_ms(),
-                                     last_flushed_n   = std::unordered_map<int, size_t>{}]() mutable {
+                                     last_flush_ms = ggml_time_ms()]() mutable {
                 int64_t now = ggml_time_ms();
                 if (now - last_flush_ms < flush_interval_ms) {
                     return;
@@ -1455,7 +1459,7 @@ private:
                     // (LLAMA_TOKEN_NULL placeholders occupy real KV cells).
                     const llama_tokens & tokens = slot.prompt.tokens.get_tokens_raw();
 
-                    size_t & prev_n = last_flushed_n[slot.id];
+                    size_t & prev_n = slot_last_flushed_n[slot.id];
 
                     // Reset dirty marker if the prompt was cleared and refilled
                     // with fewer tokens than the last flush (e.g. new conversation).
@@ -3929,11 +3933,26 @@ void server_context::save_slots_on_shutdown() {
     }
 
     int saved = 0;
+    int skipped = 0;
     for (server_slot & slot : impl->slots) {
         if (slot.prompt.n_tokens() == 0) {
             continue; // nothing to save
         }
         const llama_tokens & tokens = slot.prompt.tokens.get_tokens();
+
+        // Skip if the periodic flush already wrote this exact KV state to disk.
+        // token count mismatch (shrink) resets the marker in the flush path, so
+        // a prev_n that equals the current count reliably means the file is current.
+        // Use get_tokens_raw() size to match what the periodic flush records.
+        const size_t tokens_raw_size = slot.prompt.tokens.get_tokens_raw().size();
+        auto it = impl->slot_last_flushed_n.find(slot.id);
+        if (it != impl->slot_last_flushed_n.end() && it->second == tokens_raw_size) {
+            SRV_INF("shutdown save: slot %d (%zu tokens) already up to date on disk, skipping\n",
+                slot.id, tokens.size());
+            skipped++;
+            continue;
+        }
+
         std::string filename = safe_model_name + "_slot" + std::to_string(slot.id) + ".bin";
         std::string filepath = p.slot_save_path + filename;
         SRV_INF("shutdown save: saving slot %d (%zu tokens) to %s\n",
@@ -3950,8 +3969,9 @@ void server_context::save_slots_on_shutdown() {
             saved++;
         }
     }
-    if (saved > 0) {
-        SRV_INF("shutdown save: saved %d slot(s) to %s\n", saved, p.slot_save_path.c_str());
+    if (saved > 0 || skipped > 0) {
+        SRV_INF("shutdown save: saved %d slot(s), skipped %d (already up to date) in %s\n",
+            saved, skipped, p.slot_save_path.c_str());
     }
 }
 
