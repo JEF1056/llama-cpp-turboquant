@@ -351,8 +351,13 @@ static void launch_score_kernel(
     const dim3 block(fc, 1, 1);
     const size_t smem_bytes = (hd + fc) * sizeof(float);  // K vector + score reduction
 
-    // Compute head offset on host (ggml_row_size is a host function)
-    const size_t head_off = ggml_row_size(cfg.k_type, (uint64_t)kv_head_idx * hd);
+    // Compute head offset on host (ggml_row_size is a host function).
+    // Must use the full model head_dim (n_embd_k_gqa / n_kv_heads), not the
+    // calibration head_dim (hd), which may be smaller for partial-rotary models
+    // (e.g. Qwen3.6 has rotary_dim=64 but full head_dim=256).  Using hd here
+    // would compute the wrong inter-head stride for kv_head_idx > 0.
+    const uint64_t model_head_dim = (cfg.n_kv_heads > 0) ? (n_embd_k_gqa / cfg.n_kv_heads) : hd;
+    const size_t head_off = ggml_row_size(cfg.k_type, (uint64_t)kv_head_idx * model_head_dim);
 
     #define LAUNCH_KERNEL(KTYPE, WHT, TRIG) \
         triattention_score_kernel<KTYPE, WHT, TRIG><<<grid, block, smem_bytes, stream>>>( \
