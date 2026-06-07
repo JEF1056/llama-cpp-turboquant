@@ -279,7 +279,7 @@ llama_kv_cache::llama_kv_cache(
         {
             static const int adaptive_mode = [&]() {
                 const char * env = getenv("TURBO_LAYER_ADAPTIVE");
-                if (env) {
+                if (env && env[0] != '\0') {
                     int mode = atoi(env);
                     if (mode > 0) {
                         LLAMA_LOG_INFO("llama_kv_cache: layer-adaptive mode %d enabled (env)\n", mode);
@@ -296,32 +296,39 @@ llama_kv_cache::llama_kv_cache(
             const bool is_turbo = (type_k == GGML_TYPE_TURBO3_0 || type_k == GGML_TYPE_TURBO4_0 || type_k == GGML_TYPE_TURBO2_0);
             const bool v_is_turbo = (type_v == GGML_TYPE_TURBO3_0 || type_v == GGML_TYPE_TURBO4_0 || type_v == GGML_TYPE_TURBO2_0);
             const uint32_t n_layer = hparams.n_layer;
-            if (adaptive_mode == 1 && is_turbo && n_layer >= 8) {
-                if (il < 4 || il >= n_layer - 4) {
+            // Use n_main (main model layers only, excluding MTP prediction heads) for
+            // boundary detection. n_layer includes nextn_predict_layers MTP heads which
+            // are filtered out by filter_attn and never allocated a KV cache here.
+            // Using n_layer caused the last main layer (e.g. layer 63 in a 64+1 model)
+            // to be incorrectly flagged as a boundary layer, assigning it q8_0 V cache
+            // while the graph builder expected turbo2 strides → SET_ROWS OOB crash.
+            const uint32_t n_main = n_layer - hparams.nextn_predict_layers;
+            if (adaptive_mode == 1 && is_turbo && n_main >= 8) {
+                if (il < 4 || il >= n_main - 4) {
                     layer_type_k = GGML_TYPE_Q8_0;
                     layer_type_v = GGML_TYPE_Q8_0;
                 }
-            } else if (adaptive_mode == 2 && is_turbo && n_layer >= 8) {
-                if (il >= n_layer - 8) {
+            } else if (adaptive_mode == 2 && is_turbo && n_main >= 8) {
+                if (il >= n_main - 8) {
                     layer_type_k = GGML_TYPE_Q8_0;
                     layer_type_v = GGML_TYPE_Q8_0;
                 }
-            } else if (adaptive_mode == 5 && v_is_turbo && n_layer >= 8) {
+            } else if (adaptive_mode == 5 && v_is_turbo && n_main >= 8) {
                 // Boundary V (turbo4 boundaries): first2+last2 V=turbo4, rest V=turbo2
-                const bool is_boundary = (il < 2 || il >= n_layer - 2);
+                const bool is_boundary = (il < 2 || il >= n_main - 2);
                 layer_type_v = is_boundary ? GGML_TYPE_TURBO4_0 : GGML_TYPE_TURBO2_0;
                 if (il == 0) {
                     LLAMA_LOG_INFO("llama_kv_cache: Boundary V mode 5: first2+last2 V=turbo4, rest V=turbo2\n");
                 }
-            } else if (adaptive_mode == 6 && v_is_turbo && n_layer >= 8) {
+            } else if (adaptive_mode == 6 && v_is_turbo && n_main >= 8) {
                 // V-only: last 8 V=turbo4, rest V=turbo2
-                layer_type_v = (il >= n_layer - 8) ? GGML_TYPE_TURBO4_0 : GGML_TYPE_TURBO2_0;
+                layer_type_v = (il >= n_main - 8) ? GGML_TYPE_TURBO4_0 : GGML_TYPE_TURBO2_0;
                 if (il == 0) {
                     LLAMA_LOG_INFO("llama_kv_cache: V-only LA mode 6: last8 V=turbo4, rest V=turbo2\n");
                 }
-            } else if (adaptive_mode == 7 && v_is_turbo && n_layer >= 8) {
+            } else if (adaptive_mode == 7 && v_is_turbo && n_main >= 8) {
                 // Boundary V (recommended): first2+last2 V=q8_0, rest V=turbo2
-                const bool is_boundary = (il < 2 || il >= n_layer - 2);
+                const bool is_boundary = (il < 2 || il >= n_main - 2);
                 layer_type_v = is_boundary ? GGML_TYPE_Q8_0 : GGML_TYPE_TURBO2_0;
                 if (il == 0) {
                     LLAMA_LOG_INFO("llama_kv_cache: Boundary V mode 7: first2+last2 V=q8_0, rest V=turbo2\n");
