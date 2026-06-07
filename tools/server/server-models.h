@@ -11,6 +11,14 @@
 #include <memory>
 #include <set>
 
+// Signals between router parent and model child processes.
+// Also used by server.cpp (the child process entry point).
+#define CMD_ROUTER_TO_CHILD_EXIT  "cmd_router_to_child:exit"
+#define CMD_CHILD_TO_ROUTER_READY "cmd_child_to_router:ready"
+#define CMD_CHILD_TO_ROUTER_SLEEP "cmd_child_to_router:sleep"
+#define CMD_CHILD_TO_ROUTER_INFO  "cmd_child_to_router:info:"
+#define CMD_CHILD_TO_ROUTER_ERROR "cmd_child_to_router:error:"
+
 /**
  * state diagram:
  *
@@ -80,6 +88,19 @@ struct server_model_meta {
         return status == SERVER_MODEL_STATUS_UNLOADED && exit_code != 0;
     }
 
+    // true when the child was killed by a signal (e.g. SIGABRT from OOM,
+    // SIGTERM from force-kill).  exit_code is the negated signal number.
+    bool is_signaled() const {
+        return status == SERVER_MODEL_STATUS_UNLOADED && exit_code < 0;
+    }
+
+    // the signal number if is_signaled(), 0 otherwise
+    int exit_signal() const {
+        return is_signaled() ? -exit_code : 0;
+    }
+
+    std::string last_error = {}; // error message from CMD_CHILD_TO_ROUTER_ERROR or GGML_ABORT
+
     void update_args(common_preset_context & ctx_presets, std::string bin_path);
     void update_caps();
 };
@@ -99,7 +120,9 @@ private:
     std::condition_variable cv;
     std::map<std::string, instance_t> mapping;
 
-    // for stopping models
+    // for stopping models — separate mutex prevents cv_stop from contending
+    // with update_status() on mutex.
+    std::mutex stop_mutex;
     std::condition_variable cv_stop;
     std::set<std::string> stopping_models;
 
@@ -113,6 +136,7 @@ private:
     std::vector<std::string> base_env;
     common_preset base_preset; // base preset from llama-server CLI args
 
+
     void update_meta(const std::string & name, const server_model_meta & meta);
 
     // unload least recently used models if the limit is reached
@@ -121,8 +145,23 @@ private:
     // not thread-safe, caller must hold mutex
     void add_model(server_model_meta && meta);
 
+    // Extract the effective --slot-save-path from a model's rendered args.
+    // Returns empty string if not set.
+    static std::string get_model_slot_save_path(const server_model_meta & meta);
+
+    // Save all active slots of a child to disk via its HTTP API.
+    // No-op if the model has no --slot-save-path configured.
+    // Intended to be called before sending CMD_ROUTER_TO_CHILD_EXIT.
+    void save_slots_to_disk(const std::string & model_name, int port);
+
+    // Restore previously saved slots for a model from disk.
+    // No-op if the model has no --slot-save-path configured or no save files exist.
+    // Intended to be called after the child reports READY.
+    void restore_slots_from_disk(const std::string & model_name, int port);
+
 public:
     server_models(const common_params & params, int argc, char ** argv);
+
 
     // (re-)load the list of models from various sources and prepare the metadata mapping
     // - if this is called the first time, simply populate the metadata
@@ -149,6 +188,7 @@ public:
     // update the status of a model instance (thread-safe)
     void update_status(const std::string & name, server_model_status status, int exit_code);
     void update_loaded_info(const std::string & name, std::string & raw_info);
+    void update_last_error(const std::string & name, const std::string & error);
 
     // wait until the model instance is fully loaded (thread-safe)
     // return when the model no longer in "loading" state

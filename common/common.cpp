@@ -1166,7 +1166,7 @@ struct common_init_result::impl {
     std::vector<llama_sampler_seq_config> samplers_seq_config;
 };
 
-common_init_result::common_init_result(common_params & params) :
+common_init_result::common_init_result(common_params & params, bool model_only) :
     pimpl(new impl{}) {
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
@@ -1179,7 +1179,7 @@ common_init_result::common_init_result(common_params & params) :
             params.tensor_buft_overrides.data(),
             params.fit_params_target.data(),
             params.fit_params_min_ctx,
-            params.verbosity >= 4 ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+            params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
     }
 
     llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);
@@ -1188,6 +1188,10 @@ common_init_result::common_init_result(common_params & params) :
     }
 
     pimpl->model.reset(model);
+
+    if (model_only) {
+        return;
+    }
 
     const llama_vocab * vocab = llama_model_get_vocab(model);
 
@@ -1258,33 +1262,32 @@ common_init_result::common_init_result(common_params & params) :
         cparams.n_samplers = pimpl->samplers_seq_config.size();
     }
 
-    // [TAG_RS_STATE_ROLLBACK_SUPPORT]
-    // TODO: ngram speculative methods require checkpointing in addition to partial RS rollback
-    //       currently this is not supported. so we disable the partial rollback
-    if (cparams.n_rs_seq > 0 && (llama_model_is_recurrent(model) || llama_model_is_hybrid(model))) {
-        auto & types = params.speculative.types;
-
-        for (int i = 0; i < (int) types.size(); i++) {
-            if (types[i] == COMMON_SPECULATIVE_TYPE_NONE) {
-                continue;
-            }
-            if (types[i] == COMMON_SPECULATIVE_TYPE_DRAFT_MTP) {
-                continue;
-            }
-
-            cparams.n_rs_seq = 0;
-
-            LOG_WRN("%s: recurrent state rollback is not compatible with '%s' - disabling rollback support\n", __func__,
-                    common_speculative_type_to_str(types[i]).c_str());
-
-            break;
-        }
-    }
-
     llama_context * lctx = llama_init_from_model(model, cparams);
     if (lctx == NULL) {
         LOG_ERR("%s: failed to create context with model '%s'\n", __func__, params.model.path.c_str());
         return;
+    }
+
+    // Initialize TriAttention KV cache eviction if calibration stats provided
+    if (!params.triattention_stats.empty()) {
+        int32_t rc = llama_triattention_init(lctx,
+            params.triattention_stats.c_str(),
+            params.triattention_budget,
+            params.triattention_window,
+            params.triattention_offset_max,
+            params.triattention_mode,
+            params.triattention_trigger,
+            params.triattention_agg,
+            params.triattention_seed,
+            params.triattention_normalize,
+            params.triattention_protect_prefill,
+            params.triattention_disable_mlr,
+            params.triattention_disable_trig,
+            params.triattention_log);
+        if (rc != 0) {
+            LOG_WRN("%s: TriAttention initialization failed (stats=%s) — continuing without eviction\n",
+                    __func__, params.triattention_stats.c_str());
+        }
     }
 
     pimpl->context.reset(lctx);
@@ -1315,12 +1318,16 @@ std::vector<llama_adapter_lora_ptr> & common_init_result::lora() {
     return pimpl->lora;
 }
 
-common_init_result_ptr common_init_from_params(common_params & params) {
-    common_init_result_ptr res(new common_init_result(params));
+common_init_result_ptr common_init_from_params(common_params & params, bool model_only) {
+    common_init_result_ptr res(new common_init_result(params, model_only));
 
     llama_model * model = res->model();
     if (model == NULL) {
         LOG_ERR("%s: failed to load model '%s'\n", __func__, params.model.path.c_str());
+        return res;
+    }
+
+    if (model_only) {
         return res;
     }
 
@@ -1387,7 +1394,7 @@ common_init_result_ptr common_init_from_params(common_params & params) {
     }
 
     if (params.warmup) {
-        LOG_WRN("%s: warming up the model with an empty run - please wait ... (--no-warmup to disable)\n", __func__);
+        LOG_INF("%s: warming up the model with an empty run - please wait ... (--no-warmup to disable)\n", __func__);
 
         llama_set_warmup(lctx, true);
 
@@ -1984,36 +1991,37 @@ bool common_replay_last_token(struct llama_context * ctx, llama_token last_token
 
 bool common_prompt_batch_decode(
               struct llama_context * ctx,
-    const std::vector<llama_token> & tokens,
+    const std::vector<llama_token> & all_tokens,
+                               int   n_new,
                                int & n_past,
                                int   n_batch,
                   std::string_view   state_path,
                               bool   save_state) {
-    const int n_eval = tokens.size();
-    if (n_eval == 0) {
+    if (n_new == 0) {
         return true;
     }
+    const int offset = all_tokens.size() - n_new;
 
-    if (save_state && n_eval > 1) {
-        const int n_tokens_before_last = n_eval - 1;
+    if (save_state && n_new > 1) {
+        const int n_tokens_before_last = n_new - 1;
 
-        GGML_ASSERT(n_eval <= n_batch);
+        GGML_ASSERT(n_new <= n_batch);
 
         // Decode all but the last token so we can save the memory state before decoding the last token.
         // This is done so we can restore the session state later and replay the last token.
         // Memory implementations in recurrent/hybrid models don't support removing tokens from their
         // memory, so we can't just remove the last token from the memory and replay the last token which
         // is the reason for this logic.
-        if (llama_decode(ctx, llama_batch_get_one(const_cast<llama_token*>(tokens.data()), n_tokens_before_last))) {
+        if (llama_decode(ctx, llama_batch_get_one(const_cast<llama_token*>(all_tokens.data() + offset), n_tokens_before_last))) {
             LOG_ERR("%s : failed to eval\n", __func__);
             return false;
         }
         n_past += n_tokens_before_last;
 
-        llama_state_save_file(ctx, state_path.data(), tokens.data(), n_tokens_before_last);
-        LOG_INF("saved session before last token to %s, n_tokens = %d\n", state_path.data(), n_tokens_before_last);
+        llama_state_save_file(ctx, state_path.data(), all_tokens.data(), all_tokens.size() - 1);
+        LOG_INF("saved session before last token to %s, n_tokens = %zu\n", state_path.data(), all_tokens.size() - 1);
 
-        llama_token last_token = tokens.back();
+        llama_token last_token = all_tokens.back();
         llama_batch batch = llama_batch_get_one(&last_token, 1);
         int32_t pos = n_past;
         batch.pos = &pos;
@@ -2024,11 +2032,11 @@ bool common_prompt_batch_decode(
         }
         n_past++;
     } else {
-        if (llama_decode(ctx, llama_batch_get_one(const_cast<llama_token*>(tokens.data()), n_eval))) {
+        if (llama_decode(ctx, llama_batch_get_one(const_cast<llama_token*>(all_tokens.data() + offset), n_new))) {
             LOG_ERR("%s : failed to eval\n", __func__);
             return false;
         }
-        n_past += n_eval;
+        n_past += n_new;
     }
 
     return true;

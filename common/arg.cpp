@@ -4,7 +4,6 @@
 #include "chat.h"
 #include "common.h"
 #include "download.h"
-#include "hf-cache.h"
 #include "json-schema-to-grammar.h"
 #include "log.h"
 #include "sampling.h"
@@ -540,7 +539,11 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
                 throw std::invalid_argument(string_format("error: invalid argument: %s", arg.c_str()));
             }
             if (!seen_args.insert(arg).second) {
-                LOG_WRN("DEPRECATED: argument '%s' specified multiple times, use comma-separated values instead (only last value will be used)\n", arg.c_str());
+                const bool skip = (arg == "--spec-type");
+
+                if (!skip) {
+                    LOG_WRN("DEPRECATED: argument '%s' specified multiple times, use comma-separated values instead (only last value will be used)\n", arg.c_str());
+                }
             }
             auto & tmp = arg_to_options[arg];
             auto opt = *tmp.first;
@@ -589,12 +592,6 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
     // parse the first time to get -hf option (used for remote preset)
     parse_cli_args();
 
-    // TODO: Remove later
-    try {
-        hf_cache::migrate_old_cache_to_hf_cache(params.hf_token, params.offline);
-    } catch (const std::exception & e) {
-        LOG_WRN("HF cache migration failed: %s\n", e.what());
-    }
     // export_graph_ops loads only metadata
     const bool skip_model_download = ctx_arg.ex == LLAMA_EXAMPLE_EXPORT_GRAPH_OPS;
 
@@ -903,7 +900,11 @@ bool common_params_to_map(int argc, char ** argv, llama_example ex, std::map<com
             throw std::invalid_argument(string_format("error: invalid argument: %s", arg.c_str()));
         }
         if (!seen_args.insert(arg).second) {
-            LOG_WRN("DEPRECATED: argument '%s' specified multiple times, use comma-separated values instead (only last value will be used)\n", arg.c_str());
+            const bool skip = (arg == "--spec-type");
+
+            if (!skip) {
+                LOG_WRN("DEPRECATED: argument '%s' specified multiple times, use comma-separated values instead (only last value will be used)\n", arg.c_str());
+            }
         }
         auto opt = *arg_to_options[arg];
         std::string val;
@@ -2811,7 +2812,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, int value) {
             params.embd_normalize = value;
         }
-    ).set_examples({LLAMA_EXAMPLE_EMBEDDING, LLAMA_EXAMPLE_DEBUG}));
+    ).set_examples({LLAMA_EXAMPLE_EMBEDDING, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_DEBUG}));
     add_opt(common_arg(
         {"--embd-output-format"}, "FORMAT",
         "empty = default, \"array\" = [[],[]...], \"json\" = openai style, \"json+\" = same \"json\" + cosine similarity matrix, \"raw\" = plain whitespace-delimited output (one embedding per line)",
@@ -3093,6 +3094,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             if (!params.slot_save_path.empty() && params.slot_save_path[params.slot_save_path.size() - 1] != DIRECTORY_SEPARATOR) {
                 params.slot_save_path += DIRECTORY_SEPARATOR;
             }
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--slot-flush-interval"}, "SECONDS",
+        "periodically flush idle slot KV cache to disk every N seconds while model is loaded (requires --slot-save-path; 0 = disabled, default: 0)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("--slot-flush-interval must be >= 0");
+            }
+            params.slot_flush_interval = value;
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
@@ -3380,7 +3391,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             " - 1: error\n"
             " - 2: warning\n"
             " - 3: info\n"
-            " - 4: debug\n"
+            " - 4: trace (more info)\n"
+            " - 5: debug\n"
             "(default: %d)\n", params.verbosity),
         [](common_params & params, int value) {
             params.verbosity = value;
@@ -3606,6 +3618,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.speculative.draft.p_min = std::stof(value);
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_P_MIN"));
+    add_opt(common_arg(
+        {"--spec-draft-backend-sampling"},
+        {"--no-spec-draft-backend-sampling"},
+        string_format("offload draft sampling to the backend (default: %s)",
+                      params.speculative.draft.backend_sampling ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.speculative.draft.backend_sampling = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_BACKEND_SAMPLING"));
     add_opt(common_arg(
         {"--spec-draft-device", "-devd", "--device-draft"}, "<dev1,dev2,..>",
         "comma-separated list of devices to use for offloading the draft model (none = don't offload)\n"
@@ -4133,6 +4154,107 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
 
+    // TriAttention KV cache eviction args
+    add_opt(common_arg(
+        {"--triattention-stats"}, "PATH",
+        "path to .triattention calibration file (enables TriAttention eviction)",
+        [](common_params & params, const std::string & value) {
+            params.triattention_stats = value;
+        }
+    ).set_env("LLAMA_ARG_TRIATTENTION_STATS").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--triattention-budget"}, "N",
+        string_format("max KV entries to retain after pruning (default: %d)", params.triattention_budget),
+        [](common_params & params, int value) {
+            params.triattention_budget = value;
+        }
+    ).set_env("LLAMA_ARG_TRIATTENTION_BUDGET").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--triattention-window"}, "N",
+        string_format("pruning interval in decode tokens (default: %d)", params.triattention_window),
+        [](common_params & params, int value) {
+            params.triattention_window = value;
+        }
+    ).set_env("LLAMA_ARG_TRIATTENTION_WINDOW").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--triattention-offset-max"}, "N",
+        string_format("max geometric offset for scoring (default: %d)", params.triattention_offset_max),
+        [](common_params & params, int value) {
+            params.triattention_offset_max = value;
+        }
+    ).set_env("LLAMA_ARG_TRIATTENTION_OFFSET_MAX").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--triattention-mode"}, "MODE",
+        "pruning mode: global, per-kv-head, per-layer-head (default: global)",
+        [](common_params & params, const std::string & value) {
+            if (value == "global")          params.triattention_mode = 0;
+            else if (value == "per-kv-head")     params.triattention_mode = 1;
+            else if (value == "per-layer-head")  params.triattention_mode = 2;
+            else throw std::invalid_argument("invalid triattention mode: " + value);
+        }
+    ).set_env("LLAMA_ARG_TRIATTENTION_MODE").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--triattention-trigger"}, "MODE",
+        "trigger strategy: interval, slack (default: interval)",
+        [](common_params & params, const std::string & value) {
+            if (value == "interval")    params.triattention_trigger = 0;
+            else if (value == "slack")  params.triattention_trigger = 1;
+            else throw std::invalid_argument("invalid triattention trigger: " + value);
+        }
+    ).set_env("LLAMA_ARG_TRIATTENTION_TRIGGER").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--triattention-agg"}, "MODE",
+        "score aggregation: mean, max (default: mean)",
+        [](common_params & params, const std::string & value) {
+            if (value == "mean")    params.triattention_agg = 0;
+            else if (value == "max")  params.triattention_agg = 1;
+            else throw std::invalid_argument("invalid triattention aggregation: " + value);
+        }
+    ).set_env("LLAMA_ARG_TRIATTENTION_AGG").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--triattention-seed"}, "N",
+        string_format("RNG seed for tie-breaking noise, -1 to disable (default: %d)", params.triattention_seed),
+        [](common_params & params, int value) {
+            params.triattention_seed = value;
+        }
+    ).set_env("LLAMA_ARG_TRIATTENTION_SEED").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--triattention-normalize"},
+        "z-score normalize scores per head before selection",
+        [](common_params & params) {
+            params.triattention_normalize = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--triattention-no-protect-prefill"},
+        "allow eviction of prompt tokens (default: protected)",
+        [](common_params & params) {
+            params.triattention_protect_prefill = false;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--triattention-disable-mlr"},
+        "ablation: disable MLR weighting in norm term",
+        [](common_params & params) {
+            params.triattention_disable_mlr = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--triattention-disable-trig"},
+        "ablation: use norm-only scoring (no trigonometric term)",
+        [](common_params & params) {
+            params.triattention_disable_trig = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--triattention-log"},
+        {"--no-triattention-log"},
+        "log TriAttention pruning events to stderr (default: enabled)",
+        [](common_params & params, bool value) {
+            params.triattention_log = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+
     add_opt(common_arg(
         {"--spec-default"},
         string_format("enable default speculative decoding config"),
@@ -4141,6 +4263,12 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.speculative.ngram_mod.n_match = 24;
             params.speculative.ngram_mod.n_min = 48;
             params.speculative.ngram_mod.n_max = 64;
+
+            // TODO: not sure if this is a good config - explore more settings and potentially enable it
+            //params.speculative.types.push_back(COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V);
+            //params.speculative.ngram_map_k4v.size_n = 8;
+            //params.speculative.ngram_map_k4v.size_m = 24;
+            //params.speculative.ngram_map_k4v.min_hits = 2;
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
 

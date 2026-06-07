@@ -29,6 +29,9 @@ private:
     std::function<void(server_task &&)> callback_new_task;
     std::function<void(void)>           callback_update_slots;
     std::function<void(bool)>           callback_sleeping_state;
+    // Called on each ~1 s idle tick (when no tasks are pending and not sleeping).
+    // Used for periodic housekeeping such as flushing slot KV cache to disk.
+    std::function<void(void)>           callback_periodic;
 
 public:
     // Add a new task to the end of the queue
@@ -108,6 +111,11 @@ public:
         } else {
             callback_sleeping_state = std::move(callback);
         }
+    }
+
+    // Register a callback that fires on each ~1 s idle tick (no tasks pending, not sleeping).
+    void on_periodic(std::function<void(void)> callback) {
+        callback_periodic = std::move(callback);
     }
 
 private:

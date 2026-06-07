@@ -9,6 +9,7 @@
 #include <stdbool.h>
 
 #ifdef __cplusplus
+#include <map>
 #include <string>
 #include <vector>
 #include <cinttypes>
@@ -177,6 +178,26 @@ MTMD_API llama_pos                  mtmd_input_chunk_get_n_pos       (const mtmd
 MTMD_API mtmd_input_chunk * mtmd_input_chunk_copy(const mtmd_input_chunk * chunk);
 MTMD_API void               mtmd_input_chunk_free(mtmd_input_chunk * chunk);
 
+// Serialize a non-text chunk to a byte buffer (metadata only — no pixel/audio data).
+// The buffer is heap-allocated; caller must call free() on *out_buf when done.
+// Returns the number of bytes written, or 0 on failure.
+// Only IMAGE and AUDIO chunks are supported; TEXT chunks return 0.
+// Format (little-endian):
+//   uint8   type        (MTMD_INPUT_CHUNK_TYPE_IMAGE=1 or MTMD_INPUT_CHUNK_TYPE_AUDIO=2)
+//   uint32  n_tokens    (KV cell count for this chunk)
+//   uint32  id_len      (byte length of id string, may be 0)
+//   char[]  id          (id_len bytes, not null-terminated)
+//   [IMAGE only]
+//   uint32  nx
+//   uint32  ny
+//   uint8   pos_type    (0=NORMAL, 1=MROPE, 2=HUNYUANVL)
+//   uint32  image_idx
+MTMD_API size_t mtmd_input_chunk_serialize  (const mtmd_input_chunk * chunk, uint8_t ** out_buf);
+// Deserialize a chunk from a byte buffer previously produced by mtmd_input_chunk_serialize.
+// Returns a new chunk (caller must mtmd_input_chunk_free it), or nullptr on failure.
+// The batch_f32 field is left empty; the caller is responsible for re-encoding if needed.
+MTMD_API mtmd_input_chunk * mtmd_input_chunk_deserialize(const uint8_t * buf, size_t buf_size);
+
 
 // mtmd_image_tokens
 //
@@ -259,6 +280,14 @@ MTMD_API mtmd_input_chunks * mtmd_test_create_input_chunks(void);
 
 #ifdef __cplusplus
 } // extern "C"
+#endif
+
+// Get memory usage of the current model in bytes, per backend device
+// Note: this is an unstable API, used internally by fit_params; it WILL be removed or changed without deprecation
+#ifdef __cplusplus
+MTMD_API std::map<ggml_backend_dev_t, size_t> mtmd_get_memory_usage(
+    const char * mmproj_fname,
+    struct mtmd_context_params ctx_params);
 #endif
 
 //

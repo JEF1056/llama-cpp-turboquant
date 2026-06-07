@@ -6,11 +6,14 @@
 #include "llama-impl.h"
 #include "llama-batch.h"
 #include "llama-io.h"
+#include "llama-kv-cache.h"
 #include "llama-memory.h"
+#include "llama-memory-hybrid.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-ext.h"
 #include "llama.h"
+#include "llama-triattention.h"
 
 #include <cinttypes>
 #include <cmath>
@@ -64,8 +67,9 @@ llama_context::llama_context(
     cparams.yarn_attn_factor = params.yarn_attn_factor >= 0.0f ? params.yarn_attn_factor : hparams.yarn_attn_factor;
     cparams.yarn_beta_fast   = params.yarn_beta_fast   >= 0.0f ? params.yarn_beta_fast   : hparams.yarn_beta_fast;
     cparams.yarn_beta_slow   = params.yarn_beta_slow   >= 0.0f ? params.yarn_beta_slow   : hparams.yarn_beta_slow;
-    cparams.embeddings       = params.embeddings;
-    cparams.embeddings_pre_norm = false;
+    cparams.embeddings                  = params.embeddings;
+    cparams.embeddings_pre_norm         = false;
+    cparams.embeddings_pre_norm_masked  = false;
     cparams.offload_kqv      = params.offload_kqv;
     cparams.no_perf          = params.no_perf;
     cparams.pooling_type     = params.pooling_type;
@@ -906,6 +910,16 @@ float * llama_context::get_embeddings_pre_norm_ith(int32_t i) {
         }
 
         const uint32_t n_embd = model.hparams.n_embd;
+
+        if (!cparams.embeddings_pre_norm_masked) {
+            // unmasked: pre-norm rows are stored densely, indexed by raw token position.
+            if (i < 0 || (size_t)(i + 1) * n_embd > embd_pre_norm.size) {
+                throw std::runtime_error(format("out of range [0, %zu)", embd_pre_norm.size / n_embd));
+            }
+            return embd_pre_norm.data + (size_t) i * n_embd;
+        }
+
+        j = output_resolve_row(i);
         return embd_pre_norm.data + j*n_embd;
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: invalid pre-norm embeddings id %d, reason: %s\n", __func__, i, err.what());
@@ -1097,10 +1111,11 @@ void llama_context::set_embeddings(bool value) {
     //sched_need_reserve = true;
 }
 
-void llama_context::set_embeddings_pre_norm(bool value) {
-    LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
+void llama_context::set_embeddings_pre_norm(bool value, bool masked) {
+    LLAMA_LOG_DEBUG("%s: value = %d, masked = %d\n", __func__, value, masked);
 
-    cparams.embeddings_pre_norm = value;
+    cparams.embeddings_pre_norm        = value;
+    cparams.embeddings_pre_norm_masked = masked;
 }
 
 void llama_context::set_causal_attn(bool value) {
@@ -1134,6 +1149,19 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
     }
 
     LLAMA_LOG_DEBUG("%s: seq_id = %d, sampler = %p\n", __func__, (int) seq_id, (void *) sampler);
+
+    if (sampler && model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
+        static bool warned = false;
+        if (!warned) {
+            LLAMA_LOG_WARN("%s: backend sampling not supported with SPLIT_MODE_TENSOR; using CPU\n", __func__);
+            warned = true;
+        }
+        if (sampling.samplers.count(seq_id) > 0) {
+            sched_need_reserve = true;
+        }
+        sampling.samplers.erase(seq_id);
+        return false;
+    }
 
     const bool can_offload =
         sampler &&
@@ -1748,6 +1776,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     int64_t n_outputs_prev = 0;
     int64_t n_outputs_pre_norm_prev = 0;
+    int64_t n_tokens_prev  = 0; // tracked for future unmasked pre-norm offset (upstream compat)
 
     do {
         const auto & ubatch = mctx->get_ubatch();
@@ -1920,6 +1949,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
 
         n_outputs_prev += n_outputs;
+        n_tokens_prev  += ubatch.n_tokens;
     } while (mctx->next());
 
     // set to total number of outputs in the batch, for use in llama_get_logits_ith
@@ -2014,6 +2044,12 @@ uint32_t llama_context::output_reserve(int32_t n_outputs, int32_t n_outputs_pre_
     logits.size        = has_logits        ? n_vocab*n_outputs_max     : 0;
     embd.size          = has_embd          ? n_embd_out*n_outputs_max  : 0;
     embd_pre_norm.size = has_embd_pre_norm ? n_embd*n_outputs_pre_norm_max : 0;
+
+    if (has_embd_pre_norm && !cparams.embeddings_pre_norm_masked) {
+        // unmasked: pre-norm row exists for every token in the batch, not just
+        // those flagged via batch.logits[i] -> size by token count instead.
+        embd_pre_norm.size = (size_t) n_embd * n_batch;
+    }
 
     // Allocate backend sampling output buffers if there are backend samplers configured.
     const bool has_sampling = !sampling.samplers.empty();
@@ -3583,8 +3619,8 @@ float * llama_get_embeddings_seq(llama_context * ctx, llama_seq_id seq_id) {
     return ctx->get_embeddings_seq(seq_id);
 }
 
-void llama_set_embeddings_pre_norm(llama_context * ctx, bool value) {
-    ctx->set_embeddings_pre_norm(value);
+void llama_set_embeddings_pre_norm(llama_context * ctx, bool value, bool masked) {
+    ctx->set_embeddings_pre_norm(value, masked);
 }
 
 float * llama_get_embeddings_pre_norm(llama_context * ctx) {
@@ -3789,6 +3825,68 @@ bool llama_memory_can_shift(llama_memory_t mem) {
     }
 
     return mem->get_can_shift();
+}
+
+int32_t llama_triattention_init(
+        struct llama_context * ctx,
+                  const char * stats_path,
+                     int32_t   budget,
+                     int32_t   divide_length,
+                     int32_t   offset_max,
+                     int32_t   mode,
+                     int32_t   trigger,
+                     int32_t   agg,
+                     int32_t   seed,
+                        bool   normalize_scores,
+                        bool   protect_prefill,
+                        bool   disable_mlr,
+                        bool   disable_trig,
+                        bool   enable_logging) {
+    if (!ctx || !stats_path || stats_path[0] == '\0') {
+        return -1;
+    }
+
+    // Get the memory and try to cast to llama_kv_cache
+    auto * mem = ctx->get_memory();
+    if (!mem) {
+        LLAMA_LOG_ERROR("%s: context has no memory\n", __func__);
+        return -1;
+    }
+
+    // For hybrid models (e.g. Qwen3.5/3.6 DeltaNet+Attention), TriAttention
+    // applies only to the attention KV sub-cache — the recurrent (DeltaNet)
+    // state is fixed-size and position-independent, so it doesn't benefit
+    // from KV eviction.  Unwrap the hybrid wrapper to reach the inner KV cache.
+    llama_kv_cache * kv = dynamic_cast<llama_kv_cache *>(mem);
+    if (!kv) {
+        auto * hybrid = dynamic_cast<llama_memory_hybrid *>(mem);
+        if (hybrid) {
+            kv = hybrid->get_mem_attn();
+            LLAMA_LOG_INFO("%s: hybrid model detected — TriAttention will prune attention KV sub-cache only (recurrent layers unaffected)\n",
+                __func__);
+        }
+        if (!kv) {
+            LLAMA_LOG_ERROR("%s: memory is not a KV cache or hybrid memory (pure recurrent models not supported)\n", __func__);
+            return -1;
+        }
+    }
+
+    triattention_config cfg = {};
+    cfg.budget           = (uint32_t)budget;
+    cfg.divide_length    = (uint32_t)divide_length;
+    cfg.offset_max       = (uint32_t)offset_max;
+    cfg.mode             = (triattention_mode)mode;
+    cfg.trigger          = (triattention_trigger)trigger;
+    cfg.agg              = (triattention_agg)agg;
+    cfg.seed             = seed;
+    cfg.normalize_scores = normalize_scores;
+    cfg.protect_prefill  = protect_prefill;
+    cfg.disable_mlr      = disable_mlr;
+    cfg.disable_trig     = disable_trig;
+    cfg.enable_logging   = enable_logging;
+
+    kv->init_triattention(stats_path, &cfg);
+    return kv->has_triattention() ? 0 : -1;
 }
 
 // llama state API

@@ -68,6 +68,11 @@ struct server_context {
     // terminate main loop (will unblock start_loop)
     void terminate();
 
+    // Save all non-empty slot KV states to disk.
+    // Must be called after start_loop() returns (queue is terminated, no concurrent slot access).
+    // No-op if --slot-save-path is not configured.
+    void save_slots_on_shutdown();
+
     // get the underlaying llama_context, can return nullptr if sleeping
     // not thread-safe, should only be used from the main thread
     llama_context * get_llama_context() const;

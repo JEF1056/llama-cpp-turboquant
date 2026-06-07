@@ -32,6 +32,8 @@ static std::set<std::string> get_remote_preset_whitelist(const std::map<std::str
         "batch-size",
         "ubatch-size",
         "cache-reuse",
+        "cache-type-k-draft",
+        "cache-type-v-draft",
         "chat-template-kwargs",
         "mmap",
         // note: sampling params are automatically allowed by default

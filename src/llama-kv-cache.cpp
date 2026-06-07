@@ -1,4 +1,5 @@
 #include "llama-kv-cache.h"
+#include "llama-triattention.h"
 
 #include "llama-impl.h"
 #include "llama-io.h"
@@ -548,11 +549,19 @@ llama_kv_cache::llama_kv_cache(
     debug = LLAMA_KV_CACHE_DEBUG ? atoi(LLAMA_KV_CACHE_DEBUG) : 0;
 }
 
+llama_kv_cache::~llama_kv_cache() {
+    triattention_free(triattention_st);
+    triattention_st = nullptr;
+}
+
 void llama_kv_cache::clear(bool data) {
     for (uint32_t s = 0; s < n_stream; ++s) {
         v_cells[s].reset();
         v_heads[s] = 0;
     }
+
+    // Reset TriAttention position tracking
+    triattention_on_reset(triattention_st);
 
     if (data) {
         for (auto & [_, buf] : ctxs_bufs) {
@@ -598,6 +607,7 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
             }
 
             if (cells.seq_has(i, seq_id) && cells.seq_rm(i, seq_id)) {
+                triattention_on_cell_removed(triattention_st, i);
                 if (new_head == cells.size()) {
                     new_head = i;
                 }
@@ -622,6 +632,7 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
                 }
 
                 cells.rm(i);
+                triattention_on_cell_removed(triattention_st, i);
 
                 if (new_head == cells.size()) {
                     new_head = i;
@@ -749,7 +760,14 @@ void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
 
 void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
-    GGML_ASSERT(hparams.n_pos_per_embd() == 1 && "seq_add() is only supported for n_pos_per_embd() == 1");
+
+    // M-RoPE / I-M-RoPE (n_pos_per_embd() > 1) support:
+    //   For text tokens, all M-RoPE position dims collapse to [pos, pos, pos, 0], so a scalar
+    //   position shift is well-defined and build_rope_shift() re-applies the rotation correctly
+    //   (it normalizes M-RoPE/I-M-RoPE to NEOX for the shift). This enables --cache-reuse for
+    //   hybrid M-RoPE models (e.g. Qwen3.5/3.6).
+    //   Image tokens carry non-zero 2D spatial positions in llama_kv_cell_ext (x, y) and cannot
+    //   be safely shifted with a scalar delta — see the image-token guard below.
 
     auto & cells = v_cells[seq_to_stream[seq_id]];
     auto & head  = v_heads[seq_to_stream[seq_id]];
@@ -773,6 +791,27 @@ void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, ll
         return;
     }
 
+    // Image-token guard: refuse to shift if any cell in range carries a non-zero 2D spatial
+    // position (image token). Shifting image KV cells with a scalar delta would corrupt their
+    // M-RoPE rotation. The server already gates cache_reuse on text-only prompts
+    // (!slot.prompt.tokens.has_mtmd), so this is defense-in-depth on a path that should not
+    // currently fire. If it ever does, skip the whole shift rather than silently corrupt state.
+    // FIXME: implement spatially-correct shifting for image tokens to enable cache_reuse with
+    //        mixed image+text prompts.
+    if (hparams.n_pos_per_embd() > 1) {
+        for (uint32_t i = 0; i < cells.size(); ++i) {
+            if (!cells.pos_in(i, p0, p1) || !cells.seq_has(i, seq_id)) {
+                continue;
+            }
+            const auto & e = cells.ext_get(i);
+            if (e.x != 0 || e.y != 0) {
+                LLAMA_LOG_WARN("%s: refusing seq_add shift over image tokens (cell %u has ext=(%d,%d)); "
+                               "cache_reuse over image tokens is not supported\n", __func__, i, e.x, e.y);
+                return;
+            }
+        }
+    }
+
     for (uint32_t i = 0; i < cells.size(); ++i) {
         if (!cells.pos_in(i, p0, p1)) {
             continue;
@@ -790,6 +829,9 @@ void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, ll
     // If we freed up a slot, set head to it so searching can start there.
     // Otherwise we just start the next search from the beginning.
     head = new_head != cells.size() ? new_head : 0;
+
+    // Update TriAttention position tracking for the shifted range
+    triattention_on_position_shift(triattention_st, shift, p0, p1);
 }
 
 void llama_kv_cache::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) {
@@ -1275,10 +1317,12 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
 
                 seq_pos_max_rm[seq_id] = std::max(seq_pos_max_rm[seq_id], pos);
 
+                triattention_on_cell_removed(triattention_st, idx);
                 cells.rm(idx);
             }
 
             cells.pos_set(idx, ubatch.pos[i]);
+            triattention_on_token_added(triattention_st, idx, ubatch.pos[i]);
 
             if (ubatch.is_pos_2d()) {
                 llama_kv_cell_ext ext {
@@ -1320,6 +1364,34 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
 
         head = sinfo.idxs[s].back() + 1;
     }
+
+    // TriAttention: set prefix length and check if pruning should trigger
+    if (triattention_st != nullptr) {
+        // Set prefix_length once on the first prompt batch (contains position 0, >1 token).
+        // This enables prefix protection during pruning so prompt tokens are never evicted.
+        if (triattention_st->prefix_length == 0 && ubatch.n_tokens > 1) {
+            bool has_pos_zero = false;
+            llama_pos max_batch_pos = 0;
+            for (uint32_t i = 0; i < ubatch.n_tokens; i++) {
+                if (ubatch.pos[i] == 0) has_pos_zero = true;
+                if (ubatch.pos[i] > max_batch_pos) max_batch_pos = ubatch.pos[i];
+            }
+            if (has_pos_zero) {
+                triattention_st->prefix_length = max_batch_pos + 1;
+            }
+        }
+
+        // Count used cells in stream 0 (primary stream)
+        uint32_t n_used = 0;
+        for (uint32_t i = 0; i < v_cells[0].size(); ++i) {
+            if (!v_cells[0].is_empty(i)) {
+                n_used++;
+            }
+        }
+        if (triattention_should_prune(triattention_st, n_used)) {
+            triattention_try_prune();
+        }
+    }
 }
 
 bool llama_kv_cache::get_can_shift() const {
@@ -1327,9 +1399,13 @@ bool llama_kv_cache::get_can_shift() const {
     if (model.arch == LLM_ARCH_STEP35) {
         return false;
     }
-    if (hparams.n_pos_per_embd() > 1) {
-        return false;
-    }
+    // M-RoPE / I-M-RoPE (n_pos_per_embd() > 1) is supported for text tokens:
+    //   build_rope_shift() normalizes M-RoPE/I-M-RoPE to NEOX, and for text tokens all M-RoPE
+    //   position dims collapse to [pos, pos, pos, 0], so a scalar K-shift is equivalent to the
+    //   forward-pass rotation. Image tokens (non-zero ext spatial positions) are guarded against
+    //   in seq_add(). This enables --cache-reuse for hybrid M-RoPE models (e.g. Qwen3.5/3.6);
+    //   for hybrid recurrent models, correctness of the recurrent state after a reuse shift is
+    //   carried by the server's context-checkpoint restore machinery (see server-context.cpp).
     return true;
 }
 
@@ -2646,6 +2722,90 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
     }
 
     return true;
+}
+
+//
+// llama_kv_cache: TriAttention integration
+//
+
+void llama_kv_cache::init_triattention(const char * stats_path, const triattention_config * cfg) {
+    if (!stats_path || stats_path[0] == '\0') {
+        return;
+    }
+    if (triattention_st) {
+        triattention_free(triattention_st);
+        triattention_st = nullptr;
+    }
+
+    const uint32_t kv_size = v_cells.empty() ? 0 : (uint32_t)v_cells[0].size();
+    const double rope_theta = (double)hparams.rope_freq_base_train;
+    const uint32_t head_dim = hparams.n_embd_head_k(0);
+    const uint32_t n_kv_heads = hparams.n_head_kv(0);
+
+    triattention_st = triattention_init(stats_path, cfg, kv_size, rope_theta, head_dim, n_kv_heads);
+    if (!triattention_st) {
+        LLAMA_LOG_ERROR("%s: failed to initialize TriAttention from %s\n", __func__, stats_path);
+    }
+}
+
+int32_t llama_kv_cache::triattention_try_prune() {
+    if (!triattention_st) {
+        return 0;
+    }
+
+    // Build K tensor array and layer map for triattention_prune_impl()
+    const uint32_t n_kv_layers = (uint32_t)layers.size();
+    std::vector<ggml_tensor *> k_tensors(n_kv_layers);
+    std::vector<int32_t> layer_map(n_kv_layers);
+
+    for (uint32_t i = 0; i < n_kv_layers; i++) {
+        k_tensors[i] = layers[i].k;
+        layer_map[i] = (int32_t)layers[i].il;
+    }
+
+    const uint32_t kv_size = (uint32_t)v_cells[0].size();
+
+    int32_t n_evicted = triattention_prune_impl(
+        triattention_st,
+        k_tensors.data(),
+        n_kv_layers,
+        layer_map.data(),
+        kv_size);
+
+    if (n_evicted > 0) {
+        // Sync cell metadata: remove cells that triattention marked as evicted
+        // (cell_positions[i] == -1 after prune means the cell was evicted)
+        auto & cells = v_cells[0];
+        auto & head  = v_heads[0];
+        uint32_t new_head = cells.size();
+
+        for (uint32_t i = 0; i < kv_size; i++) {
+            if (triattention_st->cell_positions[i] < 0 && !cells.is_empty(i)) {
+                cells.rm(i);
+                if (new_head == cells.size()) {
+                    new_head = i;
+                }
+            }
+        }
+
+        if (new_head != cells.size() && new_head < head) {
+            head = new_head;
+        }
+
+        // Note: position gaps from evicted cells are intentionally left as-is.
+        // The recent-token protection in triattention_prune_impl() ensures that
+        // the most recent divide_length tokens are never evicted, so seq_pos_max
+        // always equals the server's expected position. The batch validation
+        // (Y = X + 1) passes because seq_pos_max is unchanged. Position gaps in
+        // the middle are harmless: RoPE handles non-consecutive positions, and
+        // nothing in the attention computation requires contiguous positions.
+    }
+
+    return n_evicted;
+}
+
+bool llama_kv_cache::has_triattention() const {
+    return triattention_st != nullptr;
 }
 
 //
