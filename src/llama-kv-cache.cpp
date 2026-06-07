@@ -760,7 +760,14 @@ void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
 
 void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
-    GGML_ASSERT(hparams.n_pos_per_embd() == 1 && "seq_add() is only supported for n_pos_per_embd() == 1");
+
+    // M-RoPE / I-M-RoPE (n_pos_per_embd() > 1) support:
+    //   For text tokens, all M-RoPE position dims collapse to [pos, pos, pos, 0], so a scalar
+    //   position shift is well-defined and build_rope_shift() re-applies the rotation correctly
+    //   (it normalizes M-RoPE/I-M-RoPE to NEOX for the shift). This enables --cache-reuse for
+    //   hybrid M-RoPE models (e.g. Qwen3.5/3.6).
+    //   Image tokens carry non-zero 2D spatial positions in llama_kv_cell_ext (x, y) and cannot
+    //   be safely shifted with a scalar delta — see the image-token guard below.
 
     auto & cells = v_cells[seq_to_stream[seq_id]];
     auto & head  = v_heads[seq_to_stream[seq_id]];
@@ -782,6 +789,27 @@ void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, ll
     // If there is no range then return early to avoid looping over all cells.
     if (p0 == p1) {
         return;
+    }
+
+    // Image-token guard: refuse to shift if any cell in range carries a non-zero 2D spatial
+    // position (image token). Shifting image KV cells with a scalar delta would corrupt their
+    // M-RoPE rotation. The server already gates cache_reuse on text-only prompts
+    // (!slot.prompt.tokens.has_mtmd), so this is defense-in-depth on a path that should not
+    // currently fire. If it ever does, skip the whole shift rather than silently corrupt state.
+    // FIXME: implement spatially-correct shifting for image tokens to enable cache_reuse with
+    //        mixed image+text prompts.
+    if (hparams.n_pos_per_embd() > 1) {
+        for (uint32_t i = 0; i < cells.size(); ++i) {
+            if (!cells.pos_in(i, p0, p1) || !cells.seq_has(i, seq_id)) {
+                continue;
+            }
+            const auto & e = cells.ext_get(i);
+            if (e.x != 0 || e.y != 0) {
+                LLAMA_LOG_WARN("%s: refusing seq_add shift over image tokens (cell %u has ext=(%d,%d)); "
+                               "cache_reuse over image tokens is not supported\n", __func__, i, e.x, e.y);
+                return;
+            }
+        }
     }
 
     for (uint32_t i = 0; i < cells.size(); ++i) {
@@ -1371,9 +1399,13 @@ bool llama_kv_cache::get_can_shift() const {
     if (model.arch == LLM_ARCH_STEP35) {
         return false;
     }
-    if (hparams.n_pos_per_embd() > 1) {
-        return false;
-    }
+    // M-RoPE / I-M-RoPE (n_pos_per_embd() > 1) is supported for text tokens:
+    //   build_rope_shift() normalizes M-RoPE/I-M-RoPE to NEOX, and for text tokens all M-RoPE
+    //   position dims collapse to [pos, pos, pos, 0], so a scalar K-shift is equivalent to the
+    //   forward-pass rotation. Image tokens (non-zero ext spatial positions) are guarded against
+    //   in seq_add(). This enables --cache-reuse for hybrid M-RoPE models (e.g. Qwen3.5/3.6);
+    //   for hybrid recurrent models, correctness of the recurrent state after a reuse shift is
+    //   carried by the server's context-checkpoint restore machinery (see server-context.cpp).
     return true;
 }
 

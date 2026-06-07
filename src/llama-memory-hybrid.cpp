@@ -152,6 +152,25 @@ void llama_memory_hybrid::seq_keep(llama_seq_id seq_id) {
 
 void llama_memory_hybrid::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
     mem_attn->seq_add(seq_id, p0, p1, shift);
+
+    // Recurrent state note (cache_reuse / M-RoPE):
+    //   When shift != 0, a divergent region was removed before a reused chunk. The attention
+    //   KV for the reused chunk is correctly re-rotated by the K-shift, but the recurrent/SSM
+    //   state is a single cumulative tensor that summarizes the *old* token sequence and cannot
+    //   be shifted or rotated. mem_recr->seq_add() only bumps the tail cell's pos metadata; it
+    //   does NOT make the cumulative state consistent with the new (shorter) prefix.
+    //
+    //   We deliberately do NOT invalidate the recurrent tail here:
+    //     - Zeroing the tail would make seq_pos_min() return -1, which the server treats as a
+    //       fatal "pos_min == -1 but n_past > 0" abort.
+    //     - The recurrent seq_pos_min() is high (near the tail), so the hybrid seq_pos_min()
+    //       (= max(attn, recr)) is high. This guarantees the server's post-reuse checkpoint
+    //       gate (`pos_min >= pos_min_thold`) fires for hybrid models, which then either
+    //       restores the recurrent state from a context checkpoint (PARTIAL_ONLY restore
+    //       overwrites only the recurrent state, keeping the shifted attention KV) or forces a
+    //       full reprocess. Either way the cumulative state is rebuilt correctly.
+    //   So the pos-only bump below is harmless: it is overwritten by the checkpoint restore (or
+    //   discarded on full reprocess) before any decode consumes the recurrent state.
     mem_recr->seq_add(seq_id, p0, p1, shift);
 }
 

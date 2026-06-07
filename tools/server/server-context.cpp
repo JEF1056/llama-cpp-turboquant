@@ -189,6 +189,176 @@ static bool slot_checkpoints_load(const std::string & filepath,
     return true;
 }
 
+//
+// mtmd (multimodal) chunk sidecar helpers
+//
+// Saves/restores the map_idx_to_media from a server_tokens alongside the main
+// KV slot file.  Only metadata is persisted (no pixel/audio data) — the KV
+// tensors already encode each image's attention contribution.  On restore the
+// chunks are reconstructed with empty batch_f32; the client will re-send images
+// on the next turn which triggers full re-encoding.
+//
+// File format (little-endian): filepath + ".mtmd"
+//   uint32  magic   = 0x4D544D44  ("MTMD")
+//   uint32  version = 1
+//   uint32  n_chunks
+//   For each chunk:
+//     uint64  start_idx   (index in token vector where this chunk begins)
+//     uint64  ser_size    (byte size of the serialized chunk payload)
+//     uint8   ser[ser_size]
+//
+
+static bool slot_mtmd_save(const std::string & filepath, const server_tokens & prompt_tokens) {
+    if (!prompt_tokens.has_mtmd) {
+        return true; // nothing to save
+    }
+
+    // collect non-text chunks with their start indices
+    struct chunk_entry { size_t idx; std::vector<uint8_t> data; };
+    std::vector<chunk_entry> entries;
+
+    const llama_tokens & raw = prompt_tokens.get_tokens_raw();
+    size_t i = 0;
+    while (i < raw.size()) {
+        if (raw[i] == LLAMA_TOKEN_NULL) {
+            const auto & chunk_ptr = prompt_tokens.find_chunk(i);
+            if (chunk_ptr) {
+                uint8_t * buf = nullptr;
+                size_t sz = mtmd_input_chunk_serialize(chunk_ptr.get(), &buf);
+                if (sz > 0 && buf) {
+                    chunk_entry e;
+                    e.idx  = i;
+                    e.data = std::vector<uint8_t>(buf, buf + sz);
+                    free(buf);
+                    entries.push_back(std::move(e));
+                    // advance past all null tokens belonging to this chunk
+                    const size_t n_tok = mtmd_input_chunk_get_n_tokens(chunk_ptr.get());
+                    i += n_tok;
+                    continue;
+                }
+            }
+        }
+        ++i;
+    }
+
+    if (entries.empty()) {
+        return true;
+    }
+
+    const std::string mtmd_path = filepath + ".mtmd";
+    std::ofstream ofs(mtmd_path, std::ios::binary);
+    if (!ofs) {
+        SRV_ERR("failed to open mtmd sidecar for writing: %s\n", mtmd_path.c_str());
+        return false;
+    }
+
+    auto write_u32 = [&](uint32_t v) { ofs.write(reinterpret_cast<const char *>(&v), 4); };
+    auto write_u64 = [&](uint64_t v) { ofs.write(reinterpret_cast<const char *>(&v), 8); };
+
+    write_u32(0x4D544D44); // "MTMD"
+    write_u32(1);           // version
+    write_u32((uint32_t)entries.size());
+
+    for (const auto & e : entries) {
+        write_u64((uint64_t)e.idx);
+        write_u64((uint64_t)e.data.size());
+        ofs.write(reinterpret_cast<const char *>(e.data.data()), e.data.size());
+    }
+
+    SRV_INF("saved %zu mtmd chunk(s) to %s\n", entries.size(), mtmd_path.c_str());
+    return ofs.good();
+}
+
+// Reconstruct server_tokens from a restored plain token vector + mtmd sidecar.
+// If the sidecar doesn't exist, the slot is treated as text-only (no error).
+// On success, prompt_tokens is fully replaced with nulls + map_idx_to_media rebuilt.
+static bool slot_mtmd_load(const std::string & filepath, server_tokens & prompt_tokens,
+                           const llama_tokens & restored_tokens) {
+    const std::string mtmd_path = filepath + ".mtmd";
+    std::ifstream ifs(mtmd_path, std::ios::binary);
+    if (!ifs) {
+        // no sidecar — text-only slot, just insert the restored tokens
+        prompt_tokens.clear();
+        prompt_tokens.insert(restored_tokens);
+        return true;
+    }
+
+    auto read_u32 = [&](uint32_t & v) -> bool { ifs.read(reinterpret_cast<char *>(&v), 4); return ifs.good(); };
+    auto read_u64 = [&](uint64_t & v) -> bool { ifs.read(reinterpret_cast<char *>(&v), 8); return ifs.good(); };
+
+    uint32_t magic = 0, version = 0, n_chunks = 0;
+    if (!read_u32(magic) || magic != 0x4D544D44) {
+        SRV_WRN("invalid mtmd sidecar magic in %s, treating as text-only\n", mtmd_path.c_str());
+        prompt_tokens.clear();
+        prompt_tokens.insert(restored_tokens);
+        return true;
+    }
+    if (!read_u32(version) || version != 1) {
+        SRV_WRN("unsupported mtmd sidecar version %u in %s, treating as text-only\n", version, mtmd_path.c_str());
+        prompt_tokens.clear();
+        prompt_tokens.insert(restored_tokens);
+        return true;
+    }
+    if (!read_u32(n_chunks)) {
+        prompt_tokens.clear();
+        prompt_tokens.insert(restored_tokens);
+        return true;
+    }
+
+    struct restored_chunk { size_t start_idx; mtmd::input_chunk_ptr chunk; size_t n_tokens; };
+    std::vector<restored_chunk> chunks;
+    chunks.reserve(n_chunks);
+
+    for (uint32_t ci = 0; ci < n_chunks; ++ci) {
+        uint64_t start_idx = 0, ser_size = 0;
+        if (!read_u64(start_idx) || !read_u64(ser_size) || ser_size == 0) {
+            SRV_WRN("truncated mtmd sidecar at chunk %u in %s\n", ci, mtmd_path.c_str());
+            prompt_tokens.clear();
+            prompt_tokens.insert(restored_tokens);
+            return false;
+        }
+        std::vector<uint8_t> buf(ser_size);
+        ifs.read(reinterpret_cast<char *>(buf.data()), ser_size);
+        if (!ifs.good()) {
+            prompt_tokens.clear();
+            prompt_tokens.insert(restored_tokens);
+            return false;
+        }
+        mtmd_input_chunk * raw_chunk = mtmd_input_chunk_deserialize(buf.data(), ser_size);
+        if (!raw_chunk) {
+            SRV_WRN("failed to deserialize mtmd chunk %u from %s\n", ci, mtmd_path.c_str());
+            prompt_tokens.clear();
+            prompt_tokens.insert(restored_tokens);
+            return false;
+        }
+        const size_t n_tok = mtmd_input_chunk_get_n_tokens(raw_chunk);
+        chunks.push_back({ (size_t)start_idx, mtmd::input_chunk_ptr(raw_chunk), n_tok });
+    }
+
+    // Rebuild server_tokens: walk restored_tokens, inserting text tokens and
+    // re-inserting media chunks at the correct positions.
+    prompt_tokens.clear();
+    size_t pos = 0;
+    size_t chunk_idx = 0;
+    while (pos < restored_tokens.size()) {
+        // check if a chunk starts here
+        if (chunk_idx < chunks.size() && chunks[chunk_idx].start_idx == pos) {
+            prompt_tokens.push_back(chunks[chunk_idx].chunk.get());
+            pos += chunks[chunk_idx].n_tokens;
+            ++chunk_idx;
+        } else {
+            // text token (must not be null in restored_tokens — they were stripped during save)
+            if (restored_tokens[pos] != LLAMA_TOKEN_NULL) {
+                prompt_tokens.push_back(restored_tokens[pos]);
+            }
+            ++pos;
+        }
+    }
+
+    SRV_INF("loaded %zu mtmd chunk(s) from %s\n", chunks.size(), mtmd_path.c_str());
+    return true;
+}
+
 struct server_slot {
     int id;
 
@@ -1035,10 +1205,11 @@ private:
                 SRV_WRN("%s\n", "ctx_shift is not supported by multimodal, it will be disabled");
             }
 
-            if (params_base.n_cache_reuse) {
-                params_base.n_cache_reuse = 0;
-                SRV_WRN("%s\n", "cache_reuse is not supported by multimodal, it will be disabled");
-            }
+            // n_cache_reuse is gated by llama_memory_can_shift() below; no separate
+            // disable needed here. M-RoPE/I-M-RoPE models (e.g. Qwen3.5/3.6) now report
+            // can_shift=true for text tokens (scalar K-shift is sound; see
+            // llama_kv_cache::get_can_shift / build_rope_shift). Models where shifting is
+            // genuinely unsound will have can_shift=false and silence n_cache_reuse.
         }
 
         if (!llama_memory_can_shift(llama_get_memory(ctx_tgt))) {
@@ -1263,7 +1434,10 @@ private:
                     if (slot.prompt.n_tokens() == 0) {
                         continue; // nothing to save
                     }
-                    const llama_tokens & tokens = slot.prompt.tokens.get_tokens();
+                    // Use get_tokens_raw() for multimodal slots so that the token count
+                    // passed to llama_state_seq_save_file matches the KV cell count
+                    // (LLAMA_TOKEN_NULL placeholders occupy real KV cells).
+                    const llama_tokens & tokens = slot.prompt.tokens.get_tokens_raw();
                     // Filename matches the router-side pattern used by save_slots_to_disk
                     // and scanned by restore_slots_from_disk: {safe_model_name}_slot{id}.bin
                     std::string filename = safe_model_name + "_slot" + std::to_string(slot.id) + ".bin";
@@ -1277,6 +1451,7 @@ private:
                         SLT_WRN(slot, "periodic flush: failed to save slot to %s\n", filepath.c_str());
                     } else {
                         slot_checkpoints_save(filepath, slot.prompt.checkpoints);
+                        slot_mtmd_save(filepath, slot.prompt.tokens);
                         SLT_INF(slot, "periodic flush: saved %zu bytes\n", nwrite);
                     }
                 }
@@ -2355,10 +2530,6 @@ private:
                 } break;
             case SERVER_TASK_TYPE_SLOT_SAVE:
                 {
-                    if (!check_no_mtmd(task.id)) {
-                        break;
-                    }
-
                     const int id_slot = task.slot_action.id_slot;
                     server_slot * slot = get_slot_by_id(id_slot);
                     if (slot == nullptr) {
@@ -2378,11 +2549,13 @@ private:
                     std::string filename = task.slot_action.filename;
                     std::string filepath = task.slot_action.filepath;
 
-                    const llama_tokens & tokens = slot->prompt.tokens.get_tokens();
+                    // Use get_tokens_raw() so token_count == KV cell count for mtmd slots
+                    const llama_tokens & tokens = slot->prompt.tokens.get_tokens_raw();
                     const size_t nwrite = llama_state_seq_save_file(ctx_tgt, filepath.c_str(), slot->id, tokens.data(), token_count);
 
-                    // persist context checkpoints alongside the slot state
+                    // persist context checkpoints and mtmd chunk metadata alongside the slot state
                     slot_checkpoints_save(filepath, slot->prompt.checkpoints);
+                    slot_mtmd_save(filepath, slot->prompt.tokens);
 
                     const int64_t t_end = ggml_time_us();
                     const double t_save_ms = (t_end - t_start) / 1000.0;
@@ -2399,7 +2572,6 @@ private:
                 } break;
             case SERVER_TASK_TYPE_SLOT_RESTORE:
                 {
-                    if (!check_no_mtmd(task.id)) break;
                     const int id_slot = task.slot_action.id_slot;
                     server_slot * slot = get_slot_by_id(id_slot);
                     if (slot == nullptr) {
@@ -2428,11 +2600,11 @@ private:
                         break;
                     }
                     tokens.resize(token_count);
-                    slot->prompt.tokens.clear();
-                    slot->prompt.tokens.insert(tokens);
 
-                    // restore context checkpoints if a companion file exists
+                    // Restore context checkpoints and rebuild server_tokens (including any
+                    // multimodal chunk metadata from the .mtmd sidecar if present).
                     slot_checkpoints_load(filepath, slot->prompt.checkpoints);
+                    slot_mtmd_load(filepath, slot->prompt.tokens, tokens);
 
                     const int64_t t_end = ggml_time_us();
                     const double t_restore_ms = (t_end - t_start) / 1000.0;
@@ -2449,9 +2621,6 @@ private:
                 } break;
             case SERVER_TASK_TYPE_SLOT_ERASE:
                 {
-                    if (!check_no_mtmd(task.id)) {
-                        break;
-                    }
                     const int id_slot = task.slot_action.id_slot;
                     server_slot * slot = get_slot_by_id(id_slot);
                     if (slot == nullptr) {
@@ -2861,25 +3030,28 @@ private:
 
                                 const auto n_cache_reuse = slot.task->params.n_cache_reuse;
 
+                                // can_shift() is the authoritative gate. It is true for
+                                // IMROPE/MROPE models (e.g. Qwen3.5/3.6) for text tokens
+                                // (scalar K-shift is sound; image tokens are guarded in
+                                // llama_kv_cache::seq_add), and false for recurrent-only models.
                                 const bool can_cache_reuse =
-                                    llama_memory_can_shift(llama_get_memory(ctx_tgt)) &&
-                                    !slot.prompt.tokens.has_mtmd;
+                                    llama_memory_can_shift(llama_get_memory(ctx_tgt));
 
                                 if (!can_cache_reuse && n_cache_reuse > 0) {
                                     SLT_WRN(slot, "cache reuse is not supported - ignoring n_cache_reuse = %d\n", n_cache_reuse);
                                 }
 
-                                // reuse chunks from the cached prompt by shifting their KV cache in the new position
-                                if (can_cache_reuse && n_cache_reuse > 0) {
-                                    GGML_ASSERT(!slot.prompt.tokens.has_mtmd);
+                                // n_cache_reuse with mixed image+text prompts is not yet
+                                // implemented: the reuse loop works in token-index space but
+                                // seq_rm/seq_add take positions, and image chunks contribute
+                                // n_pos != n_tokens for some models. cache_prompt prefix reuse
+                                // (get_common_prefix) still works correctly for mmproj sessions.
+                                const bool do_cache_reuse = can_cache_reuse && n_cache_reuse > 0
+                                    && !(mctx && slot.prompt.tokens.has_mtmd);
 
+                                if (do_cache_reuse) {
                                     size_t head_c = n_past; // cache
                                     size_t head_p = n_past; // current prompt
-
-                                    if (mctx) {
-                                        // we should never reach this
-                                        GGML_ABORT("not supported by multimodal");
-                                    }
 
                                     SLT_DBG(slot, "trying to reuse chunks with size > %d, n_past = %d\n", n_cache_reuse, n_past);
 

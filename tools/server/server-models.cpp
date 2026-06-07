@@ -700,14 +700,20 @@ static std::string sanitize_model_name_for_path(const std::string & name) {
 
 // Perform a synchronous HTTP POST to the child server's slot save/restore endpoint.
 // Returns the parsed JSON body on success (2xx), or an empty object on failure.
-static json child_http_post(int port, const std::string & path, const json & body, int32_t timeout_s = 300) {
+static json child_http_post(int port, const std::string & path, const json & body, int32_t timeout_s = 300,
+                            const std::string & api_key = "") {
     httplib::ClientImpl cli(CHILD_ADDR, port);
     cli.set_connection_timeout(timeout_s, 0);
     cli.set_read_timeout(timeout_s, 0);
     cli.set_write_timeout(timeout_s, 0);
 
+    httplib::Headers headers;
+    if (!api_key.empty()) {
+        headers.emplace("Authorization", "Bearer " + api_key);
+    }
+
     std::string body_str = safe_json_to_str(body);
-    auto res = cli.Post(path, body_str, "application/json");
+    auto res = cli.Post(path, headers, body_str, "application/json");
     if (!res || res->status < 200 || res->status >= 300) {
         int status = res ? res->status : -1;
         SRV_WRN("child HTTP POST %s failed with status %d\n", path.c_str(), status);
@@ -722,13 +728,19 @@ static json child_http_post(int port, const std::string & path, const json & bod
 
 // Perform a synchronous HTTP GET to the child server.
 // Returns the parsed JSON body on success, or an empty object on failure.
-static json child_http_get(int port, const std::string & path, int32_t timeout_s = 30) {
+static json child_http_get(int port, const std::string & path, int32_t timeout_s = 30,
+                           const std::string & api_key = "") {
     httplib::ClientImpl cli(CHILD_ADDR, port);
     cli.set_connection_timeout(timeout_s, 0);
     cli.set_read_timeout(timeout_s, 0);
     cli.set_write_timeout(timeout_s, 0);
 
-    auto res = cli.Get(path);
+    httplib::Headers headers;
+    if (!api_key.empty()) {
+        headers.emplace("Authorization", "Bearer " + api_key);
+    }
+
+    auto res = cli.Get(path, headers);
     if (!res || res->status < 200 || res->status >= 300) {
         int status = res ? res->status : -1;
         SRV_WRN("child HTTP GET %s failed with status %d\n", path.c_str(), status);
@@ -766,8 +778,10 @@ void server_models::save_slots_to_disk(const std::string & model_name, int port)
     }
     SRV_INF("saving KV cache slots for model '%s' before unload\n", model_name.c_str());
 
+    const std::string api_key = base_params.api_keys.empty() ? "" : base_params.api_keys[0];
+
     // Discover slot IDs from the child's /slots endpoint
-    json slots_info = child_http_get(port, "/slots");
+    json slots_info = child_http_get(port, "/slots", 30, api_key);
     if (!slots_info.is_array() || slots_info.empty()) {
         SRV_WRN("could not retrieve slot list from model '%s' (port %d), skipping KV save\n", model_name.c_str(), port);
         return;
@@ -783,7 +797,7 @@ void server_models::save_slots_to_disk(const std::string & model_name, int port)
         std::string filename = safe_name + "_slot" + std::to_string(id) + ".bin";
         json req_body = {{"filename", filename}};
         std::string endpoint = "/slots/" + std::to_string(id) + "?action=save";
-        json result = child_http_post(port, endpoint, req_body, base_params.timeout_write);
+        json result = child_http_post(port, endpoint, req_body, base_params.timeout_write, api_key);
         if (result.empty()) {
             SRV_WRN("failed to save slot %d for model '%s'\n", id, model_name.c_str());
         } else {
@@ -850,12 +864,14 @@ void server_models::restore_slots_from_disk(const std::string & model_name, int 
         return;
     }
 
+    const std::string api_key = base_params.api_keys.empty() ? "" : base_params.api_keys[0];
+
     SRV_INF("restoring %zu KV cache slot(s) for model '%s' after load\n", to_restore.size(), model_name.c_str());
     int restored = 0;
     for (const auto & [id, filename] : to_restore) {
         json req_body = {{"filename", filename}};
         std::string endpoint = "/slots/" + std::to_string(id) + "?action=restore";
-        json result = child_http_post(port, endpoint, req_body, base_params.timeout_read);
+        json result = child_http_post(port, endpoint, req_body, base_params.timeout_read, api_key);
         if (result.empty()) {
             SRV_WRN("failed to restore slot %d for model '%s' from '%s'\n", id, model_name.c_str(), filename.c_str());
         } else {
