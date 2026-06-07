@@ -2,6 +2,26 @@
 #include "cpy-utils.cuh"
 #include "turbo-quant.cuh"
 
+#include <cstdlib>
+
+// Runtime sync-after-kernel for crash localisation.
+// Set GGML_CUDA_SYNC_DEBUG=1 in the environment to enable.
+// Zero overhead when unset — checked once and cached.
+static bool ggml_cuda_sync_debug_enabled() {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char * v = getenv("GGML_CUDA_SYNC_DEBUG");
+        enabled = (v && v[0] == '1') ? 1 : 0;
+        if (enabled) {
+            fprintf(stderr, "[ggml-cuda] GGML_CUDA_SYNC_DEBUG=1: synchronizing after each turbo set_rows / fattn kernel\n");
+        }
+    }
+    return enabled == 1;
+}
+
+#define GGML_CUDA_SYNC_DEBUG_CHECK(stream) \
+    do { if (ggml_cuda_sync_debug_enabled()) { CUDA_CHECK(cudaGetLastError()); CUDA_CHECK(cudaStreamSynchronize(stream)); } } while(0)
+
 typedef void (*set_rows_kernel_t)(const char * src, char * dst);
 
 // Generic quantized set_rows kernel template
@@ -583,10 +603,7 @@ static void set_rows_cuda_turbo3(
                 s01, s02, s03, s10, s11, s12,
                 nb1, nb2, nb3);
         }
-#ifndef NDEBUG
-        CUDA_CHECK(cudaGetLastError());
-        CUDA_CHECK(cudaStreamSynchronize(stream));
-#endif
+        GGML_CUDA_SYNC_DEBUG_CHECK(stream);
     }
 
     // Launch 2: tail elements (no WHT, straight quantize)
@@ -599,10 +616,7 @@ static void set_rows_cuda_turbo3(
             ne00, ne01, ne10, ne11, ne12, ne13,
             s01, s02, s03, s10, s11, s12,
             nb1, nb2, nb3, tail_size);
-#ifndef NDEBUG
-        CUDA_CHECK(cudaGetLastError());
-        CUDA_CHECK(cudaStreamSynchronize(stream));
-#endif
+        GGML_CUDA_SYNC_DEBUG_CHECK(stream);
     }
 }
 
@@ -935,10 +949,7 @@ static void set_rows_cuda_turbo2(
                 s01, s02, s03, s10, s11, s12,
                 nb1, nb2, nb3);
         }
-#ifndef NDEBUG
-        CUDA_CHECK(cudaGetLastError());
-        CUDA_CHECK(cudaStreamSynchronize(stream));
-#endif
+        GGML_CUDA_SYNC_DEBUG_CHECK(stream);
     }
 
     if (tail_size > 0) {
@@ -949,10 +960,7 @@ static void set_rows_cuda_turbo2(
             ne00, ne01, ne10, ne11, ne12, ne13,
             s01, s02, s03, s10, s11, s12,
             nb1, nb2, nb3, tail_size);
-#ifndef NDEBUG
-        CUDA_CHECK(cudaGetLastError());
-        CUDA_CHECK(cudaStreamSynchronize(stream));
-#endif
+        GGML_CUDA_SYNC_DEBUG_CHECK(stream);
     }
 }
 
@@ -1150,10 +1158,7 @@ static void set_rows_cuda_turbo4(
             ne00, ne01, ne10, ne11, ne12, ne13,
             s01, s02, s03, s10, s11, s12,
             nb1, nb2, nb3);
-#ifndef NDEBUG
-        CUDA_CHECK(cudaGetLastError());
-        CUDA_CHECK(cudaStreamSynchronize(stream));
-#endif
+        GGML_CUDA_SYNC_DEBUG_CHECK(stream);
     }
 }
 

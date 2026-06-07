@@ -7,6 +7,11 @@
 
 #include <cstdint>
 
+// Declared in set-rows.cu; same GGML_CUDA_SYNC_DEBUG=1 env-var gate.
+#define GGML_CUDA_SYNC_DEBUG_CHECK(stream) \
+    do { if (ggml_cuda_sync_debug_enabled()) { CUDA_CHECK(cudaGetLastError()); CUDA_CHECK(cudaStreamSynchronize(stream)); } } while(0)
+bool ggml_cuda_sync_debug_enabled();
+
 #define FATTN_KQ_STRIDE       256
 #define HALF_MAX_HALF         __float2half(65504.0f/2) // Use neg. of this instead of -INFINITY to initialize KQ max vals to avoid NaN upon subtraction.
 #define SOFTMAX_FTZ_THRESHOLD -20.0f                   // Softmax exp. of values smaller than this are flushed to zero to avoid NaNs.
@@ -1547,11 +1552,7 @@ void launch_fattn(
         mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0
     );
     CUDA_CHECK(cudaGetLastError());
-#ifndef NDEBUG
-    // DEBUG: sync after fattn kernel to surface illegal memory access at the
-    // offending launch rather than deferring it to the next scheduler sync.
-    CUDA_CHECK(cudaStreamSynchronize(main_stream));
-#endif
+    GGML_CUDA_SYNC_DEBUG_CHECK(main_stream);
 
     if (stream_k) {
         if ((int)blocks_num.x % ntiles_dst == 0 && (int)blocks_num.x > ntiles_dst) {
