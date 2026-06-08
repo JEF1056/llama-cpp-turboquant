@@ -1,26 +1,7 @@
 #include "set-rows.cuh"
 #include "cpy-utils.cuh"
 #include "turbo-quant.cuh"
-
-#include <cstdlib>
-
-// Runtime sync-after-kernel for crash localisation.
-// Set GGML_CUDA_SYNC_DEBUG=1 in the environment to enable.
-// Zero overhead when unset — checked once and cached.
-static bool ggml_cuda_sync_debug_enabled() {
-    static int enabled = -1;
-    if (enabled < 0) {
-        const char * v = getenv("GGML_CUDA_SYNC_DEBUG");
-        enabled = (v && v[0] == '1') ? 1 : 0;
-        if (enabled) {
-            fprintf(stderr, "[ggml-cuda] GGML_CUDA_SYNC_DEBUG=1: synchronizing after each turbo set_rows / fattn kernel\n");
-        }
-    }
-    return enabled == 1;
-}
-
-#define GGML_CUDA_SYNC_DEBUG_CHECK(stream) \
-    do { if (ggml_cuda_sync_debug_enabled()) { CUDA_CHECK(cudaGetLastError()); CUDA_CHECK(cudaStreamSynchronize(stream)); } } while(0)
+#include "sync-debug.cuh"
 
 typedef void (*set_rows_kernel_t)(const char * src, char * dst);
 

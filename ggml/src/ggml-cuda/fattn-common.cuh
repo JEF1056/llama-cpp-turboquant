@@ -6,11 +6,7 @@
 #include "turbo-quant.cuh"
 
 #include <cstdint>
-
-// Declared in set-rows.cu; same GGML_CUDA_SYNC_DEBUG=1 env-var gate.
-#define GGML_CUDA_SYNC_DEBUG_CHECK(stream) \
-    do { if (ggml_cuda_sync_debug_enabled()) { CUDA_CHECK(cudaGetLastError()); CUDA_CHECK(cudaStreamSynchronize(stream)); } } while(0)
-bool ggml_cuda_sync_debug_enabled();
+#include "sync-debug.cuh"
 
 #define FATTN_KQ_STRIDE       256
 #define HALF_MAX_HALF         __float2half(65504.0f/2) // Use neg. of this instead of -INFINITY to initialize KQ max vals to avoid NaN upon subtraction.
