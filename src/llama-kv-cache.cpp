@@ -765,7 +765,7 @@ void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
     }
 }
 
-void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
+bool llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
 
     // M-RoPE / I-M-RoPE (n_pos_per_embd() > 1) support:
@@ -780,7 +780,7 @@ void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, ll
     auto & head  = v_heads[seq_to_stream[seq_id]];
 
     if (shift == 0) {
-        return;
+        return true;
     }
 
     uint32_t new_head = cells.size();
@@ -795,7 +795,7 @@ void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, ll
 
     // If there is no range then return early to avoid looping over all cells.
     if (p0 == p1) {
-        return;
+        return true;
     }
 
     // Image-token guard: refuse to shift if any cell in range carries a non-zero 2D spatial
@@ -814,7 +814,7 @@ void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, ll
             if (e.x != 0 || e.y != 0) {
                 LLAMA_LOG_WARN("%s: refusing seq_add shift over image tokens (cell %u has ext=(%d,%d)); "
                                "cache_reuse over image tokens is not supported\n", __func__, i, e.x, e.y);
-                return;
+                return false;
             }
         }
     }
@@ -839,6 +839,8 @@ void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, ll
 
     // Update TriAttention position tracking for the shifted range
     triattention_on_position_shift(triattention_st, shift, p0, p1);
+
+    return true;
 }
 
 void llama_kv_cache::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) {
@@ -2127,6 +2129,15 @@ ggml_tensor * llama_kv_cache::build_rope_shift(
     ggml_tensor * tmp;
 
     if (ggml_is_quantized(cur->type)) {
+        static bool warned = false;
+        if (!warned) {
+            LLAMA_LOG_WARN("%s: K-shift on quantized KV cache (type %s) causes double-quantization error "
+                           "that accumulates over long sessions; for best quality use f32 KV cache "
+                           "(--cache-type-k f32) or disable position shifting\n",
+                           __func__, ggml_type_name(cur->type));
+            warned = true;
+        }
+
         // dequantize to f32, apply RoPE, quantize back
         tmp = ggml_cast(ctx, cur, GGML_TYPE_F32);
 
@@ -2214,11 +2225,21 @@ ggml_cgraph * llama_kv_cache::build_graph_shift(llm_graph_result * res, llama_co
 
         ggml_tensor * rope_factors = model.get_rope_factors(cparams, il);
 
+        // Use actual buffer strides derived from layer.k->ne[0] (n_embd_k_gqa_eff),
+        // not hparam values. When turbo K pads head_dim to the next multiple of 128
+        // (e.g. head_dim=64→128 or head_dim=192→256), layer.k was allocated with the
+        // padded size. Using the unpadded hparam strides would mis-index into the wrong
+        // cache row for every head after the first, silently corrupting K after any
+        // cache-reuse rope-shift (e.g. with YaRN). No-op when head_dim is already
+        // 128-aligned (padded == unpadded).
+        const int64_t n_embd_k_gqa_buf  = layer.k->ne[0];  // actual (possibly padded) row width
+        const int64_t n_embd_head_k_buf = n_embd_k_gqa_buf / n_head_kv;
+
         ggml_tensor * k =
             ggml_view_3d(ctx, layer.k,
                 n_rot, n_head_kv, get_size()*n_stream,
-                ggml_row_size(layer.k->type, n_embd_head_k),
-                ggml_row_size(layer.k->type, n_embd_k_gqa),
+                ggml_row_size(layer.k->type, n_embd_head_k_buf),
+                ggml_row_size(layer.k->type, n_embd_k_gqa_buf),
                 ggml_row_size(layer.k->type, n_embd_nope));
 
         ggml_tensor * cur = build_rope_shift(cparams, ctx, k, inp->k_shift, inp->k_rot, rope_factors, freq_base_l, freq_scale_l, il);

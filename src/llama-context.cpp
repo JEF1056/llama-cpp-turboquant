@@ -129,13 +129,26 @@ llama_context::llama_context(
 
         // ref: https://github.com/huggingface/transformers/blob/6d00f6b0a5679c36510f203e4226e36f517c3032/src/transformers/modeling_rope_utils.py#L336-L348
         if (hparams.rope_yarn_log_mul != 0.0f) {
-            // note: here we assume `mscale == 1.0f`
-            // TODO: start reading the actual value of mscale and handle the case where it is not 1.0f
+            // YaRN defines two magnitude-scaling factors (see HF `_compute_yarn_parameters`,
+            // ref link above, and the DeepSeek config below):
+            //   - `mscale`          : the per-head attention-temperature scale (config key
+            //                         `rope_scaling.mscale`). Applied to all RoPE dims.
+            //   - `mscale_all_dims` : the alternative scale used when the model applies YaRN
+            //                         to every dim (config key `rope_scaling.mscale_all_dim`).
+            //                         We read this from GGUF as `hparams.rope_yarn_log_mul`
+            //                         (LLM_KV_ROPE_SCALING_YARN_LOG_MUL).
+            //
+            // We currently assume `mscale == 1.0f`: there is no GGUF key for the per-head
+            // `mscale` yet, so it cannot be loaded from the model file. Adding one is a GGUF
+            // format change that needs community review; until then `mscale` stays hardcoded.
+            // For DeepSeek2, `mscale == mscale_all_dims` per its config, so we mirror that below.
+            // GGUF spec / KV conventions: https://github.com/ggml-org/ggml/blob/master/docs/gguf.md
                   float mscale          = 1.0f;
             const float mscale_all_dims = hparams.rope_yarn_log_mul;
 
             // [TAG_DEEPSEEK2_YARN_LOG_MUL_FIX]
-            // special-case DEEPSEEK v2:
+            // special-case DEEPSEEK v2: its config sets `mscale == mscale_all_dim` (both
+            // equal to `rope_yarn_log_mul`), so override the default `mscale = 1.0f` here.
             // https://huggingface.co/deepseek-ai/DeepSeek-V2-Lite-Chat/blob/main/config.json#L42-L43
             if (model.arch == LLM_ARCH_DEEPSEEK2 && mscale_all_dims != 1.0f) {
                 mscale = mscale_all_dims;
@@ -3010,12 +3023,27 @@ size_t llama_context::state_write_data(llama_io_write_i & io) {
 
         const std::string arch_str = llm_arch_name(model.arch);
         io.write_string(arch_str);
-        // TODO: add more model-specific info which should prevent loading the session file if not identical
     }
 
     if (memory != nullptr) {
         LLAMA_LOG_DEBUG("%s: - writing memory module\n", __func__);
         memory->state_write(io);
+    }
+
+    // write RoPE parameters that affect how cached K values are encoded.
+    // these are written at the tail of the stream (after the memory module) so that
+    // older session files, which lack these fields, hit a clean EOF on read and can
+    // be loaded with only a warning instead of misaligning the rest of the stream.
+    // a mismatch on load means the cache was encoded with a different YaRN/RoPE scale
+    // than the current context will apply during K-shift, which would silently corrupt
+    // the cached keys.
+    {
+        LLAMA_LOG_DEBUG("%s: - writing rope params\n", __func__);
+
+        const float rope_freq_scale = cparams.rope_freq_scale;
+        const float yarn_ext_factor = cparams.yarn_ext_factor;
+        io.write(&rope_freq_scale, sizeof(rope_freq_scale));
+        io.write(&yarn_ext_factor, sizeof(yarn_ext_factor));
     }
 
     return io.n_bytes();
@@ -3035,13 +3063,47 @@ size_t llama_context::state_read_data(llama_io_read_i & io) {
         if (cur_arch_str != arch_str) {
             throw std::runtime_error(format("wrong model arch: '%s' instead of '%s'", arch_str.c_str(), cur_arch_str.c_str()));
         }
-        // TODO: add more info which needs to be identical but which is not verified otherwise
+        // NOTE: RoPE parameters (rope_freq_scale, yarn_ext_factor) are validated below,
+        // after the memory module, so that older session files lacking them can still load.
     }
 
     if (memory) {
         LLAMA_LOG_DEBUG("%s: - reading memory module\n", __func__);
 
         memory->state_read(io);
+    }
+
+    // read and validate the RoPE parameters that affect how cached K values are encoded.
+    // these live at the tail of the stream; an older session file lacks them and will hit
+    // a clean EOF here (the read throws before consuming/misaligning anything), in which
+    // case we simply warn and continue. a mismatch means the cache was encoded with a
+    // different YaRN/RoPE scale than the current context will apply during K-shift, which
+    // can silently corrupt the cached keys, so warn loudly but do not throw (the user may
+    // have intentionally changed the scale, and we want to remain backward compatible).
+    {
+        LLAMA_LOG_DEBUG("%s: - reading rope params\n", __func__);
+
+        try {
+            float saved_rope_freq_scale = 0.0f;
+            float saved_yarn_ext_factor = 0.0f;
+            io.read(&saved_rope_freq_scale, sizeof(saved_rope_freq_scale));
+            io.read(&saved_yarn_ext_factor, sizeof(saved_yarn_ext_factor));
+
+            if (saved_rope_freq_scale != cparams.rope_freq_scale) {
+                LLAMA_LOG_WARN("%s: rope_freq_scale mismatch: session was saved with %g but current context uses %g; "
+                               "cached K values may be encoded with a different RoPE scale and could be corrupted\n",
+                               __func__, saved_rope_freq_scale, cparams.rope_freq_scale);
+            }
+
+            if (saved_yarn_ext_factor != cparams.yarn_ext_factor) {
+                LLAMA_LOG_WARN("%s: yarn_ext_factor mismatch: session was saved with %g but current context uses %g; "
+                               "cached K values may be encoded with a different YaRN attn_factor and could be corrupted\n",
+                               __func__, saved_yarn_ext_factor, cparams.yarn_ext_factor);
+            }
+        } catch (const std::exception & err) {
+            LLAMA_LOG_WARN("%s: session file lacks RoPE parameters (%s); skipping rope_freq_scale/yarn_ext_factor validation\n",
+                           __func__, err.what());
+        }
     }
 
     return io.n_bytes();
@@ -3783,7 +3845,10 @@ void llama_memory_seq_add(
         return;
     }
 
-    mem->seq_add(seq_id, p0, p1, delta);
+    if (!mem->seq_add(seq_id, p0, p1, delta)) {
+        LLAMA_LOG_WARN("%s: seq_add refused shift (seq_id=%d, p0=%d, p1=%d, delta=%d)\n",
+                       __func__, seq_id, p0, p1, delta);
+    }
 }
 
 void llama_memory_seq_div(

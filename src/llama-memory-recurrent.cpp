@@ -301,9 +301,9 @@ void llama_memory_recurrent::seq_keep(llama_seq_id seq_id) {
     }
 }
 
-void llama_memory_recurrent::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
+bool llama_memory_recurrent::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
     if (shift == 0) {
-        return;
+        return true;
     }
 
     if (p0 < 0) {
@@ -316,7 +316,7 @@ void llama_memory_recurrent::seq_add(llama_seq_id seq_id, llama_pos p0, llama_po
 
     // If there is no range then return early to avoid looping over the
     if (p0 == p1) {
-        return;
+        return true;
     }
 
     // for Mamba-like or RWKV models, only the pos needs to be shifted
@@ -329,6 +329,8 @@ void llama_memory_recurrent::seq_add(llama_seq_id seq_id, llama_pos p0, llama_po
             }
         }
     }
+
+    return true;
 }
 
 void llama_memory_recurrent::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) {

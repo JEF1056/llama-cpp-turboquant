@@ -150,8 +150,8 @@ void llama_memory_hybrid::seq_keep(llama_seq_id seq_id) {
     mem_recr->seq_keep(seq_id);
 }
 
-void llama_memory_hybrid::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
-    mem_attn->seq_add(seq_id, p0, p1, shift);
+bool llama_memory_hybrid::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
+    const bool ok_attn = mem_attn->seq_add(seq_id, p0, p1, shift);
 
     // Recurrent state note (cache_reuse / M-RoPE):
     //   When shift != 0, a divergent region was removed before a reused chunk. The attention
@@ -171,7 +171,9 @@ void llama_memory_hybrid::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p
     //       full reprocess. Either way the cumulative state is rebuilt correctly.
     //   So the pos-only bump below is harmless: it is overwritten by the checkpoint restore (or
     //   discarded on full reprocess) before any decode consumes the recurrent state.
-    mem_recr->seq_add(seq_id, p0, p1, shift);
+    const bool ok_recr = mem_recr->seq_add(seq_id, p0, p1, shift);
+
+    return ok_attn && ok_recr;
 }
 
 void llama_memory_hybrid::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) {

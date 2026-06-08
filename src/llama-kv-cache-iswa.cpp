@@ -96,9 +96,10 @@ void llama_kv_cache_iswa::seq_keep(llama_seq_id seq_id) {
     kv_swa ->seq_keep(seq_id);
 }
 
-void llama_kv_cache_iswa::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
-    kv_base->seq_add(seq_id, p0, p1, shift);
-    kv_swa ->seq_add(seq_id, p0, p1, shift);
+bool llama_kv_cache_iswa::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
+    const bool ok_base = kv_base->seq_add(seq_id, p0, p1, shift);
+    const bool ok_swa  = kv_swa ->seq_add(seq_id, p0, p1, shift);
+    return ok_base && ok_swa;
 }
 
 void llama_kv_cache_iswa::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) {

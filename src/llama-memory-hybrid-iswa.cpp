@@ -156,9 +156,10 @@ void llama_memory_hybrid_iswa::seq_keep(llama_seq_id seq_id) {
     mem_recr->seq_keep(seq_id);
 }
 
-void llama_memory_hybrid_iswa::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
-    mem_attn->seq_add(seq_id, p0, p1, shift);
-    mem_recr->seq_add(seq_id, p0, p1, shift);
+bool llama_memory_hybrid_iswa::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
+    const bool ok_attn = mem_attn->seq_add(seq_id, p0, p1, shift);
+    const bool ok_recr = mem_recr->seq_add(seq_id, p0, p1, shift);
+    return ok_attn && ok_recr;
 }
 
 void llama_memory_hybrid_iswa::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) {
