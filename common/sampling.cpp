@@ -393,9 +393,11 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, st
     }
 
     if (rbudget && params.backend_sampling) {
-        LOG_WRN("%s: backend sampling is not compatible with reasoning budget, disabling\n", __func__);
-
-        params.backend_sampling = false;
+        // Backend sampling and reasoning-budget are compatible when the budget
+        // sampler is in passthrough mode (COUNTING/IDLE/DONE).  In FORCING mode
+        // (budget exhausted; injecting </think>) the sample() function detects
+        // this and falls back to CPU sampling for that token.
+        // Remove the old hard disable: no action needed at init time.
     }
 
     auto * result = new common_sampler {
@@ -557,17 +559,31 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
         if (id != LLAMA_TOKEN_NULL) {
             LOG_DBG("%s: Backend sampler selected token: '%d'. Will not run any CPU samplers\n", __func__, id);
 
-            GGML_ASSERT(!gsmpl->grmr    && "using grammar in combination with backend sampling is not supported");
-            GGML_ASSERT(!gsmpl->rbudget && "using reasoning budget in combination with backend sampling is not supported");
+            GGML_ASSERT(!gsmpl->grmr && "using grammar in combination with backend sampling is not supported");
 
-            for (size_t i = 0; i < cur_p.size; ++i) {
-                if (cur_p.data[i].id == id) {
-                    cur_p.selected = i;
-                    break;
+            // Reasoning budget: incompatible only in FORCING state (when a specific
+            // token must be emitted to close the thinking block).  In COUNTING /
+            // IDLE / DONE state the sampler is a passthrough and backend sampling
+            // is fine.  Fall through to CPU sampling in the FORCING case.
+            if (rbudget) {
+                const auto rb_state = common_reasoning_budget_get_state(rbudget);
+                if (rb_state == REASONING_BUDGET_FORCING ||
+                    rb_state == REASONING_BUDGET_WAITING_UTF8) {
+                    LOG_DBG("%s: reasoning budget in forcing state; falling back to CPU sampling\n", __func__);
+                    id = LLAMA_TOKEN_NULL; // suppress backend token, fall through
                 }
             }
 
-            return id;
+            if (id != LLAMA_TOKEN_NULL) {
+                for (size_t i = 0; i < cur_p.size; ++i) {
+                    if (cur_p.data[i].id == id) {
+                        cur_p.selected = i;
+                        break;
+                    }
+                }
+
+                return id;
+            }
         }
     }
 
