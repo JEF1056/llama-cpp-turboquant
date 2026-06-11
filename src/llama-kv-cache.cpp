@@ -1407,6 +1407,15 @@ bool llama_kv_cache::get_can_shift() const {
     if (model.arch == LLM_ARCH_STEP35) {
         return false;
     }
+    // M-RoPE/I-RoPE (Qwen3-VL etc.): k_shift is handled via whole-vector NEOX-mode rotation
+    // in build_rope_shift() — only the sequential (t) dimension needs shifting, and the
+    // NEOX fallback there rotates all K dimensions uniformly which is correct for text tokens.
+    // Image cells are excluded from shifting at the server level (they carry absolute spatial
+    // positions that must not be relocated).
+    if (hparams.rope_type == LLAMA_ROPE_TYPE_MROPE ||
+        hparams.rope_type == LLAMA_ROPE_TYPE_IMROPE) {
+        return true;
+    }
     if (hparams.n_pos_per_embd() > 1) {
         return false;
     }

@@ -880,10 +880,9 @@ private:
                 SRV_WRN("%s\n", "ctx_shift is not supported by multimodal, it will be disabled");
             }
 
-            if (params_base.n_cache_reuse) {
-                params_base.n_cache_reuse = 0;
-                SRV_WRN("%s\n", "cache_reuse is not supported by multimodal, it will be disabled");
-            }
+            // n_cache_reuse (chunk-shifting) is now supported for M-RoPE multimodal models;
+            // the llama_memory_can_shift() check below will disable it only when the
+            // underlying memory genuinely cannot shift.
         }
 
         if (!llama_memory_can_shift(llama_get_memory(ctx_tgt))) {
@@ -2632,9 +2631,12 @@ private:
 
                                 const auto n_cache_reuse = slot.task->params.n_cache_reuse;
 
+                                // chunk-shifting is now supported for M-RoPE multimodal models.
+                                // Image cells are skipped in the loop below; only text KV blocks
+                                // are relocated. llama_memory_can_shift() returns true for
+                                // M-RoPE/I-RoPE after the get_can_shift() fix.
                                 const bool can_cache_reuse =
-                                    llama_memory_can_shift(llama_get_memory(ctx_tgt)) &&
-                                    !slot.prompt.tokens.has_mtmd;
+                                    llama_memory_can_shift(llama_get_memory(ctx_tgt));
 
                                 if (!can_cache_reuse && n_cache_reuse > 0) {
                                     SLT_WRN(slot, "cache reuse is not supported - ignoring n_cache_reuse = %d\n", n_cache_reuse);
@@ -2642,42 +2644,77 @@ private:
 
                                 // reuse chunks from the cached prompt by shifting their KV cache in the new position
                                 if (can_cache_reuse && n_cache_reuse > 0) {
-                                    GGML_ASSERT(!slot.prompt.tokens.has_mtmd);
-
                                     size_t head_c = n_past; // cache
                                     size_t head_p = n_past; // current prompt
-
-                                    if (mctx) {
-                                        // we should never reach this
-                                        GGML_ABORT("not supported by multimodal");
-                                    }
 
                                     SLT_DBG(slot, "trying to reuse chunks with size > %d, n_past = %d\n", n_cache_reuse, n_past);
 
                                     while (head_c < slot.prompt.tokens.size() &&
                                            head_p < input_tokens.size()) {
 
+                                        // Handle image sentinels (LLAMA_TOKEN_NULL) in both lists.
+                                        // Only advance BOTH pointers when both sides have an image at
+                                        // the same logical position — keeps positions aligned.
+                                        // If one side has an image and the other has text, the M-RoPE
+                                        // time positions diverge from this point, AND set_token() would
+                                        // write past slot.prompt.tokens.size() causing heap corruption.
+                                        // Stop cache reuse in that case.
+                                        const bool cache_null = (slot.prompt.tokens[head_c] == LLAMA_TOKEN_NULL);
+                                        const bool input_null = (input_tokens[head_p] == LLAMA_TOKEN_NULL);
+                                        if (cache_null && input_null) {
+                                            // Both have an image here — skip both, positions stay aligned.
+                                            head_c++;
+                                            head_p++;
+                                            continue;
+                                        }
+                                        if (cache_null || input_null) {
+                                            // One side has an image, the other has text — positions diverge.
+                                            // Stop reuse: any subsequent match would write set_token() past
+                                            // slot.prompt.tokens.size() when head_p > head_c.
+                                            break;
+                                        }
+
                                         size_t n_match = 0;
                                         while (head_c + n_match < slot.prompt.tokens.size() &&
                                                head_p + n_match < input_tokens.size()       &&
+                                               slot.prompt.tokens[head_c + n_match] != LLAMA_TOKEN_NULL &&
+                                               input_tokens[head_p + n_match]        != LLAMA_TOKEN_NULL &&
                                                slot.prompt.tokens[head_c + n_match] == input_tokens[head_p + n_match]) {
                                             n_match++;
                                         }
 
                                         if (n_match >= (size_t) n_cache_reuse) {
                                             SLT_TRC(slot, "reusing chunk with size %zu, shifting KV cache [%zu, %zu) -> [%zu, %zu)\n", n_match, head_c, head_c + n_match, head_p, head_p + n_match);
-                                            //for (size_t i = head_p; i < head_p + n_match; i++) {
-                                            //    SLT_DBG(slot, "cache token %3zu: %6d '%s'\n", i, prompt_tokens[i], common_token_to_piece(ctx_tgt, prompt_tokens[i]).c_str());
-                                            //}
 
-                                            const int64_t kv_shift = (int64_t) head_p - (int64_t) head_c;
+                                            // use pos_next() to convert token indices → actual KV positions.
+                                            // for text-only models pos_next(n) == n; for M-RoPE with images
+                                            // the image chunks advance the position counter by max(nx,ny)
+                                            // rather than n_tokens, so we need the conversion for correctness.
+                                            const llama_pos pos_c  = slot.prompt.tokens.pos_next(head_c);
+                                            const llama_pos pos_p  = input_tokens.pos_next(head_p);
+                                            const llama_pos pos_c1 = slot.prompt.tokens.pos_next(head_c + n_match);
+                                            const int64_t kv_shift = (int64_t) pos_p - (int64_t) pos_c;
 
-                                            common_context_seq_rm (ctx_tgt, slot.id, head_p, head_c);
-                                            common_context_seq_add(ctx_tgt, slot.id, head_c, head_c + n_match, kv_shift);
+                                            // seq_add() asserts n_pos_per_embd()==1 and crashes for M-RoPE
+                                            // models (Qwen3-VL etc.) when kv_shift != 0. This happens when
+                                            // the new prompt has different images before a matching text
+                                            // chunk, causing M-RoPE positions to diverge (pos_p != pos_c).
+                                            // When shift is non-zero and the slot has multimodal tokens,
+                                            // stop reuse here — the server will re-encode from n_past.
+                                            // Zero-shift is safe: seq_add() returns early for shift==0.
+                                            if (kv_shift != 0 && slot.prompt.tokens.has_mtmd) {
+                                                SLT_DBG(slot, "cache reuse: stopping at pos mismatch "
+                                                        "(kv_shift=%" PRId64 ") — M-RoPE cannot seq_add\n",
+                                                        kv_shift);
+                                                break;
+                                            }
+
+                                            common_context_seq_rm (ctx_tgt, slot.id, pos_p, pos_c);
+                                            common_context_seq_add(ctx_tgt, slot.id, pos_c, pos_c1, kv_shift);
 
                                             if (ctx_dft) {
-                                                common_context_seq_rm (ctx_dft.get(), slot.id, head_p, head_c);
-                                                common_context_seq_add(ctx_dft.get(), slot.id, head_c, head_c + n_match, kv_shift);
+                                                common_context_seq_rm (ctx_dft.get(), slot.id, pos_p, pos_c);
+                                                common_context_seq_add(ctx_dft.get(), slot.id, pos_c, pos_c1, kv_shift);
                                             }
 
                                             for (size_t i = 0; i < n_match; i++) {
