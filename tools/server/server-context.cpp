@@ -1152,10 +1152,12 @@ private:
                 cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
             }
 
-            // note: for small models maybe we can set this to the maximum possible draft from all speculative types
-            //       the extra memory for small models is likely negligible?
-            cparams.n_rs_seq  = 0;
+            // Keep n_rs_seq from the base params: the use_ckpt_dft dispatch in
+            // server-context.cpp already falls back to a checkpoint when
+            // draft.size() > llama_n_rs_seq(ctx_dft), so short drafts use cheap
+            // RS rollback and oversized ngram drafts use checkpoints automatically.
             cparams.ctx_other = ctx_tgt;
+
 
             ctx_dft.reset(llama_init_from_model(model_dft.get(), cparams));
 
@@ -1170,9 +1172,12 @@ private:
             cparams_mtp.ctx_type      = LLAMA_CONTEXT_TYPE_MTP;
             cparams_mtp.type_k        = params_base.speculative.draft.cache_type_k;
             cparams_mtp.type_v        = params_base.speculative.draft.cache_type_v;
-            cparams_mtp.n_rs_seq      = 0;
             cparams_mtp.n_outputs_max = params_base.n_parallel;
             cparams_mtp.ctx_other     = ctx_tgt;
+            // Keep n_rs_seq from params_base; use_ckpt_dft already falls back to a
+            // checkpoint when draft.size() > llama_n_rs_seq(ctx_dft).
+            // [TAG_RS_NGRAM_AUDIT]: RS rollback with ngram on hybrid models should
+            // be verified for partial-accept correctness (verify_h / pending_h sync).
 
             ctx_dft.reset(llama_init_from_model(model_tgt, cparams_mtp));
             if (ctx_dft == nullptr) {

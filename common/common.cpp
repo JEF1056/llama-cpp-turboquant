@@ -1258,6 +1258,31 @@ common_init_result::common_init_result(common_params & params) :
         cparams.n_samplers = pimpl->samplers_seq_config.size();
     }
 
+    // [TAG_RS_STATE_ROLLBACK_SUPPORT]
+    // Ngram speculative methods previously required n_rs_seq=0 because partial
+    // RS rollback was unverified for them.  The server-context.cpp dispatch at
+    // use_ckpt_tgt/use_ckpt_dft already falls back to a checkpoint when
+    // draft.size() > llama_n_rs_seq(ctx), so we can keep the configured RS
+    // window for the common short-draft case and only checkpoint for oversized
+    // ngram drafts.  Remove the blanket disable here and keep n_rs_seq as-is.
+    // For auditing correctness of the RS+ngram path, see [TAG_RS_NGRAM_AUDIT].
+    if (cparams.n_rs_seq > 0 && (llama_model_is_recurrent(model) || llama_model_is_hybrid(model))) {
+        auto & types = params.speculative.types;
+        bool has_non_mtp = false;
+        for (int i = 0; i < (int) types.size(); i++) {
+            if (types[i] == COMMON_SPECULATIVE_TYPE_NONE ||
+                types[i] == COMMON_SPECULATIVE_TYPE_DRAFT_MTP) {
+                continue;
+            }
+            has_non_mtp = true;
+            break;
+        }
+        if (has_non_mtp) {
+            LOG_INF("%s: ngram speculative type present with hybrid model; "
+                    "RS rollback window = %d (checkpoints cover larger drafts)\n",
+                    __func__, (int) cparams.n_rs_seq);
+        }
+    }
     llama_context * lctx = llama_init_from_model(model, cparams);
     if (lctx == NULL) {
         LOG_ERR("%s: failed to create context with model '%s'\n", __func__, params.model.path.c_str());
