@@ -160,3 +160,6 @@ a.out.*
 
 AGENTS.local.md
 .pi/SYSTEM.md
+
+# Logs 
+*.log

@@ -2073,6 +2073,134 @@ void llama_kv_cache::set_input_v_rot(ggml_tensor * dst) const {
     memcpy(dst->data, attn_rot_hadamard.at(n_rot).data(), ggml_nbytes(dst));
 }
 
+// ---------------------------------------------------------------------------
+// TriAttention bridge helpers
+// ---------------------------------------------------------------------------
+
+ggml_tensor * llama_kv_cache::get_k_raw(int il) const {
+    const auto it = map_layer_ids.find(il);
+    if (it == map_layer_ids.end()) return nullptr;
+    return layers[it->second].k;
+}
+
+ggml_tensor * llama_kv_cache::get_v_raw(int il) const {
+    const auto it = map_layer_ids.find(il);
+    if (it == map_layer_ids.end()) return nullptr;
+    return layers[it->second].v;
+}
+
+uint32_t llama_kv_cache::get_used_n_kv() const {
+    if (v_cells.empty()) return 0;
+    return v_cells[0].get_used();
+}
+
+bool llama_kv_cache::get_cell_positions(std::vector<llama_pos> & out) const {
+    if (v_cells.empty()) return false;
+    const auto & cells = v_cells[0];
+    out.clear();
+    out.reserve(cells.size());
+    for (uint32_t i = 0; i < cells.size(); ++i) {
+        out.push_back(cells.get_pos(i));   // -1 for empty cells
+    }
+    return true;
+}
+
+bool llama_kv_cache::triattention_compact(const std::vector<uint32_t> & keep_positions) {
+    if (keep_positions.empty()) {
+        return false;
+    }
+
+    // Phase 1: Compact the cell metadata (logical compaction)
+    for (uint32_t s = 0; s < n_stream; ++s) {
+        auto & cells = v_cells[s];
+        
+        // Copy the metadata for the kept positions
+        llama_kv_cells copied_cells = cells.cp(keep_positions);
+        
+        // Reset the entire stream's metadata
+        cells.reset();
+        
+        // Write the compacted metadata back starting at index 0
+        cells.set(0, copied_cells);
+    }
+
+    // Phase 2: Physical tensor memory compaction on the GPU/backend.
+    // We use a backend-agnostic approach: reading the kept tokens into a host buffer and
+    // writing them back to the contiguous [0...num_kept-1] range.
+
+    const uint32_t num_kept = keep_positions.size();
+    if (num_kept == 0) return true;
+
+    for (int il = 0; il < (int) layers.size(); ++il) {
+        auto & layer = layers[il];
+        
+        struct ggml_tensor * k = layer.k;
+        struct ggml_tensor * v = layer.v;
+
+        const size_t k_size_row = ggml_row_size(k->type, k->ne[0]);
+        const size_t v_size_row = ggml_row_size(v->type, v->ne[0]);
+
+        // Batch copies by finding contiguous ranges in keep_positions and copying directly on the device
+        uint32_t i = 0;
+        while (i < num_kept) {
+            uint32_t start_i = i;
+            uint32_t start_pos = keep_positions[i];
+            
+            // Find contiguous chunk
+            while (i + 1 < num_kept && keep_positions[i + 1] == keep_positions[i] + 1) {
+                i++;
+            }
+            uint32_t chunk_len = (i - start_i) + 1;
+
+            // Create stack-allocated views for source and destination ranges
+            ggml_tensor k_src_view = *k;
+            ggml_tensor k_dst_view = *k;
+            ggml_tensor v_src_view = *v;
+            ggml_tensor v_dst_view = *v;
+
+            k_src_view.ne[1] = chunk_len;
+            k_src_view.ne[2] = 1;
+            k_src_view.ne[3] = 1;
+            k_src_view.data = (void *)((uint8_t *)k->data + start_pos * k_size_row);
+            k_src_view.view_src = nullptr;
+
+            k_dst_view.ne[1] = chunk_len;
+            k_dst_view.ne[2] = 1;
+            k_dst_view.ne[3] = 1;
+            k_dst_view.data = (void *)((uint8_t *)k->data + start_i * k_size_row);
+            k_dst_view.view_src = nullptr;
+
+            v_src_view.ne[1] = chunk_len;
+            v_src_view.ne[2] = 1;
+            v_src_view.ne[3] = 1;
+            v_src_view.data = (void *)((uint8_t *)v->data + start_pos * v_size_row);
+            v_src_view.view_src = nullptr;
+
+            v_dst_view.ne[1] = chunk_len;
+            v_dst_view.ne[2] = 1;
+            v_dst_view.ne[3] = 1;
+            v_dst_view.data = (void *)((uint8_t *)v->data + start_i * v_size_row);
+            v_dst_view.view_src = nullptr;
+
+            // Perform pure device-to-device copy
+            ggml_backend_tensor_copy(&k_src_view, &k_dst_view);
+            ggml_backend_tensor_copy(&v_src_view, &v_dst_view);
+            
+            i++;
+        }
+    }
+
+    LLAMA_LOG_INFO("%s: TriAttention physical compaction applied. Tokens kept: %u\n", __func__, num_kept);
+
+    return true;
+}
+
+bool llama_kv_cache::triattention_set_active(const std::vector<uint32_t> & /*keep_positions*/) {
+    return false;  // logical indirection not implemented
+}
+
+// ---------------------------------------------------------------------------
+
 size_t llama_kv_cache::total_size() const {
     size_t size = 0;
 

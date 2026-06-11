@@ -39,6 +39,10 @@ add_library(llama
             unicode.cpp
             unicode.h
             ${LLAMA_MODELS_SOURCES}
+            triattention.c
+            triattention-runtime.c
+            triattention-backend.c
+            triattention-bridge.cpp
             )
 
 set_target_properties(llama PROPERTIES

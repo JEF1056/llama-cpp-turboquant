@@ -1566,6 +1566,12 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.swa_full          = params.swa_full;
     cparams.kv_unified        = params.kv_unified;
 
+    cparams.triattention_path        = params.triattention_path.empty() ? nullptr : params.triattention_path.c_str();
+    cparams.triattention_budget_pct  = params.triattention_budget_pct;
+    cparams.triattention_window      = params.triattention_window;
+    cparams.triattention_interval    = params.triattention_interval;
+    cparams.triattention_sink        = params.triattention_sink;
+
     cparams.type_k = params.cache_type_k;
     cparams.type_v = params.cache_type_v;
 

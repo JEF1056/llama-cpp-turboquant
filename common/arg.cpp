@@ -2080,6 +2080,34 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_TYPE_V"));
     add_opt(common_arg(
+        {"--triattention"}, "FNAME",
+        "path to .tria calibration file for TriAttention KV cache eviction (disabled by default)",
+        [](common_params & params, const std::string & value) {
+            params.triattention_path = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PERPLEXITY}));
+    add_opt(common_arg(
+        {"--triattention-budget"}, "N",
+        "TriAttention KV retention % of context length (default: 75)",
+        [](common_params & params, int value) {
+            params.triattention_budget_pct = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PERPLEXITY}));
+    add_opt(common_arg(
+        {"--triattention-window"}, "N",
+        "TriAttention: always keep last N tokens in window (default: 128)",
+        [](common_params & params, int value) {
+            params.triattention_window = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--triattention-interval"}, "N",
+        "TriAttention: score KV cache every N decode tokens (default: 128)",
+        [](common_params & params, int value) {
+            params.triattention_interval = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--hellaswag"},
         "compute HellaSwag score over random tasks from datafile supplied with -f",
         [](common_params & params) {

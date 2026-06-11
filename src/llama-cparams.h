@@ -3,6 +3,7 @@
 #include "llama.h"
 
 #include <cstdint>
+#include <string>
 
 #define LLAMA_MAX_SEQ 256
 
@@ -43,6 +44,13 @@ struct llama_cparams {
     bool op_offload;
     bool kv_unified;
     bool pipeline_parallel;
+
+    // TriAttention KV eviction (requires a .tria calibration stats file)
+    std::string triattention_path;          // path to .tria file; empty = disabled
+    int         triattention_budget_pct = 75;   // KV retention % (1-100)
+    int         triattention_window     = 128;  // recent tokens always kept
+    int         triattention_interval   = 128;  // score every N decode tokens
+    int         triattention_sink       = 4;    // prefix (attention sink) tokens always kept
 
     enum llama_context_type ctx_type;
     enum llama_pooling_type pooling_type;

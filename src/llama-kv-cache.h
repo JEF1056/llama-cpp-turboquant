@@ -182,6 +182,34 @@ public:
     ggml_tensor * cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, const slot_info & sinfo) const;
 
     //
+    // TriAttention bridge API
+    // Used by triattention-bridge.cpp for scoring and eviction.
+    //
+
+    // Return the raw K/V tensor for a given model layer (no view, full cache).
+    ggml_tensor * get_k_raw(int il) const;
+    ggml_tensor * get_v_raw(int il) const;
+
+    // Returns false — this fork does not implement logical indirection.
+    bool has_indirection() const { return false; }
+    int  get_active_kv_real_len() const { return 0; }   // unused when !has_indirection
+    int  get_active_kv_phys(int pos) const { return pos; } // identity, unused
+
+    // Fill `out` with the token position stored in each KV cell (stream 0).
+    // pos[i] == -1 for empty cells. Returns true on success.
+    bool get_cell_positions(std::vector<llama_pos> & out) const;
+
+    // Number of cells currently in use (stream 0).
+    uint32_t get_used_n_kv() const;
+
+    // Physical compaction: keep only the rows at keep_positions, move them to front.
+    // Returns false (not implemented; scoring still works, eviction via mask only).
+    bool triattention_compact(const std::vector<uint32_t> & keep_positions);
+
+    // Logical indirection (Phase 3B) — not implemented, always returns false.
+    bool triattention_set_active(const std::vector<uint32_t> & keep_positions);
+
+    //
     // preparation API
     //
 

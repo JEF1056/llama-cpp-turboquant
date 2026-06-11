@@ -578,6 +578,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 const float * h = llama_get_embeddings_pre_norm_ith(ctx_tgt, i_batch_end[seq_id]);
                 if (h) {
                     std::memcpy(pending_h[seq_id].data(), h, row_bytes);
+                } else {
+                    // pre-norm embeddings unavailable (flash-attn path or arch without pre-norm);
+                    // zero the seed so downstream MTP drafting does not use stale state from a prior sequence
+                    std::fill(pending_h[seq_id].begin(), pending_h[seq_id].end(), 0.0f);
                 }
             }
 

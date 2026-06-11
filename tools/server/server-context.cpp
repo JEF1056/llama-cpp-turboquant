@@ -14,6 +14,8 @@
 #include "speculative.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
+#include "../../src/llama-context.h"
+#include "../../src/triattention-runtime.h"
 
 #include "ggml-cpp.h"
 
@@ -128,13 +130,66 @@ struct server_slot {
 
     server_prompt prompt;
 
-    void prompt_save(server_prompt_cache & prompt_cache) const {
+    void prompt_save(server_prompt_cache & prompt_cache) {
         GGML_ASSERT(prompt.data.size() == 0);
 
-        const size_t cur_size_tgt =           llama_state_seq_get_size_ext(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
-        const size_t cur_size_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
+        size_t cur_size_tgt =           llama_state_seq_get_size_ext(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        size_t cur_size_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
 
-        const size_t cur_size = cur_size_tgt + cur_size_dft;
+        size_t cur_size = cur_size_tgt + cur_size_dft;
+
+        if (prompt_cache.limit_size > 0 && prompt_cache.size() + cur_size > prompt_cache.limit_size) {
+            if (ctx_tgt->get_tria_rt() != nullptr && !prompt.tokens.has_mtmd) {
+                // Free space by evicting older prompts in the cache if the new prompt size is huge
+                size_t max_allowed_size = prompt_cache.limit_size - prompt_cache.size();
+                while (prompt_cache.states.size() > 1 && max_allowed_size < 0.5 * cur_size) {
+                    SRV_WRN(" - cache pressure: evicting oldest entry (size = %.3f MiB) to make room for new prompt\n",
+                            prompt_cache.states.front().size() / (1024.0 * 1024.0));
+                    prompt_cache.remove_prompt_file(prompt_cache.states.front());
+                    prompt_cache.states.pop_front();
+                    max_allowed_size = prompt_cache.limit_size - prompt_cache.size();
+                }
+
+                if (max_allowed_size < cur_size) {
+                    const int32_t n_tokens = (int32_t) prompt.tokens.size();
+                    if (n_tokens > 2000) {
+                        const double size_per_token = (double) cur_size / n_tokens;
+                        int32_t target_budget = (int32_t) (max_allowed_size / size_per_token);
+
+                        const int32_t min_budget = std::max<int32_t>(2000, n_tokens / 4);
+                        if (target_budget < min_budget) {
+                            target_budget = min_budget;
+                        }
+
+                        if (target_budget < n_tokens) {
+                            SRV_WRN(" - cache pressure: compacting slot %d prompt on GPU from %d to %d tokens using TriAttention\n",
+                                    id, n_tokens, target_budget);
+
+                            // Trigger GPU-side compaction via TriAttention bridge
+                            ctx_tgt->get_tria_rt()->global_budget = target_budget;
+                            std::vector<uint32_t> keep_positions;
+                            tria_compact_kv_with_positions(ctx_tgt->get_tria_rt(), ctx_tgt, keep_positions);
+
+                            if (!keep_positions.empty() && keep_positions.size() < (size_t)n_tokens) {
+                                // Reconstruct the compacted token sequence to match the new KV layout
+                                std::vector<llama_token> compacted_tokens;
+                                compacted_tokens.reserve(keep_positions.size());
+                                for (uint32_t pos : keep_positions) {
+                                    compacted_tokens.push_back(prompt.tokens.get_tokens_all()[pos]);
+                                }
+                                prompt.tokens = server_tokens(compacted_tokens, prompt.tokens.has_mtmd);
+                                prompt.checkpoints.clear(); // Compacted sequence invalidates prior checkpoints
+
+                                // Update the sizes after compaction
+                                cur_size_tgt =           llama_state_seq_get_size_ext(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+                                cur_size_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
+                                cur_size = cur_size_tgt + cur_size_dft;
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         SRV_WRN(" - saving prompt with length %d, total state size = %.3f MiB (draft: %.3f MiB)\n",
                 (int) prompt.tokens.size(), cur_size / (1024.0 * 1024.0), cur_size_dft / (1024.0 * 1024.0));
@@ -172,6 +227,7 @@ struct server_slot {
         }
 
         prompt.tokens.clear();
+        prompt.checkpoints.clear();
         prompt.mtmd_positions.clear();
         kvc_restored_pos_end = -1;
         kvc_saved_pos_next   = -1; // content changed — next autosave must write
@@ -3265,6 +3321,28 @@ private:
                             if (res != 0) {
                                 GGML_ABORT("failed to process multi-modal data on draft context\n");
                             }
+                        }
+
+                        // MTP Speculative alignment: Sync seed hidden states for subsequent text drafting
+                        if (slot.spec) {
+                            const int32_t n_batch_sz = llama_n_batch(ctx_tgt);
+                            const int32_t last_batch_sz = n_tokens_out % n_batch_sz == 0 ? n_batch_sz : (n_tokens_out % n_batch_sz);
+
+                            llama_batch dummy_batch = {};
+                            dummy_batch.n_tokens = last_batch_sz;
+                            dummy_batch.token = nullptr;
+                            dummy_batch.embd = (float *)0x1; // Non-null pointer to indicate embedding batch
+
+                            std::vector<int32_t> n_seq_id(last_batch_sz, 1);
+                            std::vector<llama_seq_id *> seq_ids(last_batch_sz);
+                            std::vector<llama_seq_id> seq_id_vals(last_batch_sz, slot.id);
+                            for (int k = 0; k < last_batch_sz; ++k) {
+                                seq_ids[k] = &seq_id_vals[k];
+                            }
+                            dummy_batch.n_seq_id = n_seq_id.data();
+                            dummy_batch.seq_id = seq_ids.data();
+
+                            common_speculative_process(slot.spec, dummy_batch);
                         }
 
                         slot.n_prompt_tokens_processed += n_tokens_out;

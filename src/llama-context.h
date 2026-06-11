@@ -14,6 +14,9 @@
 #include <map>
 #include <vector>
 
+struct tria_stats;
+struct tria_runtime;
+
 struct llama_model;
 class llama_batch_allocr;
 
@@ -87,6 +90,8 @@ struct llama_context {
 
     float * get_embeddings_nextn();
     float * get_embeddings_nextn_ith(int32_t i);
+
+    struct tria_runtime * get_tria_rt() const { return tria_rt; }
 
     llama_token * get_sampled_tokens() const;
     llama_token   get_sampled_token_ith(int32_t idx);
@@ -361,6 +366,10 @@ private:
 
     // env: LLAMA_GRAPH_REUSE_DISABLE
     bool graph_reuse_disable = false;
+
+    // TriAttention KV eviction
+    struct tria_stats   * tria_stats_data = nullptr;
+    struct tria_runtime * tria_rt         = nullptr;
 
     // perf
     mutable int64_t t_start_us  = 0;

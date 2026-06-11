@@ -52,7 +52,8 @@ static void llama_log_internal_v(ggml_log_level level, const char * format, va_l
     va_end(args_copy);
 }
 
-void llama_log_internal(ggml_log_level level, const char * format, ...) {
+/* Expose with C linkage so triattention C translation units can call it. */
+extern "C" void llama_log_internal(ggml_log_level level, const char * format, ...) {
     va_list args;
     va_start(args, format);
     llama_log_internal_v(level, format, args);

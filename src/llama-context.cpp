@@ -6,11 +6,14 @@
 #include "llama-impl.h"
 #include "llama-batch.h"
 #include "llama-io.h"
+#include "llama-kv-cache.h"
 #include "llama-memory.h"
+#include "llama-memory-hybrid.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-ext.h"
 #include "llama.h"
+#include "triattention-runtime.h"
 
 #include <cinttypes>
 #include <cmath>
@@ -76,6 +79,11 @@ llama_context::llama_context(
     cparams.pooling_type = params.pooling_type;
 
     cparams.n_ctx            = params.n_ctx           == 0    ? hparams.n_ctx_train           : params.n_ctx;
+
+    // For MTP contexts, allow a separate (typically smaller) KV cache context size
+    if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && params.n_ctx_mtp > 0) {
+        cparams.n_ctx = params.n_ctx_mtp;
+    }
     cparams.rope_freq_base   = params.rope_freq_base  == 0.0f ? hparams.rope_freq_base_train  : params.rope_freq_base;
     cparams.rope_freq_scale  = params.rope_freq_scale == 0.0f ? hparams.rope_freq_scale_train : params.rope_freq_scale;
 
@@ -401,6 +409,69 @@ llama_context::llama_context(
             sampling.token_ids_full_vocab[i] = i;
         }
     }
+
+    // Copy triattention parameters from public params to cparams
+    cparams.triattention_path        = params.triattention_path ? params.triattention_path : "";
+    cparams.triattention_budget_pct  = params.triattention_budget_pct;
+    cparams.triattention_window      = params.triattention_window;
+    cparams.triattention_interval    = params.triattention_interval;
+    cparams.triattention_sink        = params.triattention_sink;
+
+    // TriAttention: load calibration stats and init runtime if a path was given.
+    // Only initialise for the primary (DEFAULT) context — MTP/draft contexts share
+    // the target model's KV cache and should not create their own tria_runtime,
+    // which would overwrite g_tria_rt and break the fast-path get_kv() lookup for
+    // the target context (causing n_kv=0 and silently skipping all scoring).
+    if (!cparams.triattention_path.empty() && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT) {
+        tria_stats_data = tria_load(cparams.triattention_path.c_str());
+        if (!tria_stats_data) {
+            LLAMA_LOG_WARN("%s: failed to load triattention stats from '%s'\n",
+                           __func__, cparams.triattention_path.c_str());
+        } else {
+            tria_rt = tria_runtime_init(tria_stats_data,
+                                        cparams.triattention_budget_pct,
+                                        cparams.triattention_window,
+                                        cparams.triattention_interval,
+                                        cparams.triattention_sink);
+            if (!tria_rt) {
+                LLAMA_LOG_WARN("%s: triattention runtime init failed (bad budget or dims)\n",
+                               __func__);
+            } else {
+                // Set RoPE layout flag so the CPU scoring path extracts
+                // frequency pairs correctly. NEOX and IMROPE both use the
+                // split-half layout [r0..r_{fc-1}, i0..i_{fc-1}]; NORM uses
+                // the interleaved layout [r0, i0, r1, i1, ...].
+                const auto rt = model.hparams.rope_type;
+                tria_rt->rope_neox = (rt == LLAMA_ROPE_TYPE_NEOX ||
+                                      rt == LLAMA_ROPE_TYPE_IMROPE) ? 1 : 0;
+
+                /* Task 10: cache the KV cache pointer to avoid repeated dynamic_cast in bridge */
+                {
+                    auto * mem = memory.get();
+                    if (mem) {
+                        auto * kv = dynamic_cast<llama_kv_cache *>(mem);
+                        if (kv) {
+                            tria_rt->kv_cache_ptr = kv;
+                        } else {
+                            auto * hybrid = dynamic_cast<llama_memory_hybrid *>(mem);
+                            if (hybrid) tria_rt->kv_cache_ptr = hybrid->get_mem_attn();
+                        }
+                    }
+                }
+
+                g_tria_rt = tria_rt;
+                LLAMA_LOG_INFO("%s: triattention enabled — %u layers, %u kv_heads, "
+                               "budget %d%%, window %d, interval %d, rope_neox=%d\n",
+                               __func__,
+                               tria_stats_data->num_layers,
+                               tria_stats_data->num_kv_heads,
+                               cparams.triattention_budget_pct,
+                               cparams.triattention_window,
+                               cparams.triattention_interval,
+                               tria_rt->rope_neox);
+            }
+        }
+    }
 }
 
 llama_context::~llama_context() {
@@ -420,6 +491,11 @@ llama_context::~llama_context() {
             }
         }
     }
+    tria_runtime_free(tria_rt);
+    tria_rt = nullptr;
+    tria_free(tria_stats_data);
+    tria_stats_data = nullptr;
+
     ggml_opt_free(opt_ctx);
 }
 
@@ -1329,6 +1405,21 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     }
 
     ret = GGML_STATUS_SUCCESS;
+
+    // TriAttention post-compute scoring pass: runs every `interval` decode tokens.
+    // Only active during primary decoder steps. We explicitly exclude:
+    //   - LLM_GRAPH_TYPE_ENCODER: no KV cache to score
+    //   - LLM_GRAPH_TYPE_DECODER_MTP: MTP passes write only the last N layers;
+    //     scoring against a partially-written cache would evict tokens based on
+    //     incomplete layer information and could corrupt the primary decoder state.
+    //   - prefill batches (n_seq_tokens > 1): scoring during prefill triggers a
+    //     full GPU→CPU KV readback every `interval` tokens, decimating pp throughput.
+    //     KV eviction only makes sense after the prompt is fully encoded anyway.
+    if (tria_rt && tria_stats_data &&
+        ubatch.n_seq_tokens == 1 &&
+        (gtype == LLM_GRAPH_TYPE_DECODER || gtype == LLM_GRAPH_TYPE_DEFAULT)) {
+        tria_maybe_score(tria_rt, this);
+    }
 
     return res;
 }
@@ -3017,6 +3108,19 @@ size_t llama_context::state_write_data(llama_io_write_i & io) {
         // TODO: add more model-specific info which should prevent loading the session file if not identical
     }
 
+    // write RoPE / YaRN parameters so K-cache tensors can be validated on restore
+    // (session version 10+)
+    {
+        LLAMA_LOG_DEBUG("%s: - writing rope/yarn params\n", __func__);
+        io.write(&cparams.n_ctx_orig_yarn,  sizeof(cparams.n_ctx_orig_yarn));
+        io.write(&cparams.yarn_ext_factor,  sizeof(cparams.yarn_ext_factor));
+        io.write(&cparams.yarn_attn_factor, sizeof(cparams.yarn_attn_factor));
+        io.write(&cparams.yarn_beta_fast,   sizeof(cparams.yarn_beta_fast));
+        io.write(&cparams.yarn_beta_slow,   sizeof(cparams.yarn_beta_slow));
+        io.write(&cparams.rope_freq_base,   sizeof(cparams.rope_freq_base));
+        io.write(&cparams.rope_freq_scale,  sizeof(cparams.rope_freq_scale));
+    }
+
     if (memory != nullptr) {
         LLAMA_LOG_DEBUG("%s: - writing memory module\n", __func__);
         memory->state_write(io);
@@ -3040,6 +3144,61 @@ size_t llama_context::state_read_data(llama_io_read_i & io) {
             throw std::runtime_error(format("wrong model arch: '%s' instead of '%s'", arch_str.c_str(), cur_arch_str.c_str()));
         }
         // TODO: add more info which needs to be identical but which is not verified otherwise
+    }
+
+    // read and validate RoPE / YaRN parameters (session version 10+)
+    // K-cache tensors were position-encoded with these values; mismatches mean
+    // attention scores may be wrong, but we only warn rather than hard-error to
+    // allow approximate restoration for debugging purposes.
+    {
+        LLAMA_LOG_DEBUG("%s: - reading rope/yarn params\n", __func__);
+
+        uint32_t saved_n_ctx_orig_yarn = 0;
+        float    saved_yarn_ext_factor  = 0.0f;
+        float    saved_yarn_attn_factor = 0.0f;
+        float    saved_yarn_beta_fast   = 0.0f;
+        float    saved_yarn_beta_slow   = 0.0f;
+        float    saved_rope_freq_base   = 0.0f;
+        float    saved_rope_freq_scale  = 0.0f;
+
+        io.read(&saved_n_ctx_orig_yarn,  sizeof(saved_n_ctx_orig_yarn));
+        io.read(&saved_yarn_ext_factor,  sizeof(saved_yarn_ext_factor));
+        io.read(&saved_yarn_attn_factor, sizeof(saved_yarn_attn_factor));
+        io.read(&saved_yarn_beta_fast,   sizeof(saved_yarn_beta_fast));
+        io.read(&saved_yarn_beta_slow,   sizeof(saved_yarn_beta_slow));
+        io.read(&saved_rope_freq_base,   sizeof(saved_rope_freq_base));
+        io.read(&saved_rope_freq_scale,  sizeof(saved_rope_freq_scale));
+
+        bool rope_mismatch = false;
+        if (saved_n_ctx_orig_yarn != cparams.n_ctx_orig_yarn) {
+            LLAMA_LOG_WARN("%s: session rope n_ctx_orig_yarn mismatch: saved=%u current=%u\n",
+                __func__, saved_n_ctx_orig_yarn, cparams.n_ctx_orig_yarn);
+            rope_mismatch = true;
+        }
+        if (saved_yarn_ext_factor != cparams.yarn_ext_factor) {
+            LLAMA_LOG_WARN("%s: session rope yarn_ext_factor mismatch: saved=%.4f current=%.4f\n",
+                __func__, saved_yarn_ext_factor, cparams.yarn_ext_factor);
+            rope_mismatch = true;
+        }
+        if (saved_yarn_attn_factor != cparams.yarn_attn_factor) {
+            LLAMA_LOG_WARN("%s: session rope yarn_attn_factor mismatch: saved=%.4f current=%.4f\n",
+                __func__, saved_yarn_attn_factor, cparams.yarn_attn_factor);
+            rope_mismatch = true;
+        }
+        if (saved_rope_freq_base != cparams.rope_freq_base) {
+            LLAMA_LOG_WARN("%s: session rope_freq_base mismatch: saved=%.1f current=%.1f\n",
+                __func__, saved_rope_freq_base, cparams.rope_freq_base);
+            rope_mismatch = true;
+        }
+        if (saved_rope_freq_scale != cparams.rope_freq_scale) {
+            LLAMA_LOG_WARN("%s: session rope_freq_scale mismatch: saved=%.4f current=%.4f\n",
+                __func__, saved_rope_freq_scale, cparams.rope_freq_scale);
+            rope_mismatch = true;
+        }
+        if (rope_mismatch) {
+            LLAMA_LOG_WARN("%s: RoPE/YaRN parameter mismatch — restored KV cache may produce incorrect attention scores\n",
+                __func__);
+        }
     }
 
     if (memory) {
@@ -3347,6 +3506,7 @@ void llama_context::opt_epoch(
 llama_context_params llama_context_default_params() {
     llama_context_params result = {
         /*.n_ctx                       =*/ 512,
+        /*.n_ctx_mtp                   =*/ 0,
         /*.n_batch                     =*/ 2048,
         /*.n_ubatch                    =*/ 512,
         /*.n_seq_max                   =*/ 1,
@@ -3379,6 +3539,11 @@ llama_context_params llama_context_default_params() {
         /*.op_offload                  =*/ true,
         /*.swa_full                    =*/ true,
         /*.kv_unified                  =*/ false,
+        /*.triattention_path           =*/ nullptr,
+        /*.triattention_budget_pct     =*/ 75,
+        /*.triattention_window         =*/ 128,
+        /*.triattention_interval       =*/ 128,
+        /*.triattention_sink           =*/ 4,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,

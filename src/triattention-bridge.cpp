@@ -1,0 +1,225 @@
+/*
+ * triattention-bridge.cpp — C++ bridge for accessing llama internals from C
+ */
+
+#include "llama.h"
+#include "llama-context.h"
+#include "llama-kv-cache.h"
+#include "llama-memory-hybrid.h"
+#include "triattention-runtime.h"
+#include "llama-impl.h"
+
+#include <algorithm>
+#include <numeric>
+#include <vector>
+
+/* Helper: extract llama_kv_cache from either pure KV or hybrid memory */
+static llama_kv_cache * get_kv(void * ctx_void) {
+    auto * ctx = (llama_context *)ctx_void;
+
+    /* Fast path: use cached pointer set during context init (Task 10).
+     * g_tria_rt is set in llama_context ctor when tria_rt is initialized.
+     * Valid for single-context use; falls through to dynamic_cast on miss. */
+    if (g_tria_rt && g_tria_rt->kv_cache_ptr) {
+        return static_cast<llama_kv_cache *>(g_tria_rt->kv_cache_ptr);
+    }
+
+    /* Slow path: dynamic cast (first call or multi-context fallback) */
+    auto * mem = llama_get_memory(ctx);
+    if (!mem) return nullptr;
+
+    auto * kv = dynamic_cast<llama_kv_cache *>(mem);
+    if (kv) return kv;
+
+    auto * hybrid = dynamic_cast<llama_memory_hybrid *>(mem);
+    if (hybrid) return hybrid->get_mem_attn();
+
+    return nullptr;
+}
+
+extern "C" {
+
+struct ggml_tensor * tria_get_k_tensor(void * ctx_void, int layer_idx) {
+    auto * kv = get_kv(ctx_void);
+    if (!kv) return nullptr;
+    return kv->get_k_raw(layer_idx);
+}
+
+struct ggml_tensor * tria_get_v_tensor(void * ctx_void, int layer_idx) {
+    auto * kv = get_kv(ctx_void);
+    if (!kv) return nullptr;
+    return kv->get_v_raw(layer_idx);
+}
+
+int tria_get_n_kv(void * ctx_void) {
+    auto * kv = get_kv(ctx_void);
+    if (!kv) return 0;
+
+    // TODO: per-sequence tracking for multi-slot server.
+    // Current approach: max pos across all sequences. Correct for -np 1.
+    // For multi-slot: cur_pos used in scoring may be wrong for shorter slots.
+    auto * ctx = (llama_context *)ctx_void;
+    const uint32_t n_seq = llama_n_seq_max(ctx);
+    llama_pos pmax = -1;
+    for (llama_seq_id s = 0; s < (llama_seq_id) n_seq; ++s) {
+        pmax = std::max(pmax, kv->seq_pos_max(s));
+    }
+    return (pmax >= 0) ? (int) (pmax + 1) : 0;
+}
+
+int tria_get_used_n_kv(void * ctx_void) {
+    auto * kv = get_kv(ctx_void);
+    if (!kv) return 0;
+
+    // Phase 3B: return logical size when indirection active
+    if (kv->has_indirection()) {
+        return kv->get_active_kv_real_len();
+    }
+
+    return (int) kv->get_used_n_kv();
+}
+
+int tria_get_n_ctx(void * ctx_void) {
+    auto * ctx = (llama_context *)ctx_void;
+    if (!ctx) return 0;
+    return (int) llama_n_ctx(ctx);
+}
+
+int tria_get_kv_positions(void * ctx_void, int * positions, int * phys_indices, int max_positions) {
+    auto * ctx = (llama_context *)ctx_void;
+    if (!ctx || !positions || max_positions <= 0) {
+        return 0;
+    }
+
+    auto * kv = get_kv(ctx_void);
+    if (!kv) return 0;
+
+    std::vector<llama_pos> kv_positions;
+    if (!kv->get_cell_positions(kv_positions)) {
+        return 0;
+    }
+
+    int count = 0;
+    for (int i = 0; i < (int) kv_positions.size() && count < max_positions; ++i) {
+        if (kv_positions[i] >= 0) {  /* skip empty cells */
+            positions[count] = (int) kv_positions[i];
+            if (phys_indices) phys_indices[count] = i;  /* physical row index */
+            count++;
+        }
+    }
+    return count;
+}
+
+} // extern "C"
+
+int tria_compact_kv_with_positions(struct tria_runtime * rt, void * ctx_void, std::vector<uint32_t> & keep_positions) {
+    auto * ctx = (llama_context *)ctx_void;
+    if (!rt || !ctx || !rt->global_scores || rt->global_budget <= 0) {
+        return 0;
+    }
+
+    auto * kv = get_kv(ctx_void);
+    if (!kv) return 0;
+
+    /* Phase 3B: when indirection is active, use logical size */
+    const bool has_indirection = kv->has_indirection();
+    const int n_kv = has_indirection ? kv->get_active_kv_real_len() : (int) kv->get_used_n_kv();
+    const int n_old = n_kv - rt->window;
+    if (n_old <= 0) {
+        return 0;
+    }
+
+    int budget = rt->global_budget;
+    budget = std::max(1, std::min(budget, n_old));
+
+    /* Protect sink/prefix tokens from compaction (Codex review) */
+    int prefix = rt->sink > 0 ? rt->sink : 128;
+    if (prefix > n_old) prefix = n_old;
+
+    /* Ensure budget covers at least the protected prefix (Codex review #2) */
+    if (budget < prefix) budget = prefix;
+
+    /* Build keep set: always keep prefix, then top-scoring from rest */
+    keep_positions.clear();
+    keep_positions.reserve(budget + rt->window);
+
+    /* Always keep prefix tokens */
+    for (int i = 0; i < prefix && i < budget; i++) {
+        keep_positions.push_back((uint32_t)i);
+    }
+
+    /* Fill remaining budget from non-prefix tokens by score */
+    int remaining_budget = budget - (int)keep_positions.size();
+    if (remaining_budget > 0 && prefix < n_old) {
+        std::vector<uint32_t> ranked;
+        ranked.reserve(n_old - prefix);
+        for (int i = prefix; i < n_old; i++) {
+            ranked.push_back((uint32_t)i);
+        }
+
+        std::stable_sort(ranked.begin(), ranked.end(), [&](uint32_t a, uint32_t b) {
+            if (rt->global_scores[a] == rt->global_scores[b]) return a < b;
+            return rt->global_scores[a] > rt->global_scores[b];
+        });
+
+        int take = std::min(remaining_budget, (int)ranked.size());
+        ranked.resize(take);
+        std::sort(ranked.begin(), ranked.end());
+        keep_positions.insert(keep_positions.end(), ranked.begin(), ranked.end());
+    }
+
+    /* Add window (recent) tokens */
+    for (int pos = n_old; pos < n_kv; ++pos) {
+        keep_positions.push_back((uint32_t) pos);
+    }
+
+    if ((int) keep_positions.size() >= n_kv) {
+        return 0;
+    }
+
+    llama_synchronize(ctx);
+
+    /* Phase 3B: indirection is currently broken for multi-round eviction
+     * (scoring reads K tensor by physical offset, but indirection makes
+     * logical != physical). Default to legacy compaction.
+     * Set TRIA_INDIRECTION=1 to test Phase 3B. */
+    static int use_compact = -1;
+    if (use_compact < 0) {
+        const char * env = getenv("TRIA_INDIRECTION");
+        use_compact = (env && env[0] == '1') ? 0 : 1;
+    }
+
+    if (!use_compact) {
+        /* Phase 3B: translate logical keep indices to physical rows */
+        if (has_indirection) {
+            for (auto & pos : keep_positions) {
+                pos = (uint32_t)kv->get_active_kv_phys(pos);
+            }
+        }
+        if (!kv->triattention_set_active(keep_positions)) {
+            return 0;
+        }
+
+        int evicted = n_kv - (int)keep_positions.size();
+        LLAMA_LOG_INFO("%s: TriAttention (Phase 3B indirection) evicted %d tokens (kept %d / %d)\n", __func__, evicted, (int)keep_positions.size(), n_kv);
+        return evicted;
+    }
+
+    /* Legacy physical compaction path */
+    if (!kv->triattention_compact(keep_positions)) {
+        return 0;
+    }
+
+    int evicted = n_kv - (int) keep_positions.size();
+    LLAMA_LOG_INFO("%s: TriAttention evicted %d tokens (kept %d / %d)\n", __func__, evicted, (int)keep_positions.size(), n_kv);
+    return evicted;
+}
+
+extern "C" {
+
+int tria_compact_kv(struct tria_runtime * rt, void * ctx_void) {
+    std::vector<uint32_t> dummy;
+    return tria_compact_kv_with_positions(rt, ctx_void, dummy);
+}
+
+} /* extern "C" */

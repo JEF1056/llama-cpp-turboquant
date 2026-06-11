@@ -20,7 +20,7 @@
 //
 
 LLAMA_ATTRIBUTE_FORMAT(2, 3)
-void llama_log_internal        (ggml_log_level level, const char * format, ...);
+extern "C" void llama_log_internal(ggml_log_level level, const char * format, ...);
 void llama_log_callback_default(ggml_log_level level, const char * text, void * user_data);
 
 #define LLAMA_LOG(...)       llama_log_internal(GGML_LOG_LEVEL_NONE , __VA_ARGS__)

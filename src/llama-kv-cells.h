@@ -76,6 +76,12 @@ public:
         return pos[i] == -1;
     }
 
+    // Return the token position stored in cell i (-1 if empty).
+    llama_pos get_pos(uint32_t i) const {
+        assert(i < pos.size());
+        return pos[i];
+    }
+
     uint32_t get_used() const {
         return used.size();
     }

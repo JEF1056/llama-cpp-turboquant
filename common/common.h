@@ -545,6 +545,13 @@ struct common_params {
     bool swa_full          = false; // use full-size SWA cache (https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055)
     bool kv_unified        = false; // enable unified KV cache
 
+    // TriAttention KV eviction
+    std::string triattention_path;                // path to .tria calibration file
+    int         triattention_budget_pct  = 75;   // KV retention %
+    int         triattention_window      = 128;  // recent tokens always kept
+    int         triattention_interval    = 128;  // score every N tokens
+    int         triattention_sink        = 4;    // attention sink tokens always kept
+
     bool input_prefix_bos  = false; // prefix BOS to user inputs, preceding input_prefix
     bool use_mmap          = true;  // enable mmap to use filesystem cache
     bool use_direct_io     = false; // read from disk without buffering

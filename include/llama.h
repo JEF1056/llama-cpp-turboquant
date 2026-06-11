@@ -43,7 +43,7 @@
 #define LLAMA_FILE_MAGIC_GGSQ 0x67677371u // 'ggsq'
 
 #define LLAMA_SESSION_MAGIC   LLAMA_FILE_MAGIC_GGSN
-#define LLAMA_SESSION_VERSION 9
+#define LLAMA_SESSION_VERSION 10
 
 #define LLAMA_STATE_SEQ_MAGIC   LLAMA_FILE_MAGIC_GGSQ
 #define LLAMA_STATE_SEQ_VERSION 2
@@ -337,6 +337,7 @@ extern "C" {
     //       https://github.com/ggml-org/llama.cpp/pull/7544
     struct llama_context_params {
         uint32_t n_ctx;             // text context, 0 = from model
+        uint32_t n_ctx_mtp;         // KV cache context size for MTP contexts (0 = same as n_ctx)
         uint32_t n_batch;           // logical maximum batch size that can be submitted to llama_decode
         uint32_t n_ubatch;          // physical maximum batch size
         uint32_t n_seq_max;         // max number of sequences (i.e. distinct states for recurrent models)
@@ -384,6 +385,14 @@ extern "C" {
         bool kv_unified;  // use a unified buffer across the input sequences when computing the attention
                           // try to disable when n_seq_max > 1 for improved performance when the sequences do not share a large prefix
                           // ref: https://github.com/ggml-org/llama.cpp/pull/14363
+
+        // TriAttention KV eviction (requires a .tria calibration stats file)
+        // Scores and evicts low-importance KV cache entries every `triattention_interval` tokens.
+        const char * triattention_path;        // path to .tria file; NULL = disabled
+        int          triattention_budget_pct;  // KV retention % of n_ctx (1-100, default 75)
+        int          triattention_window;      // recent tokens always kept (default 128)
+        int          triattention_interval;    // score every N decode tokens (default 128)
+        int          triattention_sink;        // prefix/attention-sink tokens always kept (default 4)
 
         // [EXPERIMENTAL]
         // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)
