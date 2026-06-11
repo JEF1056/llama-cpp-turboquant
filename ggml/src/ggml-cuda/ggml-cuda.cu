@@ -559,6 +559,10 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
             access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
             access.location.id = device;
             access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+            // cuMemSetAccess returns CUDA_ERROR_NOT_READY if the context has any
+            // outstanding async work (common during image embedding with a large KV cache).
+            // Synchronize first to bring the device to a quiescent state.
+            CU_CHECK(cuCtxSynchronize());
             CU_CHECK(cuMemSetAccess((CUdeviceptr)((char *)(pool_addr) + pool_size), reserve_size, &access, 1));
 
             // add to the pool
