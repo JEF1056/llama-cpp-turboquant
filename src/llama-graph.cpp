@@ -88,9 +88,9 @@ void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
         // receive valid indices. Fill with zeros (token ID 0 is always a valid
         // vocabulary index) to avoid uninitialized memory causing out-of-bounds
         // get_rows crashes when processing a second image in the same turn.
-        const int64_t n_tokens = ubatch->n_tokens;
-        std::vector<int32_t> zeros(n_tokens, 0);
-        ggml_backend_tensor_set(tokens, zeros.data(), 0, n_tokens*ggml_element_size(tokens));
+        // Use memset rather than a heap-allocated zeros buffer — avoids a
+        // malloc/free on every image sub-batch (called 2–4× per image).
+        ggml_backend_tensor_memset(tokens, 0, 0, ggml_nbytes(tokens));
     }
 
     if (ubatch->embd) {

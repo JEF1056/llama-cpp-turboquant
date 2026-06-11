@@ -45,7 +45,12 @@ struct mtmd_image_tokens {
     uint32_t ny; // number of tokens in y direction
     mtmd_pos_type pos = MTMD_POS_TYPE_NORMAL;
     uint32_t image_idx = 0; // 0-based position of this image among image chunks in the prompt(used by pos == MTMD_POS_TYPE_HUNYUANVL)
+    // When non-zero, overrides nx*ny in n_tokens(). Used by sentinel chunks
+    // created via mtmd_input_chunk_create_sentinel() for kvc-disk prefix matching.
+    // Always 0 for real (encoded) chunks.
+    uint32_t n_tokens_override = 0;
     uint32_t n_tokens() const {
+        if (n_tokens_override > 0) return n_tokens_override;
         if (pos == MTMD_POS_TYPE_HUNYUANVL) {
             // [BOI] [row0 tokens + newline] ... [row(ny-1) tokens + newline] [EOI]
             return (nx + 1) * ny + 2;
@@ -61,6 +66,7 @@ struct mtmd_image_tokens {
             ny,
             pos,
             image_idx,
+            n_tokens_override,
             batch_f32.clone(),
             id
         };
@@ -1306,6 +1312,32 @@ void mtmd_input_chunk_free(mtmd_input_chunk * chunk) {
     if (chunk) {
         delete chunk;
     }
+}
+
+mtmd_input_chunk * mtmd_input_chunk_create_sentinel(
+        const char * id, size_t n_tokens, llama_pos n_pos, int pos_type_int) {
+    // Creates a metadata-only sentinel chunk for kvc-disk prefix matching after restore.
+    // The sentinel has the correct id, n_tokens() and n_pos values but carries no
+    // embedding data (batch_f32 is empty) — it MUST NOT be passed to mtmd_decode_batch.
+    //
+    // nx is set to n_pos so that:
+    //   MROPE:   get_n_pos() = max(nx, ny) = n_pos          ✓
+    //   NORMAL:  get_n_pos() = n_tokens()  = n_tokens_override = n_tokens
+    //            (n_pos == n_tokens for NORMAL, so nx = n_pos = n_tokens is fine)
+    //   HUNYUAN: get_n_pos() = n_tokens()  = n_tokens_override = n_tokens
+    //
+    // n_tokens_override ensures n_tokens() returns the saved NULL-run length for
+    // all position types, independently of nx*ny.
+    auto * chunk = new mtmd_input_chunk{MTMD_INPUT_CHUNK_TYPE_IMAGE};
+    chunk->tokens_image = mtmd_image_tokens_ptr(new mtmd_image_tokens{});
+    auto & img = *chunk->tokens_image;
+    img.nx               = (uint32_t) n_pos;  // drives n_pos() for MROPE
+    img.ny               = 1;
+    img.pos              = (mtmd_pos_type) pos_type_int;
+    img.n_tokens_override = (uint32_t) n_tokens;
+    img.id               = id ? id : "";
+    // batch_f32 default-constructed (empty)
+    return chunk;
 }
 
 // mtmd_image_tokens

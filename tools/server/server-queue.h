@@ -2,6 +2,8 @@
 
 #include "server-task.h"
 
+#include "ggml.h"
+
 #include <condition_variable>
 #include <deque>
 #include <mutex>
@@ -29,6 +31,12 @@ private:
     std::function<void(server_task &&)> callback_new_task;
     std::function<void(void)>           callback_update_slots;
     std::function<void(bool)>           callback_sleeping_state;
+
+    // KVC disk autosave timer
+    std::function<bool(void)> callback_all_slots_idle; // returns true when no slot is processing
+    std::function<void(void)> callback_autosave;       // triggered when idle + interval elapsed
+    int64_t kv_autosave_interval_ms = -1;              // -1 = disabled
+    int64_t time_last_autosave      = 0;
 
 public:
     // Add a new task to the end of the queue
@@ -93,6 +101,26 @@ public:
     // Register the function to be called when all slots data is ready to be processed
     void on_update_slots(std::function<void(void)> callback) {
         callback_update_slots = std::move(callback);
+    }
+
+    // Register the "all slots idle?" predicate used by the KVC autosave timer.
+    // Must be called before start_loop().
+    void on_all_slots_idle(std::function<bool(void)> callback) {
+        callback_all_slots_idle = std::move(callback);
+    }
+
+    // Register the KVC autosave callback (called when idle + interval elapsed).
+    // Must be called before start_loop().
+    void on_autosave(std::function<void(void)> callback) {
+        callback_autosave = std::move(callback);
+    }
+
+    // Configure the KVC autosave timer interval.
+    // interval_ms <= 0 disables the autosave timer.
+    // Must be called before start_loop().
+    void set_kv_autosave_interval(int64_t interval_ms) {
+        kv_autosave_interval_ms = interval_ms;
+        time_last_autosave      = ggml_time_ms();
     }
 
     // Register callback for sleeping state change; multiple callbacks are allowed

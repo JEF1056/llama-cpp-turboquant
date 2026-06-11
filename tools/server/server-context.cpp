@@ -4,6 +4,7 @@
 #include "server-http.h"
 #include "server-task.h"
 #include "server-queue.h"
+#include "kvc-disk.h"
 
 #include "build-info.h"
 #include "common.h"
@@ -171,6 +172,9 @@ struct server_slot {
         }
 
         prompt.tokens.clear();
+        prompt.mtmd_positions.clear();
+        kvc_restored_pos_end = -1;
+        kvc_saved_pos_next   = -1; // content changed — next autosave must write
     }
 
     std::vector<common_adapter_lora_info> lora;
@@ -199,6 +203,16 @@ struct server_slot {
     int32_t n_draft_total = 0;      // Total draft tokens generated
     int32_t n_draft_accepted = 0;   // Draft tokens actually accepted
 
+    // kvc-disk restore: when >= 0, holds the pos_next() value saved in the TKVD file.
+    // Enables correct seq_rm boundary for M-RoPE and hybrid models.
+    // Consumed (set to -1) on first use in update_slots().
+    llama_pos kvc_restored_pos_end = -1;
+
+    // kvc-disk autosave: pos_next() value at the time of the last successful disk write.
+    // -1 means the slot has never been saved (or was cleared since the last save).
+    // Used to skip redundant writes when the KV state has not changed.
+    llama_pos kvc_saved_pos_next = -1;
+
     void reset() {
         SLT_DBG(*this, "%s", "\n");
 
@@ -224,6 +238,9 @@ struct server_slot {
         // clear speculative decoding stats
         n_draft_total = 0;
         n_draft_accepted = 0;
+
+        kvc_restored_pos_end = -1;
+        kvc_saved_pos_next   = -1;
 
         task_prev = std::move(task);
         task.reset();
@@ -656,6 +673,13 @@ public:
 
     ~server_context_impl() {
         if (!sleeping) {
+            // Flush KV cache to disk before releasing GPU memory.
+            // This covers normal exit (SIGINT), router model eviction, and any
+            // other path that terminates the queue and destroys the context.
+            // The sleeping path already saves in handle_sleeping_state().
+            if (!params_base.slot_save_path.empty() && ctx_tgt != nullptr) {
+                save_all_idle_slots_to_disk();
+            }
             // destroy() is already called when entering sleeping state
             // we don't call it again here to avoid double free
             destroy();
@@ -740,15 +764,264 @@ private:
         prompt_cache->update();
     }
 
+    // Populate slot.prompt.tokens and slot.kvc_restored_pos_end from a
+    // successful kvc_disk_read result.  Shared by restore_idle_slots_from_disk()
+    // and SERVER_TASK_TYPE_SLOT_RESTORE.
+    // Returns true on success; on failure the slot is left empty and safe.
+    bool kvc_restore_slot_tokens(server_slot & slot,
+                                 std::vector<mtmd_chunk_pos> mtmd_positions,
+                                 const llama_tokens        & tokens_out,
+                                 llama_pos                   n_pos_out) {
+        slot.prompt.tokens.clear();
+        slot.prompt.mtmd_positions = std::move(mtmd_positions);
+        slot.kvc_restored_pos_end  = n_pos_out;
+
+        size_t mtmd_idx = 0;
+        for (size_t i = 0; i < tokens_out.size(); ) {
+            if (tokens_out[i] == LLAMA_TOKEN_NULL) {
+                size_t j = i;
+                while (j < tokens_out.size() && tokens_out[j] == LLAMA_TOKEN_NULL) j++;
+                const uint32_t n_null = (uint32_t)(j - i);
+
+                if (mtmd_idx < slot.prompt.mtmd_positions.size()) {
+                    const auto & cp = slot.prompt.mtmd_positions[mtmd_idx++];
+                    auto * sentinel = mtmd_input_chunk_create_sentinel(
+                        cp.id.c_str(), n_null, (llama_pos) cp.seq_len, cp.pos_type);
+                    slot.prompt.tokens.push_back(sentinel);
+                    mtmd_input_chunk_free(sentinel);
+                } else {
+                    SRV_WRN("[KVC] slot %d: NULL run at offset %zu but no mtmd_pos entry "
+                        "(mtmd_idx=%zu, n_mtmd=%zu); discarding token restore\n",
+                        slot.id, i, mtmd_idx, slot.prompt.mtmd_positions.size());
+                    slot.prompt.tokens.clear();
+                    slot.kvc_restored_pos_end = -1;
+                    return false;
+                }
+                i = j;
+            } else {
+                slot.prompt.tokens.push_back(tokens_out[i++]);
+            }
+        }
+        return true;
+    }
+
+    // Build a kvc_disk_fingerprint from the currently-loaded model/context.
+    // YaRN/RoPE fields are filled from common_params (which mirrors llama_cparams).
+    kvc_disk_fingerprint make_kvc_fingerprint() const {
+        kvc_disk_fingerprint fp = kvc_disk_make_fingerprint(
+            model_tgt, ctx_tgt, params_base.model.path);
+        fp.n_ctx_orig_yarn  = (uint32_t) params_base.yarn_orig_ctx;
+        fp.yarn_ext_factor  = params_base.yarn_ext_factor;
+        fp.yarn_attn_factor = params_base.yarn_attn_factor;
+        fp.yarn_beta_fast   = params_base.yarn_beta_fast;
+        fp.yarn_beta_slow   = params_base.yarn_beta_slow;
+        fp.rope_freq_base   = params_base.rope_freq_base;
+        fp.rope_freq_scale  = params_base.rope_freq_scale;
+        fp.type_k           = (uint32_t) params_base.cache_type_k;
+        fp.type_v           = (uint32_t) params_base.cache_type_v;
+        return fp;
+    }
+
+    std::string get_prompt_cache_file_path(const server_prompt & prompt) const {
+        const auto & tokens_all = prompt.tokens.get_tokens_all();
+        uint32_t crc = crc32_buf(tokens_all.data(), tokens_all.size() * sizeof(llama_token));
+        char buf[64];
+        snprintf(buf, sizeof(buf), "prompt_cache_%08X.llama_cache", crc);
+        return params_base.slot_save_path + buf;
+    }
+
+    // Persist all idle (non-processing) slots with cached tokens to disk.
+    void save_all_idle_slots_to_disk() {
+        if (params_base.slot_save_path.empty() || ctx_tgt == nullptr) {
+            return;
+        }
+
+        // Ensure directory exists
+        std::error_code ec;
+        std::filesystem::create_directories(params_base.slot_save_path, ec);
+        if (ec) {
+            SRV_WRN("[KVC] failed to create autosave dir '%s': %s\n",
+                params_base.slot_save_path.c_str(), ec.message().c_str());
+            return;
+        }
+
+        const kvc_disk_fingerprint fp = make_kvc_fingerprint();
+        int n_saved = 0;
+        int n_total = 0;
+
+        SRV_INF("[KVC] autosave triggered: scanning %zu slots\n", slots.size());
+
+        for (auto & slot : slots) {
+            if (slot.is_processing()) {
+                SRV_INF("[KVC] slot %d: active, skipping\n", slot.id);
+                continue;
+            }
+            if (slot.prompt.n_tokens() == 0) {
+                SRV_INF("[KVC] slot %d: no cached tokens, skipping\n", slot.id);
+                continue;
+            }
+            n_total++;
+            // Skip if nothing changed since the last write.
+            const llama_pos cur_pos = slot.prompt.tokens.pos_next();
+            if (slot.kvc_saved_pos_next >= 0 && cur_pos == slot.kvc_saved_pos_next) {
+                SRV_INF("[KVC] slot %d: unchanged (pos=%d), skipping write\n",
+                    slot.id, (int) cur_pos);
+                n_saved++; // counts as "already persisted"
+                continue;
+            }
+            // Use slot id as filename — slots are ephemeral; the file serves as
+            // a restore hint for the same slot position after a wake.
+            // slot_save_path already has a trailing separator (normalized in arg.cpp)
+            const std::string path = params_base.slot_save_path
+                + "slot" + std::to_string(slot.id) + ".llama_cache";
+            SRV_INF("[KVC] slot %d: saving %d tokens → %s\n",
+                slot.id, slot.prompt.n_tokens(), path.c_str());
+            const bool ok = kvc_disk_write(
+                path, fp, slot.prompt.mtmd_positions,
+                ctx_tgt, slot.id,
+                slot.prompt.n_tokens(),
+                cur_pos,
+                slot.prompt.tokens.get_tokens_all()); // includes LLAMA_TOKEN_NULL for mtmd
+            if (ok) {
+                slot.kvc_saved_pos_next = cur_pos;
+                n_saved++;
+            }
+        }
+
+        int n_prompt_saved = 0;
+        if (prompt_cache) {
+            SRV_INF("[KVC] autosave prompt cache: scanning %zu cached prompts\n", prompt_cache->states.size());
+            for (const auto & prompt : prompt_cache->states) {
+                const std::string path = get_prompt_cache_file_path(prompt);
+                if (std::filesystem::exists(path)) {
+                    n_prompt_saved++;
+                    continue;
+                }
+                SRV_INF("[KVC] prompt_cache: saving %d tokens → %s\n",
+                    prompt.n_tokens(), path.c_str());
+                if (kvc_disk_write_prompt(path, fp, prompt)) {
+                    n_prompt_saved++;
+                }
+            }
+        }
+
+        SRV_INF("[KVC] autosave complete: %d/%d slots and %d prompt cache entries written\n",
+            n_saved, n_total, n_prompt_saved);
+    }
+
+    // Scan slot_save_path for *.llama_cache files and restore matching ones
+    // into idle slots.
+    void restore_idle_slots_from_disk() {
+        if (params_base.slot_save_path.empty() || ctx_tgt == nullptr) {
+            return;
+        }
+
+        const kvc_disk_fingerprint expected = make_kvc_fingerprint();
+
+        std::error_code ec;
+        std::vector<std::filesystem::path> files;
+        for (const auto & entry : std::filesystem::directory_iterator(
+                params_base.slot_save_path, ec)) {
+            if (entry.is_regular_file() && entry.path().extension() == ".llama_cache") {
+                files.push_back(entry.path());
+            }
+        }
+        if (ec) {
+            SRV_WRN("[KVC] cannot scan dir '%s': %s\n",
+                params_base.slot_save_path.c_str(), ec.message().c_str());
+            return;
+        }
+
+        SRV_INF("[KVC] scanning '%s' for *.llama_cache (%zu files found)\n",
+            params_base.slot_save_path.c_str(), files.size());
+
+        int n_loaded = 0;
+        int n_prompt_loaded = 0;
+        for (const auto & fpath : files) {
+            std::string filename = fpath.filename().string();
+            if (filename.rfind("slot", 0) == 0) {
+                // Find a free idle slot
+                server_slot * target_slot = nullptr;
+                for (auto & slot : slots) {
+                    if (!slot.is_processing() && slot.prompt.n_tokens() == 0) {
+                        target_slot = &slot;
+                        break;
+                    }
+                }
+                if (target_slot == nullptr) {
+                    SRV_INF("%s", "[KVC] no free slots, stopping restore\n");
+                    break;
+                }
+
+                std::vector<mtmd_chunk_pos> mtmd_positions;
+                int32_t   n_tokens  = 0;
+                llama_pos n_pos_out = 0;
+                llama_tokens tokens_out;
+                const bool ok = kvc_disk_read(
+                    fpath.string(), expected,
+                    ctx_tgt, target_slot->id,
+                    mtmd_positions, n_tokens, n_pos_out, tokens_out);
+
+                if (ok) {
+                    const bool restore_ok = kvc_restore_slot_tokens(
+                        *target_slot, std::move(mtmd_positions), tokens_out, n_pos_out);
+                    if (restore_ok) {
+                        // Mark the slot as already in sync with disk so the next
+                        // autosave interval skips a redundant write.
+                        target_slot->kvc_saved_pos_next = n_pos_out;
+                        SRV_INF("[KVC] slot %d: restored %d tokens (n_pos=%d)\n",
+                            target_slot->id, (int) target_slot->prompt.n_tokens(), (int) n_pos_out);
+                    }
+                    n_loaded++;
+                }
+            } else if (filename.rfind("prompt_cache_", 0) == 0) {
+                if (!prompt_cache) {
+                    continue;
+                }
+                server_prompt prompt;
+                if (kvc_disk_read_prompt(fpath.string(), expected, prompt)) {
+                    // Check if already exists in states to avoid duplicates
+                    bool found = false;
+                    for (const auto & existing : prompt_cache->states) {
+                        if (existing.tokens.get_common_prefix(prompt.tokens) == prompt.tokens.size() &&
+                            existing.tokens.size() == prompt.tokens.size()) {
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (!found) {
+                        prompt_cache->states.push_back(std::move(prompt));
+                        n_prompt_loaded++;
+                    }
+                }
+            }
+        }
+
+        SRV_INF("[KVC] restore complete: %d slots and %d prompt cache entries loaded\n",
+            n_loaded, n_prompt_loaded);
+    }
+
     void handle_sleeping_state(bool new_state) {
         GGML_ASSERT(sleeping != new_state);
         if (new_state) {
             SRV_INF("%s", "server is entering sleeping state\n");
+            // Flush KV cache to disk before releasing GPU memory
+            if (!params_base.slot_save_path.empty()) {
+                SRV_INF("[KVC] entering sleep: flushing %zu slots to disk before GPU release\n",
+                    slots.size());
+                save_all_idle_slots_to_disk();
+            }
             destroy();
         } else {
             SRV_INF("%s", "server is exiting sleeping state\n");
             if (!load_model(params_base)) {
                 GGML_ABORT("failed to reload model after sleeping");
+            }
+            // Attempt to restore previously flushed KV cache
+            if (!params_base.slot_save_path.empty()) {
+                SRV_INF("[KVC] exiting sleep: attempting to restore from '%s'\n",
+                    params_base.slot_save_path.c_str());
+                restore_idle_slots_from_disk();
             }
         }
         sleeping = new_state;
@@ -1011,7 +1284,7 @@ private:
             }
             SRV_INF("%s", "use `--cache-ram 0` to disable the prompt cache\n");
 
-            prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx);
+            prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx, params_base.slot_save_path);
         } else {
             SRV_INF("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
         }
@@ -1058,6 +1331,25 @@ private:
         queue_tasks.on_sleeping_state([this](bool sleeping) {
             handle_sleeping_state(sleeping);
         });
+
+        // KVC disk autosave callbacks
+        if (!params_base.slot_save_path.empty() && params_base.kv_autosave_interval > 0) {
+            queue_tasks.set_kv_autosave_interval((int64_t) params_base.kv_autosave_interval * 1000);
+            queue_tasks.on_all_slots_idle([this]() -> bool {
+                for (const auto & slot : slots) {
+                    if (slot.is_processing()) return false;
+                }
+                return true;
+            });
+            queue_tasks.on_autosave([this]() {
+                save_all_idle_slots_to_disk();
+            });
+            SRV_INF("[KVC] disk autosave enabled: dir='%s' interval=%ds\n",
+                params_base.slot_save_path.c_str(), params_base.kv_autosave_interval);
+        } else if (!params_base.slot_save_path.empty()) {
+            SRV_INF("%s", "[KVC] slot_save_path set but kv_autosave_interval <= 0; "
+                "exit/sleep flush only\n");
+        }
 
         metrics.init();
 
@@ -1129,6 +1421,14 @@ private:
                 /* media_path            */ params_base.media_path,
                 /* force_pure_content    */ params_base.force_pure_content_parser
             };
+        }
+
+        // Restore any KV cache snapshots that were saved by a previous run.
+        // This mirrors the wake-from-sleep path in handle_sleeping_state().
+        if (!params_base.slot_save_path.empty()) {
+            SRV_INF("[KVC] startup: attempting to restore from '%s'\n",
+                params_base.slot_save_path.c_str());
+            restore_idle_slots_from_disk();
         }
 
         return true;
@@ -2131,10 +2431,6 @@ private:
                 } break;
             case SERVER_TASK_TYPE_SLOT_SAVE:
                 {
-                    if (!check_no_mtmd(task.id)) {
-                        break;
-                    }
-
                     const int id_slot = task.slot_action.id_slot;
                     server_slot * slot = get_slot_by_id(id_slot);
                     if (slot == nullptr) {
@@ -2142,37 +2438,43 @@ private:
                         break;
                     }
                     if (slot->is_processing()) {
-                        // if requested slot is unavailable, we defer this task for processing later
                         SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", task.id);
                         queue_tasks.defer(std::move(task));
                         break;
                     }
 
-                    const size_t token_count = slot->prompt.tokens.size();
                     const int64_t t_start = ggml_time_us();
 
-                    std::string filename = task.slot_action.filename;
-                    std::string filepath = task.slot_action.filepath;
+                    const kvc_disk_fingerprint fp = make_kvc_fingerprint();
+                    const llama_pos save_pos = slot->prompt.tokens.pos_next();
+                    const bool ok = kvc_disk_write(
+                        task.slot_action.filepath, fp,
+                        slot->prompt.mtmd_positions,
+                        ctx_tgt, slot->id,
+                        slot->prompt.n_tokens(),
+                        save_pos,
+                        slot->prompt.tokens.get_tokens_all());
 
-                    const llama_tokens & tokens = slot->prompt.tokens.get_tokens();
-                    const size_t nwrite = llama_state_seq_save_file(ctx_tgt, filepath.c_str(), slot->id, tokens.data(), token_count);
+                    if (!ok) {
+                        send_error(task, "Failed to save slot to disk", ERROR_TYPE_SERVER);
+                        break;
+                    }
+                    slot->kvc_saved_pos_next = save_pos;
 
                     const int64_t t_end = ggml_time_us();
-                    const double t_save_ms = (t_end - t_start) / 1000.0;
 
                     auto res = std::make_unique<server_task_result_slot_save_load>();
                     res->id       = task.id;
                     res->id_slot  = id_slot;
-                    res->filename = filename;
+                    res->filename = task.slot_action.filename;
                     res->is_save  = true;
-                    res->n_tokens = token_count;
-                    res->n_bytes  = nwrite;
-                    res->t_ms     = t_save_ms;
+                    res->n_tokens = (size_t) slot->prompt.n_tokens();
+                    res->n_bytes  = 0; // kvc_disk_write does not return bytes written
+                    res->t_ms     = (t_end - t_start) / 1000.0;
                     queue_results.send(std::move(res));
                 } break;
             case SERVER_TASK_TYPE_SLOT_RESTORE:
                 {
-                    if (!check_no_mtmd(task.id)) break;
                     const int id_slot = task.slot_action.id_slot;
                     server_slot * slot = get_slot_by_id(id_slot);
                     if (slot == nullptr) {
@@ -2180,7 +2482,6 @@ private:
                         break;
                     }
                     if (slot->is_processing()) {
-                        // if requested slot is unavailable, we defer this task for processing later
                         SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", task.id);
                         queue_tasks.defer(std::move(task));
                         break;
@@ -2188,33 +2489,35 @@ private:
 
                     const int64_t t_start = ggml_time_us();
 
-                    std::string filename = task.slot_action.filename;
-                    std::string filepath = task.slot_action.filepath;
+                    const kvc_disk_fingerprint expected = make_kvc_fingerprint();
+                    std::vector<mtmd_chunk_pos> mtmd_positions;
+                    int32_t   n_tokens  = 0;
+                    llama_pos n_pos_out = 0;
+                    llama_tokens tokens_out;
+                    const bool ok = kvc_disk_read(
+                        task.slot_action.filepath, expected,
+                        ctx_tgt, slot->id,
+                        mtmd_positions, n_tokens, n_pos_out, tokens_out);
 
-                    llama_tokens tokens;
-                    tokens.resize(slot->n_ctx);
-                    size_t token_count = 0;
-                    size_t nread = llama_state_seq_load_file(ctx_tgt, filepath.c_str(), slot->id, tokens.data(), tokens.size(), &token_count);
-                    if (nread == 0) {
-                        slot->prompt.tokens.clear(); // KV may already been invalidated?
-                        send_error(task, "Unable to restore slot, no available space in KV cache or invalid slot save file", ERROR_TYPE_INVALID_REQUEST);
+                    if (!ok) {
+                        slot->prompt.tokens.clear();
+                        send_error(task, "Unable to restore slot: invalid or incompatible cache file", ERROR_TYPE_INVALID_REQUEST);
                         break;
                     }
-                    tokens.resize(token_count);
-                    slot->prompt.tokens.clear();
-                    slot->prompt.tokens.insert(tokens);
+
+                    kvc_restore_slot_tokens(*slot, std::move(mtmd_positions), tokens_out, n_pos_out);
+                    slot->kvc_saved_pos_next = n_pos_out; // in sync with the file we just read
 
                     const int64_t t_end = ggml_time_us();
-                    const double t_restore_ms = (t_end - t_start) / 1000.0;
 
                     auto res = std::make_unique<server_task_result_slot_save_load>();
                     res->id       = task.id;
                     res->id_slot  = id_slot;
-                    res->filename = filename;
+                    res->filename = task.slot_action.filename;
                     res->is_save  = false;
-                    res->n_tokens = token_count;
-                    res->n_bytes  = nread;
-                    res->t_ms     = t_restore_ms;
+                    res->n_tokens = (size_t) n_tokens;
+                    res->n_bytes  = 0;
+                    res->t_ms     = (t_end - t_start) / 1000.0;
                     queue_results.send(std::move(res));
                 } break;
             case SERVER_TASK_TYPE_SLOT_ERASE:
@@ -2849,6 +3152,27 @@ private:
                             SLT_WRN(slot, "n_past was set to %d\n", n_past);
                         }
 
+                        // kvc-disk restore safety gate:
+                        // A partial prefix match on a restored slot is unsafe for
+                        // hybrid/recurrent models — the recurrent state is at the
+                        // saved position; re-processing the overlap would corrupt it.
+                        // Only a FULL prefix match (n_past == all saved tokens) is safe.
+                        // If the match is partial or absent, discard the restored tokens
+                        // so that processing starts from scratch with n_past = 0.
+                        if (slot.kvc_restored_pos_end >= 0) {
+                            const int saved_n_tokens = slot.prompt.n_tokens();
+                            if (n_past < saved_n_tokens) {
+                                SLT_INF(slot,
+                                    "[KVC] partial match on restored slot "
+                                    "(n_past=%d < saved=%d); discarding restored KV\n",
+                                    n_past, saved_n_tokens);
+                                slot.prompt.tokens.clear();
+                                slot.prompt.mtmd_positions.clear(); // must match tokens state
+                                n_past = 0;
+                            }
+                            slot.kvc_restored_pos_end = -1; // consume
+                        }
+
                         slot.n_prompt_tokens_cache = n_past;
                         slot.n_prompt_tokens_processed = 0;
 
@@ -2873,6 +3197,10 @@ private:
                     slot.print_timings_pp();
 
                     // truncate any tokens that are beyond n_past for this slot
+                    // For kvc-disk restored slots with a full prefix match, pos_next()
+                    // uses sentinel chunks and correctly returns the saved n_pos value
+                    // (including M-RoPE extra positions). kvc_restored_pos_end was
+                    // already consumed above, so pos_next() is always authoritative here.
                     const llama_pos p0 = slot.prompt.tokens.pos_next();
 
                     SLT_TRC(slot, "cached n_tokens = %d, memory_seq_rm [%d, end)\n", slot.prompt.n_tokens(), p0);
@@ -2915,9 +3243,12 @@ private:
 
                     // check if we should process the image
                     while (slot.prompt.n_tokens() < slot.task->n_tokens() && input_tokens[slot.prompt.n_tokens()] == LLAMA_TOKEN_NULL) {
+                        // record the KV position before decoding so we can save/restore it
+                        const llama_pos chunk_pos_start = slot.prompt.tokens.pos_next();
+
                         // process the image
                         size_t n_tokens_out = 0;
-                        int32_t res = input_tokens.process_chunk(ctx_tgt, mctx, slot.prompt.n_tokens(), slot.prompt.tokens.pos_next(), slot.id, n_tokens_out);
+                        int32_t res = input_tokens.process_chunk(ctx_tgt, mctx, slot.prompt.n_tokens(), chunk_pos_start, slot.id, n_tokens_out);
                         if (res != 0) {
                             SLT_ERR(slot, "failed to process image, res = %d\n", res);
                             send_error(slot, "failed to process image", ERROR_TYPE_SERVER);
@@ -2938,10 +3269,21 @@ private:
 
                         slot.n_prompt_tokens_processed += n_tokens_out;
 
-                        // add the image chunk to cache
+                        // add the image chunk to cache and record its KV position range
                         {
                             const auto & chunk = input_tokens.find_chunk(slot.prompt.n_tokens());
                             slot.prompt.tokens.push_back(chunk.get()); // copy
+
+                            // record position metadata for later save/restore
+                            mtmd_chunk_pos cpos;
+                            const char * cid = mtmd_input_chunk_get_id(chunk.get());
+                            cpos.id        = cid ? cid : "";
+                            cpos.seq_start = (int32_t) chunk_pos_start;
+                            cpos.seq_len   = (int32_t) n_tokens_out;
+                            cpos.pos_type  = (mctx && mtmd_decode_use_mrope(mctx)) ? 1 : 0;
+                            slot.prompt.mtmd_positions.push_back(cpos);
+                            SLT_DBG(slot, "[KVC] recorded mtmd chunk: id='%s' pos=%d len=%d type=%d\n",
+                                cpos.id.c_str(), cpos.seq_start, cpos.seq_len, cpos.pos_type);
                         }
 
                         has_mtmd = true;
@@ -3970,7 +4312,7 @@ void server_routes::init_routes() {
     this->post_slots = [this](const server_http_req & req) {
         auto res = create_response();
         if (params.slot_save_path.empty()) {
-            res->error(format_error_response("This server does not support slots action. Start it with `--slot-save-path`", ERROR_TYPE_NOT_SUPPORTED));
+            res->error(format_error_response("This server does not support slots action. Start it with `--slot-save-path` or `--kv-autosave-dir`", ERROR_TYPE_NOT_SUPPORTED));
             return res;
         }
 

@@ -576,12 +576,27 @@ struct server_prompt_data {
     }
 };
 
+// Records the KV-cache position range occupied by one multimodal chunk
+// (image or audio) after it has been decoded into the context.
+// Used to validate and restore multimodal state from disk.
+struct mtmd_chunk_pos {
+    std::string id;       // optional user-set bitmap ID (may be empty)
+    int32_t     seq_start = 0; // first KV position of this chunk
+    int32_t     seq_len   = 0; // number of KV positions consumed
+    int         pos_type  = 0; // 0=normal, 1=mrope (Qwen3VL), 2=hunyuanvl
+};
+
 struct server_prompt {
     server_tokens tokens;
 
     server_prompt_data data;
 
     std::list<common_prompt_checkpoint> checkpoints;
+
+    // Multimodal (image/audio) chunk position records.
+    // Populated when image/audio chunks are decoded into the KV cache.
+    // Empty for text-only prompts.
+    std::vector<mtmd_chunk_pos> mtmd_positions;
 
     size_t size() const {
         size_t res = 0;
@@ -604,17 +619,20 @@ struct server_prompt {
             tokens.clone(),
             data,
             checkpoints,
+            mtmd_positions,
         };
     }
 };
 
 struct server_prompt_cache {
-    server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens) {
+    server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens, std::string slot_save_path = "") {
         this->limit_size   = 1024ull*1024ull*(limit_size_mib < 0 ? 0 : limit_size_mib);
         this->limit_tokens = limit_tokens;
+        this->slot_save_path = std::move(slot_save_path);
     }
 
     std::list<server_prompt> states;
+    std::string slot_save_path;
 
     // in bytes, 0 = no limit
     size_t limit_size = 0;
@@ -631,4 +649,6 @@ struct server_prompt_cache {
     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_main, llama_context * ctx_drft, int32_t id_slot);
 
     void update();
+
+    void remove_prompt_file(const server_prompt & prompt);
 };

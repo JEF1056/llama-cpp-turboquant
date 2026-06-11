@@ -177,6 +177,14 @@ MTMD_API llama_pos                  mtmd_input_chunk_get_n_pos       (const mtmd
 MTMD_API mtmd_input_chunk * mtmd_input_chunk_copy(const mtmd_input_chunk * chunk);
 MTMD_API void               mtmd_input_chunk_free(mtmd_input_chunk * chunk);
 
+// Creates a metadata-only sentinel chunk for kvc-disk KV restore prefix matching.
+// The sentinel carries the saved id, n_tokens (NULL-run length) and n_pos (KV positions)
+// but has NO embedding data — it cannot be used with mtmd_decode_batch.
+// pos_type: 0=NORMAL, 1=MROPE (Qwen3-VL), 2=HUNYUANVL (matches mtmd_chunk_pos.pos_type).
+// Caller must free with mtmd_input_chunk_free().
+MTMD_API mtmd_input_chunk * mtmd_input_chunk_create_sentinel(
+    const char * id, size_t n_tokens, llama_pos n_pos, int pos_type);
+
 
 // mtmd_image_tokens
 //

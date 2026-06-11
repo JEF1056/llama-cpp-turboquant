@@ -1,4 +1,5 @@
 #include "server-task.h"
+#include "kvc-disk.h"
 
 #include "build-info.h"
 #include "server-chat.h"
@@ -2106,6 +2107,7 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 
         prompt = std::move(*it_best);
 
+        remove_prompt_file(prompt); // Loaded into active slot, remove from RAM-cache disk files
         states.erase(it_best);
     }
 
@@ -2122,6 +2124,7 @@ void server_prompt_cache::update() {
 
             SRV_WRN(" - cache size limit reached, removing oldest entry (size = %.3f MiB)\n", states.front().size() / (1024.0 * 1024.0));
 
+            remove_prompt_file(states.front());
             states.pop_front();
         }
     }
@@ -2141,6 +2144,7 @@ void server_prompt_cache::update() {
             SRV_WRN(" - cache token limit (%zu, est: %zu) reached, removing oldest entry (size = %.3f MiB)\n",
                     limit_tokens, limit_tokens_cur, states.front().size() / (1024.0 * 1024.0));
 
+            remove_prompt_file(states.front());
             states.pop_front();
         }
     }
@@ -2153,3 +2157,19 @@ void server_prompt_cache::update() {
                 (const void *)&state, state.n_tokens(), state.checkpoints.size(), state.size() / (1024.0 * 1024.0));
     }
 }
+
+void server_prompt_cache::remove_prompt_file(const server_prompt & prompt) {
+    if (!slot_save_path.empty()) {
+        const auto & tokens_all = prompt.tokens.get_tokens_all();
+        uint32_t crc = crc32_buf(tokens_all.data(), tokens_all.size() * sizeof(llama_token));
+        char buf[64];
+        snprintf(buf, sizeof(buf), "prompt_cache_%08X.llama_cache", crc);
+        std::string path = slot_save_path + buf;
+        std::error_code ec;
+        if (std::filesystem::exists(path, ec)) {
+            std::filesystem::remove(path, ec);
+            SRV_INF(" - removed prompt cache file: %s\n", path.c_str());
+        }
+    }
+}
+

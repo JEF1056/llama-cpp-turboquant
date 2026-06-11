@@ -192,7 +192,12 @@ public:
     void insert(const llama_tokens & inp_tokens);
 
     // for compatibility with speculative decoding, ctx shift, slot save/load
+    // NOTE: asserts !has_mtmd; use get_tokens_all() when mtmd tokens (LLAMA_TOKEN_NULL) are acceptable
     const llama_tokens & get_tokens() const;
+
+    // Returns the raw token array including LLAMA_TOKEN_NULL image-placeholder entries.
+    // Safe to call regardless of has_mtmd; intended for kvc-disk save/restore.
+    const llama_tokens & get_tokens_all() const;
 
     llama_tokens get_text_tokens() const;
 

@@ -17,6 +17,8 @@ add_library(${TARGET} STATIC
     server-context.h
     server-tools.cpp
     server-tools.h
+    kvc-disk.cpp
+    kvc-disk.h
 )
 
 if (BUILD_SHARED_LIBS)

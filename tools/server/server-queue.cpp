@@ -174,6 +174,21 @@ void server_queue::start_loop(int64_t idle_sleep_ms) {
                 break; // go back to process new tasks or terminate
             }
 
+            // no tasks — check KVC autosave timer before sleeping check
+            if (kv_autosave_interval_ms > 0 && !sleeping && callback_autosave) {
+                const int64_t now = ggml_time_ms();
+                if ((now - time_last_autosave) >= kv_autosave_interval_ms) {
+                    if (callback_all_slots_idle && callback_all_slots_idle()) {
+                        lock.unlock();
+                        callback_autosave();
+                        lock.lock();
+                        time_last_autosave = ggml_time_ms();
+                    } else if (callback_all_slots_idle) {
+                        QUE_DBG("%s", "[KVC] autosave check: slots still active, deferring\n");
+                    }
+                }
+            }
+
             // no tasks, check for sleeping state
             if (should_sleep()) {
                 QUE_INF("%s", "entering sleeping state\n");
