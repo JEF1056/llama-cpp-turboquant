@@ -77,3 +77,25 @@ export { default as SyntaxHighlightedCode } from './SyntaxHighlightedCode.svelte
  * ```
  */
 export { default as CollapsibleContentBlock } from './CollapsibleContentBlock.svelte';
+
+/**
+ * **JsonTree** - Incremental JSON tree viewer
+ *
+ * Renders a parsed or partially-parsed JSON value as a collapsible tree.
+ * Designed for streaming: accepts incomplete JSON strings and updates
+ * live as tokens arrive. Each node is independently collapsible.
+ *
+ * **Features:**
+ * - Accepts raw JSON strings (complete or mid-stream partial)
+ * - Partial JSON is repaired via bracket-depth tracking (never injects wrong quotes)
+ * - Collapsible objects/arrays; auto-collapses nodes with > 10 children
+ * - Collapse state is shared across the tree and resets on `callId` change
+ * - Streaming indicator dot when `partial` is true
+ * - Syntax-colored tokens (key, string, number, boolean, null)
+ *
+ * @example
+ * ```svelte
+ * <JsonTree json={section.toolArgs} partial={isStreaming} callId={callId} />
+ * ```
+ */
+export { default as JsonTree } from './JsonTree.svelte';

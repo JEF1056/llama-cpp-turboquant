@@ -3,8 +3,8 @@
 	import {
 		ChatMessageStatistics,
 		CollapsibleContentBlock,
+		JsonTree,
 		MarkdownContent,
-		SyntaxHighlightedCode,
 		ChatMessageActionCardPermissionRequest,
 		ChatMessageActionCardContinueRequest
 	} from '$lib/components/app';
@@ -12,7 +12,6 @@
 	import {
 		AgenticSectionType,
 		ChatMessageStatsView,
-		FileTypeText,
 		ToolPermissionDecision
 	} from '$lib/enums';
 	import type {
@@ -22,7 +21,7 @@
 	} from '$lib/types';
 	import {
 		deriveAgenticSections,
-		formatJsonPretty,
+		parsePartialJson,
 		parseToolResultWithImages,
 		type AgenticSection,
 		type ToolResultLine
@@ -212,11 +211,12 @@
 					{/if}
 				</div>
 				{#if section.toolArgs}
-					<SyntaxHighlightedCode
-						code={formatJsonPretty(section.toolArgs)}
-						language={FileTypeText.JSON}
+					<JsonTree
+						json={section.toolArgs}
+						partial={isStreaming}
+						callId="{section.toolName}-{index}"
 						maxHeight="20rem"
-						class="text-xs"
+						class="rounded-lg border border-border bg-muted"
 					/>
 				{:else if isStreaming}
 					<div class="rounded bg-muted/30 p-2 text-xs text-muted-foreground italic">
@@ -250,11 +250,12 @@
 				<div class="pt-3">
 					<div class="my-3 text-xs text-muted-foreground">Arguments:</div>
 
-					<SyntaxHighlightedCode
-						code={formatJsonPretty(section.toolArgs)}
-						language={FileTypeText.JSON}
+					<JsonTree
+						json={section.toolArgs}
+						partial={isPending}
+						callId="{section.toolName}-{index}"
 						maxHeight="20rem"
-						class="text-xs"
+						class="rounded-lg border border-border bg-muted"
 					/>
 				</div>
 			{/if}
@@ -274,9 +275,19 @@
 				{:else if section.toolResult}
 					<div class="overflow-auto rounded-lg border border-border bg-muted p-4">
 						{#each section.parsedLines as line, i (i)}
-							<div class="font-mono text-xs leading-relaxed whitespace-pre-wrap">
-								{line.text}
-							</div>
+							{@const lineJson = parsePartialJson(line.text)}
+							{#if lineJson.complete && lineJson.value !== null && typeof lineJson.value === 'object'}
+								<JsonTree
+									json={line.text}
+									partial={false}
+									callId="{section.toolName}-result-{i}"
+									maxHeight="16rem"
+								/>
+							{:else}
+								<div class="font-mono text-xs leading-relaxed whitespace-pre-wrap [overflow-wrap:anywhere]">
+									{line.text}
+								</div>
+							{/if}
 							{#if line.image}
 								<img
 									src={line.image.base64Url}

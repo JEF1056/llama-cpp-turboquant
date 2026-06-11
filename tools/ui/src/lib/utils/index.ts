@@ -35,6 +35,9 @@ export {
 // Code
 export { highlightCode, detectIncompleteCodeBlock, type IncompleteCodeBlock } from './code';
 
+// JSON partial parsing (streaming)
+export { parsePartialJson, type PartialJsonResult } from './json-partial';
+
 // Config helpers
 export { setConfigValue, getConfigValue, configToParameterRecord } from './config-helpers';
 
