@@ -386,12 +386,6 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, st
         llama_sampler_chain_add(chain, smpl);
     }
 
-    if (grmr && params.backend_sampling) {
-        LOG_WRN("%s: backend sampling is not compatible with grammar, disabling\n", __func__);
-
-        params.backend_sampling = false;
-    }
-
     if (rbudget && params.backend_sampling) {
         // Backend sampling and reasoning-budget are compatible when the budget
         // sampler is in passthrough mode (COUNTING/IDLE/DONE).  In FORCING mode
@@ -559,8 +553,6 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
         if (id != LLAMA_TOKEN_NULL) {
             LOG_DBG("%s: Backend sampler selected token: '%d'. Will not run any CPU samplers\n", __func__, id);
 
-            GGML_ASSERT(!gsmpl->grmr && "using grammar in combination with backend sampling is not supported");
-
             // Reasoning budget: incompatible only in FORCING state (when a specific
             // token must be emitted to close the thinking block).  In COUNTING /
             // IDLE / DONE state the sampler is a passthrough and backend sampling
@@ -572,6 +564,14 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
                     LOG_DBG("%s: reasoning budget in forcing state; falling back to CPU sampling\n", __func__);
                     id = LLAMA_TOKEN_NULL; // suppress backend token, fall through
                 }
+            }
+
+            // Grammar: fall back to CPU when the grammar needs to constrain the token
+            // set (e.g. tool-call output phase).  During thinking (lazy grammar not yet
+            // triggered) grammar_should_apply() returns false so backend sampling is used.
+            if (id != LLAMA_TOKEN_NULL && gsmpl->grmr && grammar_should_apply(gsmpl)) {
+                LOG_DBG("%s: grammar active; falling back to CPU sampling\n", __func__);
+                id = LLAMA_TOKEN_NULL; // suppress backend token, fall through
             }
 
             if (id != LLAMA_TOKEN_NULL) {

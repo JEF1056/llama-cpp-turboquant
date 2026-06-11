@@ -1812,8 +1812,10 @@ private:
 
             backend_sampling &= task.params.sampling.backend_sampling;
 
-            // TODO: speculative decoding requires multiple samples per batch - not supported yet
-            backend_sampling &= !(slot.can_speculate());
+            // Speculative decoding: llama_get_sampled_token_ith() uses output_resolve_row()
+            // and works for each output position in the verification batch, so multi-position
+            // GPU sampling is supported.  common_sampler_sample() already falls back to CPU
+            // when the backend returns LLAMA_TOKEN_NULL for a given position.
 
             // TODO: getting pre sampling logits is not yet supported with backend sampling
             backend_sampling &= !need_pre_sample_logits;
