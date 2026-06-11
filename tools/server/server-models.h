@@ -114,6 +114,7 @@ private:
         std::thread th;
         server_model_meta meta;
         FILE * stdin_file = nullptr;
+        int active_connections = 0; // number of in-flight proxy requests; protected by mutex
     };
 
     std::mutex mutex;

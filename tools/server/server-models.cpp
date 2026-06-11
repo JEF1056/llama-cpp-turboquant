@@ -683,30 +683,67 @@ void server_models::unload_lru() {
         return; // no limit
     }
     // remove one of the servers if we passed the models_max (least recently used - LRU)
-    std::string lru_model_name = "";
-    int64_t lru_last_used = ggml_time_ms();
-    size_t count_active = 0;
-    {
-        std::unique_lock<std::mutex> lk(mutex);
-        for (const auto & m : mapping) {
-            if (m.second.meta.is_running()) {
-                count_active++;
-                if (m.second.meta.last_used < lru_last_used) {
-                    lru_model_name = m.first;
-                    lru_last_used = m.second.meta.last_used;
+    // Skip models that are currently loading or actively serving requests — evicting them
+    // causes thrashing (loading model) or interrupts live generation (active model).
+    // If every running model is busy (loading or has active connections), block until at
+    // least one becomes idle before evicting it.
+    while (true) {
+        std::string lru_model_name = "";
+        int64_t lru_last_used = ggml_time_ms();
+        size_t count_active = 0;
+        bool any_busy = false;
+        {
+            std::unique_lock<std::mutex> lk(mutex);
+            for (const auto & m : mapping) {
+                if (m.second.meta.is_running()) {
+                    count_active++;
+                    bool busy = m.second.meta.status == SERVER_MODEL_STATUS_LOADING
+                             || m.second.active_connections > 0;
+                    if (busy) {
+                        any_busy = true;
+                    } else if (m.second.meta.last_used < lru_last_used) {
+                        lru_model_name = m.first;
+                        lru_last_used = m.second.meta.last_used;
+                    }
                 }
             }
         }
-    }
-    if (!lru_model_name.empty() && count_active >= (size_t)base_params.models_max) {
-        SRV_INF("models_max limit reached, removing LRU name=%s\n", lru_model_name.c_str());
-        unload(lru_model_name);
-        // wait for unload to complete
-        {
+
+        if (count_active < (size_t)base_params.models_max) {
+            return; // capacity available, nothing to evict
+        }
+
+        if (!lru_model_name.empty()) {
+            SRV_INF("models_max limit reached, removing LRU name=%s\n", lru_model_name.c_str());
+            unload(lru_model_name);
+            // wait for unload to complete
+            {
+                std::unique_lock<std::mutex> lk(mutex);
+                cv.wait(lk, [this, &lru_model_name]() {
+                    return mapping[lru_model_name].meta.status == SERVER_MODEL_STATUS_UNLOADED;
+                });
+            }
+            return;
+        }
+
+        // All running models are busy (loading or actively serving); wait for any one to
+        // become idle (loading finished or last connection closed) before retrying.
+        if (any_busy) {
+            SRV_INF("%s", "models_max limit reached, all models busy — waiting for one to become idle...\n");
             std::unique_lock<std::mutex> lk(mutex);
-            cv.wait(lk, [this, &lru_model_name]() {
-                return mapping[lru_model_name].meta.status == SERVER_MODEL_STATUS_UNLOADED;
+            cv.wait(lk, [this]() {
+                for (const auto & m : mapping) {
+                    if (m.second.meta.is_running()
+                            && m.second.meta.status != SERVER_MODEL_STATUS_LOADING
+                            && m.second.active_connections == 0) {
+                        return true; // at least one evictable model available
+                    }
+                }
+                return false;
             });
+            // retry the scan
+        } else {
+            return; // no running models at all, nothing to evict
         }
     }
 }
@@ -1064,6 +1101,10 @@ server_http_res_ptr server_models::proxy_request(const server_http_req & req, co
         std::unique_lock<std::mutex> lk(mutex);
         mapping[name].meta.last_used = ggml_time_ms();
     }
+    {
+        std::unique_lock<std::mutex> lk(mutex);
+        mapping[name].active_connections++;
+    }
     SRV_INF("proxying request to model %s on port %d\n", name.c_str(), meta->port);
     std::string proxy_path = req.path;
     if (!req.query_string.empty()) {
@@ -1082,6 +1123,11 @@ server_http_res_ptr server_models::proxy_request(const server_http_req & req, co
             base_params.timeout_read,
             base_params.timeout_write
             );
+    proxy->cleanup = [this, name]() {
+        std::unique_lock<std::mutex> lk(mutex);
+        mapping[name].active_connections--;
+        cv.notify_all();
+    };
     return proxy;
 }
 

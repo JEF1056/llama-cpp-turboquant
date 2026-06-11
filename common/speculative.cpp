@@ -588,7 +588,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 }
                 // Capture hidden state at the last image position — becomes h_p seed
                 // for the first text token draft after the image.
-                const float * h = llama_get_embeddings_pre_norm_ith(ctx_tgt, i_batch_end[seq_id]);
+                const float * h = llama_get_embeddings_nextn_ith(ctx_tgt, i_batch_end[seq_id]);
                 if (h) {
                     std::memcpy(pending_h[seq_id].data(), h, row_bytes);
                 } else {
