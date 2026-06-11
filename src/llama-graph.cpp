@@ -82,6 +82,15 @@ void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
         const int64_t n_tokens = ubatch->n_tokens;
 
         ggml_backend_tensor_set(tokens, ubatch->token, 0, n_tokens*ggml_element_size(tokens));
+    } else if (tokens) {
+        // Embedding-only batch (image/audio): no token IDs in the batch.
+        // The MTP layer's get_rows(tok_embd, inp_tokens) still runs and must
+        // receive valid indices. Fill with zeros (token ID 0 is always a valid
+        // vocabulary index) to avoid uninitialized memory causing out-of-bounds
+        // get_rows crashes when processing a second image in the same turn.
+        const int64_t n_tokens = ubatch->n_tokens;
+        std::vector<int32_t> zeros(n_tokens, 0);
+        ggml_backend_tensor_set(tokens, zeros.data(), 0, n_tokens*ggml_element_size(tokens));
     }
 
     if (ubatch->embd) {

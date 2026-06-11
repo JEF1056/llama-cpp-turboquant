@@ -551,8 +551,45 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             return true;
         }
 
-        // TODO: how to make it work with vision tokens?
-        if (batch_in.token == nullptr || batch_in.embd != nullptr) {
+        // For embedding-only batches (image/audio tokens): we cannot sync the draft
+        // model KV cache (no text token pairs to construct the (h_p, x_{p+1}) input),
+        // but we MUST save the target model's pre-norm hidden states at the end of
+        // each sequence so that MTP drafting can resume correctly for subsequent text.
+        if (batch_in.embd != nullptr && batch_in.token == nullptr) {
+            std::fill(i_batch_end.begin(), i_batch_end.end(), -1);
+
+            for (int k = 0; k < batch_in.n_tokens; ++k) {
+                for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                    if (batch_in.n_seq_id[k] == 1 && batch_in.seq_id[k][0] == seq_id) {
+                        i_batch_end[seq_id] = k;
+                    }
+                }
+            }
+
+            auto * ctx_tgt = this->params.ctx_tgt;
+            const size_t row_bytes = (size_t) n_embd * sizeof(float);
+
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                if (i_batch_end[seq_id] < 0) {
+                    continue;
+                }
+                // Capture hidden state at the last image position — becomes h_p seed
+                // for the first text token draft after the image.
+                const float * h = llama_get_embeddings_pre_norm_ith(ctx_tgt, i_batch_end[seq_id]);
+                if (h) {
+                    std::memcpy(pending_h[seq_id].data(), h, row_bytes);
+                }
+            }
+
+            // No draft tokens were generated at image positions — clear verify state.
+            for (auto & vr : verify_h) { vr.clear(); }
+            std::fill(verify_h_rows.begin(), verify_h_rows.end(), 0);
+
+            return true;
+        }
+
+        // Batches with no token IDs and no embeddings are unsupported.
+        if (batch_in.token == nullptr) {
             return true;
         }
 
