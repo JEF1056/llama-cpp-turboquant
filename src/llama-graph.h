@@ -118,6 +118,12 @@ public:
     ggml_tensor * tokens = nullptr; // I32 [n_batch]
     ggml_tensor * embd   = nullptr; // F32 [n_embd, n_batch]
 
+    // Optional device-tensor override: if non-null, device→device copy into
+    // embd replaces the normal host upload from ubatch->embd.  Consumed once
+    // (cleared after set_input).  Set via llm_graph_result::set_embd_src_dev
+    // which is called from llama_context::process_ubatch before set_inputs.
+    ggml_tensor * embd_src_dev = nullptr;
+
     const int64_t n_embd = 0;
 };
 
@@ -684,6 +690,11 @@ public:
 
     llm_graph_input_i * add_input(llm_graph_input_ptr input);
 
+    // Wire a device tensor as the embedding source for the next set_inputs()
+    // call.  The tensor must be [n_embd, n_tokens] and live on the same CUDA
+    // device as embd.  Sets inp_embd_obj->embd_src_dev (consumed once).
+    void set_embd_src_dev(ggml_tensor * src);
+
     void set_params(const llm_graph_params & params);
 
     // important graph nodes
@@ -700,6 +711,10 @@ public:
     std::map<llama_seq_id, ggml_tensor*> t_sampled_probs;
 
     std::vector<llm_graph_input_ptr> inputs;
+
+    // Non-owning pointer to the llm_graph_input_embd in `inputs`; set by
+    // build_inp_embd so that set_embd_src_dev() can reach it without a scan.
+    llm_graph_input_embd * inp_embd_obj = nullptr;
 
     ggml_context_ptr ctx_compute;
 

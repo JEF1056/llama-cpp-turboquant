@@ -102,3 +102,13 @@ LLAMA_API float * llama_get_embeddings_nextn(struct llama_context * ctx);
 LLAMA_API float * llama_get_embeddings_nextn_ith(struct llama_context * ctx, int32_t i);
 
 LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
+
+// Returns the device-resident ggml_tensor* holding pre-norm hidden states from
+// the most recent llama_decode.  nullptr if embeddings_pre_norm was not enabled
+// or no decode has run yet.  Valid until the next llama_decode on this context.
+LLAMA_API struct ggml_tensor * llama_get_h_pre_norm_tensor(struct llama_context * ctx);
+
+// Set a device tensor as the embedding input for the NEXT llama_decode call.
+// The tensor is consumed exactly once (cleared after set_inputs).  Pass nullptr
+// to revert to the normal host-buffer upload path.
+LLAMA_API void llama_set_next_embd_src_dev(struct llama_context * ctx, struct ggml_tensor * src);

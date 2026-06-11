@@ -979,6 +979,18 @@ float * llama_context::get_embeddings_nextn() {
     return embd_nextn.data;
 }
 
+ggml_tensor * llama_context::get_h_pre_norm_tensor() const {
+    if (!cparams.embeddings_nextn) {
+        return nullptr;
+    }
+    auto * res = gf_res_prev.get();
+    return res ? res->get_h_nextn() : nullptr;
+}
+
+void llama_context::set_next_embd_src_dev(ggml_tensor * src) {
+    next_embd_src_dev = src;
+}
+
 float * llama_context::get_embeddings_nextn_ith(int32_t i) {
     output_reorder();
 
@@ -1390,6 +1402,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // set the input data for the input tensors
     {
         //const auto t_start_us = ggml_time_us();
+
+        // If a device-resident embedding source was requested (MTP on-device
+        // draft path), wire it into the graph input before set_inputs runs.
+        if (next_embd_src_dev) {
+            res->set_embd_src_dev(next_embd_src_dev);
+            next_embd_src_dev = nullptr;
+        }
 
         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
         res->set_inputs(&ubatch);
@@ -3811,6 +3830,16 @@ float * llama_get_embeddings_nextn_ith(llama_context * ctx, int32_t i) {
     ctx->synchronize();
 
     return ctx->get_embeddings_nextn_ith(i);
+}
+
+ggml_tensor * llama_get_h_pre_norm_tensor(llama_context * ctx) {
+    // No synchronize: returns a tensor handle, not host data.
+    // Caller must not read the tensor's data until after a synchronize.
+    return ctx->get_h_pre_norm_tensor();
+}
+
+void llama_set_next_embd_src_dev(llama_context * ctx, ggml_tensor * src) {
+    ctx->set_next_embd_src_dev(src);
 }
 
 bool llama_set_sampler(llama_context * ctx, llama_seq_id seq_id, llama_sampler * smpl) {

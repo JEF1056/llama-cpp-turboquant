@@ -91,6 +91,16 @@ struct llama_context {
     float * get_embeddings_nextn();
     float * get_embeddings_nextn_ith(int32_t i);
 
+    // Returns the device-resident pre-norm hidden-state tensor from the most
+    // recent llama_decode, or nullptr if unavailable.  Valid until the next
+    // call to llama_decode on this context (scheduler may reuse the buffer).
+    ggml_tensor * get_h_pre_norm_tensor() const;
+
+    // Set a device tensor to use as the embedding input for the NEXT
+    // llama_decode call on this context (consumed once, then cleared).
+    // The tensor must remain valid until set_inputs() runs inside process_ubatch.
+    void set_next_embd_src_dev(ggml_tensor * src);
+
     struct tria_runtime * get_tria_rt() const { return tria_rt; }
 
     llama_token * get_sampled_tokens() const;
@@ -355,6 +365,9 @@ private:
 
     llm_graph_result_ptr gf_res_prev;
     llm_graph_result_ptr gf_res_reserve;
+
+    // Device tensor to use as embedding input for the next decode (consumed once).
+    ggml_tensor * next_embd_src_dev = nullptr;
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;

@@ -2,6 +2,7 @@
 
 #include "common.h"
 #include "ggml.h"
+#include "ggml-alloc.h"
 #include "llama.h"
 #include "log.h"
 #include "ngram-cache.h"
@@ -439,6 +440,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     // pre-advancement before process() mirrored the verify batch.
     std::vector<uint16_t> last_n_drafted;
 
+    // On-device persistent buffer for the MTP draft self-feed path.
+    // Holds the nextn hidden state from the previous draft decode so it can
+    // be fed directly into the next decode's inp_embd (device→device, no host).
+    // Lazily allocated on the first draft() call.
+    // Shape: [n_embd, n_seq] — one row per sequence slot.
+    ggml_context        * pending_h_dev_ctx = nullptr;
+    ggml_backend_buffer * pending_h_dev_buf = nullptr;
+    ggml_tensor         * pending_h_dev     = nullptr;
+
     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq)
         , params(params.draft)
@@ -526,6 +536,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             batch.token = nullptr;
         }
         llama_batch_free(batch);
+        // Free the on-device embedding buffer (may be null if never used)
+        ggml_backend_buffer_free(pending_h_dev_buf);
+        ggml_free(pending_h_dev_ctx);
     }
 
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
@@ -715,6 +728,36 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             return;
         }
 
+        // --- On-device embedding path: lazy-init + seed copy ---
+        // After the seed decode the GPU has fully run (sampling will sync it).
+        // Allocate pending_h_dev once from the same device as t_h_pre_norm.
+        // In the draft loop we copy t_h_pre_norm→pending_h_dev (D→D) and
+        // inject via set_next_embd_src_dev, avoiding the GPU→CPU→GPU round-trip
+        // on h_row each draft token.  Shape guard: n_drafting==n_seq only.
+        ggml_tensor * t_h_seed = llama_get_h_pre_norm_tensor(ctx_dft);
+        if (t_h_seed && !pending_h_dev) {
+            ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(t_h_seed->buffer);
+            struct ggml_init_params meta = {
+                /* .mem_size   = */ 2 * ggml_tensor_overhead(),
+                /* .mem_buffer = */ nullptr,
+                /* .no_alloc   = */ true,
+            };
+            pending_h_dev_ctx = ggml_init(meta);
+            pending_h_dev     = ggml_new_tensor_2d(pending_h_dev_ctx, GGML_TYPE_F32, n_embd, (int64_t) n_seq);
+            pending_h_dev_buf = ggml_backend_alloc_ctx_tensors_from_buft(pending_h_dev_ctx, buft);
+            if (!pending_h_dev_buf) {
+                ggml_free(pending_h_dev_ctx);
+                pending_h_dev_ctx = nullptr;
+                pending_h_dev     = nullptr;
+            }
+        }
+        bool use_dev_path = pending_h_dev && t_h_seed &&
+                            ggml_are_same_shape(t_h_seed, pending_h_dev);
+        if (use_dev_path) {
+            ggml_backend_tensor_copy(t_h_seed, pending_h_dev);
+            llama_set_next_embd_src_dev(ctx_dft, pending_h_dev);
+        }
+
         int i = 0;
 
         while (n_drafting > 0) {
@@ -730,7 +773,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 auto * smpl = smpls[seq_id].get();
 
                 common_sampler_sample(smpl, ctx_dft, i_batch, true);
-                h_row = llama_get_embeddings_nextn_ith(ctx_dft, i_batch);
+                // On host path: read embd from device for next decode's inp_embd.
+                // On device path: skip this GPU→CPU copy; the D→D copy below handles it.
+                if (!use_dev_path) {
+                    h_row = llama_get_embeddings_nextn_ith(ctx_dft, i_batch);
+                }
                 ++i_batch;
 
                 const auto * cur_p = common_sampler_get_candidates(smpl, true);
@@ -772,11 +819,29 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 } else {
                     common_batch_add(batch, id, dp.n_past + i + 1, { seq_id }, true);
                 }
-                std::memcpy(batch.embd + n_embd*(batch.n_tokens - 1), h_row, row_bytes);
+                // Host path: stash h_row into batch.embd as usual.
+                // Device path: batch.embd still written (acts as fallback if
+                // the D→D inject fails shape check), but embd_src_dev wins.
+                if (!use_dev_path) {
+                    std::memcpy(batch.embd + n_embd*(batch.n_tokens - 1), h_row, row_bytes);
+                }
             }
 
             if (batch.n_tokens == 0) {
                 break;
+            }
+
+            // Device path: copy all current drafting seqs' hidden states to the
+            // persistent device buffer and prime the next decode's inp_embd.
+            // Shape guard: t_h has [n_embd, n_drafting]; pending_h_dev has
+            // [n_embd, n_seq].  They match only while n_drafting==n_seq.
+            if (use_dev_path) {
+                ggml_tensor * t_h = llama_get_h_pre_norm_tensor(ctx_dft);
+                use_dev_path = t_h && ggml_are_same_shape(t_h, pending_h_dev);
+                if (use_dev_path) {
+                    ggml_backend_tensor_copy(t_h, pending_h_dev);
+                    llama_set_next_embd_src_dev(ctx_dft, pending_h_dev);
+                }
             }
 
             // evaluate the drafted tokens on the draft model

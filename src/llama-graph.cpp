@@ -93,7 +93,15 @@ void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
         ggml_backend_tensor_memset(tokens, 0, 0, ggml_nbytes(tokens));
     }
 
-    if (ubatch->embd) {
+    if (embd_src_dev) {
+        // Device→device copy: skip the host upload path entirely.
+        // Use ggml_backend_tensor_copy which, for same-backend tensors, issues
+        // a cudaMemcpyAsync (D→D, stream-ordered, no host traffic).
+        // Shapes must match: [n_embd, n_tokens] on both sides.
+        GGML_ASSERT(ggml_are_same_shape(embd_src_dev, embd));
+        ggml_backend_tensor_copy(embd_src_dev, embd);
+        embd_src_dev = nullptr; // consumed once
+    } else if (ubatch->embd) {
         GGML_ASSERT(n_embd == embd->ne[0]);
 
         const int64_t n_tokens = ubatch->n_tokens;
@@ -875,6 +883,7 @@ int64_t llm_graph_result::get_max_nodes() const {
 void llm_graph_result::reset() {
     t_inp_tokens  = nullptr;
     t_inp_embd    = nullptr;
+    t_h_nextn     = nullptr;
     t_logits      = nullptr;
     t_embd        = nullptr;
     t_embd_pooled = nullptr;
@@ -886,6 +895,7 @@ void llm_graph_result::reset() {
     params = {};
 
     inputs.clear();
+    inp_embd_obj = nullptr; // cleared with inputs vector
 
     buf_compute_meta.resize(ggml_tensor_overhead()*max_nodes + ggml_graph_overhead_custom(max_nodes, false));
 
@@ -903,6 +913,12 @@ void llm_graph_result::reset() {
 void llm_graph_result::set_inputs(const llama_ubatch * ubatch) {
     for (auto & input : inputs) {
         input->set_input(ubatch);
+    }
+}
+
+void llm_graph_result::set_embd_src_dev(ggml_tensor * src) {
+    if (inp_embd_obj) {
+        inp_embd_obj->embd_src_dev = src;
     }
 }
 
@@ -1853,7 +1869,11 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
 
     cb(cur, "embd", -1);
 
+    // Capture raw pointer before the move so set_embd_src_dev() can reach the
+    // input object via res->inp_embd_obj without scanning the inputs vector.
+    auto * inp_raw = inp.get();
     res->add_input(std::move(inp));
+    res->inp_embd_obj = inp_raw;
 
     // make sure the produced embeddings are immediately materialized in the ggml graph
     // ref: https://github.com/ggml-org/llama.cpp/pull/18599
