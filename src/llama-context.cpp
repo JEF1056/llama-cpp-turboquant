@@ -2699,7 +2699,11 @@ public:
         for (const auto & winfo : winfos) {
             auto * buft = ggml_backend_buffer_get_type(winfo.tensor->buffer);
 
-            const int64_t n = winfo.size/ggml_element_size(winfo.tensor);
+            // ggml_element_size() returns type_size (block bytes), not per-scalar bytes.
+            // For quantized types (e.g. turbo4: type_size=68, blck_size=128) we must
+            // convert to scalar element count so ggml_view_1d / ggml_nbytes cover
+            // the full winfo.size bytes instead of 1/blck_size of them.
+            const int64_t n = (winfo.size / ggml_type_size(winfo.tensor->type)) * ggml_blck_size(winfo.tensor->type);
 
             auto & mbuf = mbufs_new[buft];
 
@@ -2830,7 +2834,8 @@ public:
         for (const auto & rinfo : rinfos) {
             auto * buft = ggml_backend_buffer_get_type(rinfo.tensor->buffer);
 
-            const int64_t n = rinfo.size/ggml_element_size(rinfo.tensor);
+            // Same fix as llama_io_write_device: convert byte count to scalar element count.
+            const int64_t n = (rinfo.size / ggml_type_size(rinfo.tensor->type)) * ggml_blck_size(rinfo.tensor->type);
 
             auto & mbuf = mbufs_new[buft];
 
