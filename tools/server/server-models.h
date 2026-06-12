@@ -171,7 +171,9 @@ public:
     void unload_all();
 
     // update the status of a model instance (thread-safe)
-    void update_status(const std::string & name, server_model_status status, int exit_code);
+    // proc: if non-null, the update is ignored when the current instance's subprocess differs
+    //       (prevents stale updates from a crashed/replaced child from overwriting a new one)
+    void update_status(const std::string & name, server_model_status status, int exit_code, subprocess_s * proc = nullptr);
     void update_loaded_info(const std::string & name, std::string & raw_info);
     void update_last_error(const std::string & name, const std::string & error);
 

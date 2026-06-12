@@ -886,10 +886,10 @@ void server_models::load(const std::string & name) {
                     LOG("[%5d] %s", port, buffer);
                     std::string str(buffer);
                     if (string_starts_with(buffer, CMD_CHILD_TO_ROUTER_READY)) {
-                        this->update_status(name, SERVER_MODEL_STATUS_LOADED, 0);
+                        this->update_status(name, SERVER_MODEL_STATUS_LOADED, 0, child_proc.get());
                     } else if (string_starts_with(buffer, CMD_CHILD_TO_ROUTER_ERROR)) {
                         SRV_ERR("model name=%s loading error: %s\n", name.c_str(), buffer);
-                        this->update_status(name, SERVER_MODEL_STATUS_UNLOADED, 1);
+                        this->update_status(name, SERVER_MODEL_STATUS_UNLOADED, 1, child_proc.get());
                         std::string err_msg(buffer);
                         size_t prefix_len = strlen(CMD_CHILD_TO_ROUTER_ERROR);
                         if (err_msg.size() > prefix_len) {
@@ -902,14 +902,14 @@ void server_models::load(const std::string & name) {
                     } else if (string_starts_with(buffer, CMD_CHILD_TO_ROUTER_INFO)) {
                         this->update_loaded_info(name, str);
                     } else if (string_starts_with(buffer, CMD_CHILD_TO_ROUTER_SLEEP)) {
-                        this->update_status(name, SERVER_MODEL_STATUS_SLEEPING, 0);
+                        this->update_status(name, SERVER_MODEL_STATUS_SLEEPING, 0, child_proc.get());
                     }
                 }
                 // EOF on stdout — child process exited (could be a crash).
                 // Immediately mark UNLOADED so /v1/models stops advertising
                 // this model as loaded.
                 if (feof(stdout_file)) {
-                    this->update_status(name, SERVER_MODEL_STATUS_UNLOADED, 1);
+                    this->update_status(name, SERVER_MODEL_STATUS_UNLOADED, 1, child_proc.get());
                 }
             } else {
                 SRV_ERR("failed to get stdout/stderr of child process for name=%s\n", name.c_str());
@@ -986,12 +986,20 @@ void server_models::load(const std::string & name) {
         subprocess_join(child_proc.get(), &exit_code);
         subprocess_destroy(child_proc.get());
 
-        // update status and exit code
-        this->update_status(name, SERVER_MODEL_STATUS_UNLOADED, exit_code);
+        // update status and exit code — pass child_proc so stale updates from a replaced
+        // instance don't overwrite the status of the new one (see update_status guard).
+        this->update_status(name, SERVER_MODEL_STATUS_UNLOADED, exit_code, child_proc.get());
         SRV_INF("instance name=%s exited with status %d\n", name.c_str(), exit_code);
     });
 
-    // clean up old process/thread if exists
+    // Drain / replace the old instance.
+    // IMPORTANT: do NOT call th.join() while holding the mutex — the old monitoring
+    // thread's final update_status() also acquires the mutex, causing a deadlock when
+    // the child crashes while load() is executing (crash → CMD_ERROR sets UNLOADED →
+    // new request immediately calls load() → holds mutex → joins old thread → deadlock).
+    // Fix: move the old thread out of the mapping, replace the mapping entry (with the
+    // new instance) and notify waiters, then release the mutex before joining.
+    std::thread old_th;
     {
         auto & old_instance = mapping[name];
         // old process should have exited already, but just in case, we clean it up here
@@ -999,13 +1007,16 @@ void server_models::load(const std::string & name) {
             SRV_WRN("old process for model name=%s is still alive, this is unexpected\n", name.c_str());
             subprocess_terminate(old_instance.subproc.get()); // force kill
         }
-        if (old_instance.th.joinable()) {
-            old_instance.th.join();
-        }
+        old_th = std::move(old_instance.th); // move out; join happens after lock release
     }
 
     mapping[name] = std::move(inst);
     cv.notify_all();
+    lk.unlock(); // release before joining — old thread may need the mutex for update_status
+
+    if (old_th.joinable()) {
+        old_th.join();
+    }
 }
 
 void server_models::unload(const std::string & name) {
@@ -1054,10 +1065,15 @@ void server_models::unload_all() {
     }
 }
 
-void server_models::update_status(const std::string & name, server_model_status status, int exit_code) {
+void server_models::update_status(const std::string & name, server_model_status status, int exit_code, subprocess_s * proc) {
     std::unique_lock<std::mutex> lk(mutex);
     auto it = mapping.find(name);
     if (it != mapping.end()) {
+        // If a subprocess pointer is provided, guard against stale updates from a replaced
+        // (crashed) child overwriting the status of a newly-spawned replacement instance.
+        if (proc != nullptr && it->second.subproc.get() != proc) {
+            return; // stale update — belongs to a previous instance, ignore it
+        }
         auto & meta = it->second.meta;
         meta.status    = status;
         meta.exit_code = exit_code;
