@@ -1437,6 +1437,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     if (tria_rt && tria_stats_data &&
         ubatch.n_seq_tokens == 1 &&
         (gtype == LLM_GRAPH_TYPE_DECODER || gtype == LLM_GRAPH_TYPE_DEFAULT)) {
+        // ggml_backend_graph_compute is asynchronous: it submits CUDA kernels to
+        // the main compute stream and returns immediately while the GPU is still
+        // writing K/V tensors.  tria_maybe_score reads those same tensors via
+        // cudaMemcpyAsync on cudaStreamPerThread (a separate stream).  Without
+        // a sync barrier between the two streams, the read races with the write
+        // and triggers a CUDA "illegal memory access" error at ~87 K tokens.
+        ggml_backend_sched_synchronize(sched.get());
         tria_maybe_score(tria_rt, this);
     }
 
