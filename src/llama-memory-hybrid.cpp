@@ -188,16 +188,20 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid::memory_breakdo
 }
 
 void llama_memory_hybrid::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
-    // Always save attention KV regardless of PARTIAL_ONLY: spec decode rollbacks
-    // require the attention KV to be checkpointed (llama_kv_cache ignores PARTIAL_ONLY
-    // internally anyway). Skipping this causes stale draft-token KV entries after
-    // rejection, leading to CUDA illegal memory access.
-    mem_attn->state_write(io, seq_id, flags);
+    // Attention KV rollback for spec-decode is handled by seq_rm (metadata-only
+    // operation), NOT by checkpoint/restore of tensor data.  PARTIAL_ONLY saves
+    // are used exclusively for spec-decode incremental checkpoints; skipping the
+    // attention KV here is intentional and correct.
+    if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
+        mem_attn->state_write(io, seq_id, flags);
+    }
     mem_recr->state_write(io, seq_id, flags);
 }
 
 void llama_memory_hybrid::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
-    mem_attn->state_read(io, seq_id, flags);
+    if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
+        mem_attn->state_read(io, seq_id, flags);
+    }
     mem_recr->state_read(io, seq_id, flags);
 }
 
