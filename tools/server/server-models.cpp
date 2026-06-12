@@ -88,6 +88,24 @@ static std::filesystem::path get_server_exec_path() {
 #endif
 }
 
+// Returns true if the preset specifies at least one model source (local file,
+// URL, or HuggingFace repo).  Presets without any source cannot be loaded and
+// should be excluded from the model mapping — this prevents ghost entries
+// created by INI keys that appear before the first [section] header.
+static bool preset_has_model_source(const common_preset & preset) {
+    static const std::vector<std::string> model_keys = {
+        "LLAMA_ARG_MODEL", "LLAMA_ARG_MODEL_URL",
+        "LLAMA_ARG_HF_REPO", "LLAMA_ARG_HF_REPO_FILE",
+    };
+    std::string val;
+    for (const auto & key : model_keys) {
+        if (preset.get_option(key, val) && !val.empty()) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static void unset_reserved_args(common_preset & preset, bool unset_model_args) {
     preset.unset_option("LLAMA_ARG_SSL_KEY_FILE");
     preset.unset_option("LLAMA_ARG_SSL_CERT_FILE");
@@ -359,6 +377,10 @@ void server_models::load_models() {
     if (is_first_load) {
         // FIRST LOAD: add all models, then unlock for autoloading
         for (const auto & [name, preset] : final_presets) {
+            if (!preset_has_model_source(preset)) {
+                SRV_WRN("skipping model preset '%s': no model source configured\n", name.c_str());
+                continue;
+            }
             server_model_meta meta{
                 /* preset       */ preset,
                 /* name         */ name,
@@ -512,6 +534,10 @@ void server_models::load_models() {
         std::vector<std::string> newly_added;
         for (const auto & [name, preset] : final_presets) {
             if (mapping.find(name) == mapping.end()) {
+                if (!preset_has_model_source(preset)) {
+                    SRV_WRN("(reload) skipping model preset '%s': no model source configured\n", name.c_str());
+                    continue;
+                }
                 server_model_meta meta{
                     /* preset       */ preset,
                     /* name         */ name,
@@ -592,6 +618,27 @@ std::optional<server_model_meta> server_models::get_meta(const std::string & nam
         if (inst.meta.aliases.count(name)) {
             return inst.meta;
         }
+    }
+    // "default" wildcard: if no model is explicitly named "default", resolve to
+    // the most-recently-used model.  Prefer a currently loaded (ready) model so
+    // requests are served immediately; fall back to the MRU unloaded model so
+    // that autoload can restart a crashed child instead of returning "not found".
+    if (name == COMMON_PRESET_DEFAULT_NAME || name.empty()) {
+        const instance_t * best_loaded   = nullptr;
+        const instance_t * best_unloaded = nullptr;
+        for (const auto & [key, inst] : mapping) {
+            if (inst.meta.is_ready()) {
+                if (!best_loaded || inst.meta.last_used > best_loaded->meta.last_used) {
+                    best_loaded = &inst;
+                }
+            } else if (!inst.meta.is_running() && inst.meta.last_used > 0) {
+                if (!best_unloaded || inst.meta.last_used > best_unloaded->meta.last_used) {
+                    best_unloaded = &inst;
+                }
+            }
+        }
+        if (best_loaded)   return best_loaded->meta;
+        if (best_unloaded) return best_unloaded->meta;
     }
     return std::nullopt;
 }
