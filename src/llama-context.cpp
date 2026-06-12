@@ -2718,7 +2718,10 @@ public:
 
             need_alloc = need_alloc || (!mbuf_cur.buf);
             need_alloc = need_alloc || (mbuf_cur.org.size() != mbuf.org.size());
-            need_alloc = need_alloc || (mbuf_cur.total_size != mbuf.total_size);
+            // Grow-only: only reallocate when new checkpoint is larger than existing buffer.
+            // Avoids a CUDA alloc/free on every spec-decode step when accepted-token count
+            // grows by a few cells (tiny total_size delta).
+            need_alloc = need_alloc || (mbuf.total_size > mbuf_cur.total_size);
 
             if (!need_alloc) {
                 for (size_t i = 0; i < mbuf_cur.org.size(); ++i) {
