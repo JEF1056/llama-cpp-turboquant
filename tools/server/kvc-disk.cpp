@@ -62,6 +62,69 @@ uint32_t crc32_buf(const void * buf, size_t len) {
 }
 
 // ---------------------------------------------------------------------------
+// Chunked write with progress reporting
+// ---------------------------------------------------------------------------
+
+// Minimum total write size to trigger progress log lines.
+static constexpr size_t KVC_PROGRESS_THRESHOLD = 128ull * 1024 * 1024; // 128 MiB
+// How many bytes to write per fwrite call (controls log granularity).
+static constexpr size_t KVC_WRITE_CHUNK = 32ull * 1024 * 1024; // 32 MiB
+
+// Write |size| bytes from |data| to |f| in KVC_WRITE_CHUNK-sized pieces.
+// |bytes_done| / |bytes_total| track overall progress across multiple calls
+// (e.g. main blob + draft blob + checkpoints).
+// When |bytes_total| >= KVC_PROGRESS_THRESHOLD a log line is emitted every
+// 10 percentage-point step with a throughput-based ETA.
+// Returns true iff all bytes were written without a short write.
+static bool write_chunked_progress(
+        FILE      * f,
+        const void * data,
+        size_t       size,
+        size_t     & bytes_done,
+        size_t       bytes_total,
+        const char * label,
+        int64_t      t0) {
+    const bool do_progress = (bytes_total >= KVC_PROGRESS_THRESHOLD);
+    const uint8_t * p = static_cast<const uint8_t *>(data);
+    size_t remaining = size;
+    int last_pct = (bytes_total > 0)
+        ? (int)(100.0 * (double)bytes_done / (double)bytes_total)
+        : 0;
+
+    while (remaining > 0) {
+        const size_t n = std::min(remaining, KVC_WRITE_CHUNK);
+        if (fwrite(p, 1, n, f) != n) {
+            return false;
+        }
+        p          += n;
+        remaining  -= n;
+        bytes_done += n;
+
+        if (do_progress) {
+            const int pct = (bytes_total > 0)
+                ? (int)(100.0 * (double)bytes_done / (double)bytes_total)
+                : 100;
+            if (pct >= last_pct + 10) {
+                last_pct = pct;
+                const int64_t elapsed_ms = ggml_time_ms() - t0;
+                const double mb_done  = (double)bytes_done  / (1024.0 * 1024.0);
+                const double mb_total = (double)bytes_total / (1024.0 * 1024.0);
+                if (elapsed_ms > 200 && bytes_done < bytes_total) {
+                    const double eta_s = (elapsed_ms / 1000.0) *
+                        (double)(bytes_total - bytes_done) / (double)bytes_done;
+                    LOG_INF("[KVC] %s: saving %d%% (%.1f / %.1f MiB, ~%.0fs remaining)\n",
+                        label, pct, mb_done, mb_total, eta_s);
+                } else {
+                    LOG_INF("[KVC] %s: saving %d%% (%.1f / %.1f MiB)\n",
+                        label, pct, mb_done, mb_total);
+                }
+            }
+        }
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
 // Fingerprint helpers
 // ---------------------------------------------------------------------------
 
@@ -206,13 +269,19 @@ bool kvc_disk_write(
     write_u64((uint64_t) kv_buf.size());
     write_u32(kv_crc);
 
-    // 5. Write KV blob
-    const size_t nw = fwrite(kv_buf.data(), 1, kv_buf.size(), f);
-    if (nw != kv_buf.size()) {
+    // 5. Write KV blob (with progress reporting for large files)
+    const std::string fname = std::filesystem::path(path).filename().string();
+    const size_t write_total = kv_buf.size();
+    size_t bytes_done = 0;
+    if (write_total >= KVC_PROGRESS_THRESHOLD) {
+        LOG_INF("[KVC] %s: saving %.1f MiB KV state...\n",
+            fname.c_str(), (double)write_total / (1024.0 * 1024.0));
+    }
+    if (!write_chunked_progress(f, kv_buf.data(), kv_buf.size(),
+                                bytes_done, write_total, fname.c_str(), t0)) {
         fclose(f);
-        LOG_WRN("[KVC] slot seq=%d: short write to '%s' (%zu/%zu bytes)\n",
-            (int) seq_id, path.c_str(), nw, kv_buf.size());
-        // leave the partial file; next validate will reject it via CRC
+        LOG_WRN("[KVC] slot seq=%d: short write to '%s'\n",
+            (int) seq_id, path.c_str());
         return false;
     }
 
@@ -455,10 +524,27 @@ bool kvc_disk_write_prompt(
     const size_t kv_main_size = prompt.data.main.size();
     const size_t kv_drft_size = prompt.data.drft.size();
 
-    FILE * f = fopen(path.c_str(), "wb");
+    // Pre-compute total bytes to write for progress reporting.
+    size_t write_total = kv_main_size + kv_drft_size;
+    for (const auto & ckpt : prompt.checkpoints) {
+        write_total += ckpt.data_tgt.size() + ckpt.data_dft.size();
+    }
+
+    const std::string fname = std::filesystem::path(path).filename().string();
+
+    // Write to a temporary file first, then atomically rename to the final path.
+    // This prevents half-written files from being seen on next startup if the
+    // process is killed during the write.
+    const std::string tmp_path = path + ".tmp";
+    FILE * f = fopen(tmp_path.c_str(), "wb");
     if (!f) {
-        LOG_WRN("[KVC] prompt_cache: cannot open '%s' for writing\n", path.c_str());
+        LOG_WRN("[KVC] prompt_cache: cannot open '%s' for writing\n", tmp_path.c_str());
         return false;
+    }
+
+    if (write_total >= KVC_PROGRESS_THRESHOLD) {
+        LOG_INF("[KVC] %s: saving %.1f MiB...\n",
+            fname.c_str(), (double)write_total / (1024.0 * 1024.0));
     }
 
     auto write_u32 = [&](uint32_t v) { fwrite(&v, 4, 1, f); };
@@ -521,13 +607,26 @@ bool kvc_disk_write_prompt(
     write_u32(kv_drft_crc);
 
     // Write Main KV blob data
+    size_t bytes_done = 0;
     if (kv_main_size > 0) {
-        fwrite(prompt.data.main.data(), 1, kv_main_size, f);
+        if (!write_chunked_progress(f, prompt.data.main.data(), kv_main_size,
+                                    bytes_done, write_total, fname.c_str(), t0)) {
+            fclose(f);
+            std::remove(tmp_path.c_str());
+            LOG_WRN("[KVC] %s: short write of main KV blob\n", fname.c_str());
+            return false;
+        }
     }
 
     // Write Draft KV blob data
     if (kv_drft_size > 0) {
-        fwrite(prompt.data.drft.data(), 1, kv_drft_size, f);
+        if (!write_chunked_progress(f, prompt.data.drft.data(), kv_drft_size,
+                                    bytes_done, write_total, fname.c_str(), t0)) {
+            fclose(f);
+            std::remove(tmp_path.c_str());
+            LOG_WRN("[KVC] %s: short write of draft KV blob\n", fname.c_str());
+            return false;
+        }
     }
 
     // Write tokens array
@@ -541,19 +640,45 @@ bool kvc_disk_write_prompt(
         write_u64((uint64_t) ckpt.n_tokens);
         write_u32((uint32_t) ckpt.pos_min);
         write_u32((uint32_t) ckpt.pos_max);
-        
+
         write_u64((uint64_t) ckpt.data_tgt.size());
         if (!ckpt.data_tgt.empty()) {
-            fwrite(ckpt.data_tgt.data(), 1, ckpt.data_tgt.size(), f);
+            if (!write_chunked_progress(f, ckpt.data_tgt.data(), ckpt.data_tgt.size(),
+                                        bytes_done, write_total, fname.c_str(), t0)) {
+                fclose(f);
+                std::remove(tmp_path.c_str());
+                LOG_WRN("[KVC] %s: short write of checkpoint tgt blob\n", fname.c_str());
+                return false;
+            }
         }
 
         write_u64((uint64_t) ckpt.data_dft.size());
         if (!ckpt.data_dft.empty()) {
-            fwrite(ckpt.data_dft.data(), 1, ckpt.data_dft.size(), f);
+            if (!write_chunked_progress(f, ckpt.data_dft.data(), ckpt.data_dft.size(),
+                                        bytes_done, write_total, fname.c_str(), t0)) {
+                fclose(f);
+                std::remove(tmp_path.c_str());
+                LOG_WRN("[KVC] %s: short write of checkpoint dft blob\n", fname.c_str());
+                return false;
+            }
         }
     }
 
+    if (fflush(f) != 0) {
+        LOG_WRN("[KVC] prompt_cache: fflush failed for '%s'\n", tmp_path.c_str());
+        fclose(f);
+        std::remove(tmp_path.c_str());
+        return false;
+    }
     fclose(f);
+
+    // Atomically replace the destination with the fully-written temp file.
+    if (std::rename(tmp_path.c_str(), path.c_str()) != 0) {
+        LOG_WRN("[KVC] prompt_cache: rename '%s' -> '%s' failed\n",
+            tmp_path.c_str(), path.c_str());
+        std::remove(tmp_path.c_str());
+        return false;
+    }
 
     const int64_t elapsed = ggml_time_ms() - t0;
     LOG_INF("[KVC] prompt_cache: saved prompt to %s in %" PRId64 " ms (tokens=%zu)\n",

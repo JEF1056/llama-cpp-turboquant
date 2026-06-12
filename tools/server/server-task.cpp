@@ -2033,6 +2033,7 @@ server_prompt * server_prompt_cache::alloc(const server_prompt & prompt, size_t 
             /*.drft =*/ std::move(state_data_dft),
         },
         /*.checkpoints =*/ {},
+        /*.mtmd_positions =*/ prompt.mtmd_positions,
     });
 
     return &states.back();
