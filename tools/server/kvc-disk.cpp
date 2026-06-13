@@ -222,10 +222,14 @@ bool kvc_disk_write(
     const uint32_t kv_crc = crc32_buf(kv_buf.data(), kv_buf.size());
 
     // 3. Open the output file
-    FILE * f = fopen(path.c_str(), "wb");
+    // Write to a temporary file first, then atomically rename to the final path.
+    // This prevents a crash mid-write from clobbering the previously-valid cache;
+    // a truncated *.tmp is simply discarded on the next startup scan.
+    const std::string tmp_path = path + ".tmp";
+    FILE * f = fopen(tmp_path.c_str(), "wb");
     if (!f) {
         LOG_WRN("[KVC] slot seq=%d: cannot open '%s' for writing\n",
-            (int) seq_id, path.c_str());
+            (int) seq_id, tmp_path.c_str());
         return false;
     }
 
@@ -287,18 +291,34 @@ bool kvc_disk_write(
     if (!write_chunked_progress(f, kv_buf.data(), kv_buf.size(),
                                 bytes_done, write_total, fname.c_str(), t0)) {
         fclose(f);
+        std::remove(tmp_path.c_str());
         LOG_WRN("[KVC] slot seq=%d: short write to '%s'\n",
-            (int) seq_id, path.c_str());
+            (int) seq_id, tmp_path.c_str());
         return false;
     }
 
     // 6. Write token array (v2: n_tokens × i32, including LLAMA_TOKEN_NULL for images)
     const size_t nt = fwrite(tokens.data(), sizeof(llama_token), tokens.size(), f);
+    if (fflush(f) != 0) {
+        LOG_WRN("[KVC] slot seq=%d: fflush failed for '%s'\n", (int) seq_id, tmp_path.c_str());
+        fclose(f);
+        std::remove(tmp_path.c_str());
+        return false;
+    }
     fclose(f);
 
     if (nt != tokens.size()) {
         LOG_WRN("[KVC] slot seq=%d: short write of token array to '%s' (%zu/%zu tokens)\n",
-            (int) seq_id, path.c_str(), nt, tokens.size());
+            (int) seq_id, tmp_path.c_str(), nt, tokens.size());
+        std::remove(tmp_path.c_str());
+        return false;
+    }
+
+    // Atomically replace the destination with the fully-written temp file.
+    if (std::rename(tmp_path.c_str(), path.c_str()) != 0) {
+        LOG_WRN("[KVC] slot seq=%d: rename '%s' -> '%s' failed\n",
+            (int) seq_id, tmp_path.c_str(), path.c_str());
+        std::remove(tmp_path.c_str());
         return false;
     }
 

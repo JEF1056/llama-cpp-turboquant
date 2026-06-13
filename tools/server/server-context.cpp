@@ -734,6 +734,8 @@ public:
             // other path that terminates the queue and destroys the context.
             // The sleeping path already saves in handle_sleeping_state().
             if (!params_base.slot_save_path.empty() && ctx_tgt != nullptr) {
+                SRV_INF("[KVC] shutdown: flushing %zu slots to disk before exit\n",
+                    slots.size());
                 try {
                     save_all_idle_slots_to_disk();
                 } catch (const std::exception & err) {
