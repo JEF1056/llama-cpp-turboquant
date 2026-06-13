@@ -278,6 +278,26 @@ int tria_maybe_score(
         }
     }
 
+    /* No eviction possible this pass: the retained budget already covers every
+     * old token (context still below triattention-budget% of n_ctx, or an
+     * absolute budget larger than the cache).  Scoring would compute
+     * global_scores that the eviction mask never consults, so skip the whole
+     * pass — including the periodic full rescore and its value-energy read of
+     * the entire V cache — and re-check after another `interval` tokens.  This
+     * eliminates all TriAttention decode-loop stalls until the cache actually
+     * exceeds budget.  It changes neither ctx-size nor triattention-budget; it
+     * only avoids dead work below the eviction threshold. */
+    if (budget >= n_old) {
+        static int skip_logged = 0;
+        if (!skip_logged) {
+            LLAMA_LOG_INFO("tria_score: n_old=%d <= budget=%d — no eviction yet, "
+                    "skipping scoring until cache exceeds budget\n", n_old, budget);
+            skip_logged = 1;
+        }
+        rt->n_scored = n_kv;
+        return 0;
+    }
+
     /* Full rescore is required:
      *   - after physical compaction (tria_compact_kv reorders cells; cached scores
      *     map to the old ordering and would corrupt incremental scoring)
