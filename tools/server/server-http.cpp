@@ -178,6 +178,7 @@ bool server_http_context::init(const common_params & params) {
             "/v1/health",
             "/models",
             "/v1/models",
+            "/props",
             "/",
             "/index.html",
             "/bundle.js",
@@ -189,9 +190,20 @@ bool server_http_context::init(const common_params & params) {
             return true;
         }
 
-        // If path is public or static file, skip validation
+        // If path is public, skip validation
         if (public_endpoints.find(req.path) != public_endpoints.end()) {
             return true;
+        }
+
+        // If path looks like a static file (has a file extension), skip validation.
+        // This allows the web UI's static assets (fonts, images, etc.) to load
+        // without an API key when served via --public-path.
+        {
+            auto dot_pos = req.path.rfind('.');
+            auto slash_pos = req.path.rfind('/');
+            if (dot_pos != std::string::npos && (slash_pos == std::string::npos || dot_pos > slash_pos)) {
+                return true;
+            }
         }
 
         // Check for API key in the Authorization header

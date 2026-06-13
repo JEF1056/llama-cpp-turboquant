@@ -31,6 +31,14 @@ def test_access_static_assets_without_api_key():
         assert res.status_code == 200, f"Expected 200 for {path}, got {res.status_code}"
 
 
+def test_access_props_without_api_key():
+    """The /props endpoint should be accessible without an API key so the web UI can bootstrap"""
+    global server
+    server.start()
+    res = server.make_request("GET", "/props")
+    assert res.status_code == 200, f"Expected 200 for /props, got {res.status_code}"
+
+
 @pytest.mark.parametrize("api_key", [None, "invalid-key"])
 def test_incorrect_api_key(api_key: str):
     global server
