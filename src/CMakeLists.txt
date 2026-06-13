@@ -65,6 +65,14 @@ if (OpenMP_C_FOUND)
     target_link_libraries(llama PRIVATE OpenMP::OpenMP_C)
 endif()
 
+# GPU TriAttention scorer (ggml/src/ggml-cuda/triattention-score.cu).  The
+# kernel entry points are resolved through the PUBLIC link chain to ggml-cuda.
+# GGML_USE_CUDA is only defined for HIP builds, so use a dedicated macro to gate
+# the host call sites in triattention-runtime.c for pure-CUDA builds.
+if (GGML_CUDA)
+    target_compile_definitions(llama PRIVATE GGML_TRIA_CUDA)
+endif()
+
 if (BUILD_SHARED_LIBS)
     set_target_properties(llama PROPERTIES POSITION_INDEPENDENT_CODE ON)
     target_compile_definitions(llama PRIVATE LLAMA_BUILD)

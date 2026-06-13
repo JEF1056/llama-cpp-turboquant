@@ -20,6 +20,26 @@
 #include <omp.h>
 #endif
 
+#ifdef GGML_TRIA_CUDA
+#include "triattention-cuda.h"
+/* GPU turbo scoring config, read once from env. -1 = not yet read. */
+static int   tria_gpu_turbo_mode     = -1;   /* TRIA_GPU_SCORING */
+static int   tria_gpu_turbo_verify   = 0;    /* TRIA_GPU_VERIFY  */
+static int   tria_gpu_stats_uploaded = 0;
+static float tria_gpu_max_beta       = 0.0f; /* TRIA_MAX_BETA, default 0 */
+static void tria_gpu_turbo_init_cfg(void) {
+    if (tria_gpu_turbo_mode >= 0) return;
+    const char * e = getenv("TRIA_GPU_SCORING");
+    tria_gpu_turbo_mode   = (e && atoi(e) != 0) ? 1 : 0;
+    const char * v = getenv("TRIA_GPU_VERIFY");
+    tria_gpu_turbo_verify = (v && atoi(v) != 0) ? 1 : 0;
+    const char * b = getenv("TRIA_MAX_BETA");
+    if (b) { float f = strtof(b, NULL); if (isfinite(f) && f >= 0.0f && f <= 1.0f) tria_gpu_max_beta = f; }
+    LLAMA_LOG_INFO("tria: GPU turbo scoring=%d verify=%d max_beta=%.2f\n",
+                   tria_gpu_turbo_mode, tria_gpu_turbo_verify, tria_gpu_max_beta);
+}
+#endif
+
 struct tria_runtime * g_tria_rt = NULL;
 
 /* ---- Inverse Turbo WHT for scoring ---- */
@@ -484,6 +504,58 @@ int tria_maybe_score(
         }
     }
 
+    /* ---- GPU turbo/GQA scoring path (opt-in via TRIA_GPU_SCORING) ----
+     * Offloads the expensive 17-offset trig + two-level GQA z-norm/max onto the
+     * GPU while the CPU still dequantizes K + applies the inverse WHT (identical
+     * k_real/k_imag feed both paths, so results are directly comparable).
+     * Distinct from the q8_0 backend path above (which requires nh == nkv). */
+#ifdef GGML_TRIA_CUDA
+    int gpu_turbo = 0;
+    {
+        tria_gpu_turbo_init_cfg();
+        int nh_all = rt->stats->num_heads;
+        int gpu_nd = rt->stats->nonrot_dim;
+        int gqa_all = (nkv > 0 && nh_all % nkv == 0) ? nh_all / nkv : 0;
+        if (tria_gpu_turbo_mode == 1 && use_gpu_scoring != 1 && !tria_random_mode &&
+            rt->cfg_no_gpu_score == 0 && gpu_nd == 0 && fc > 0 && fc <= 64 &&
+            gqa_all > 0) {
+            gpu_turbo = 1;
+            if (!tria_gpu_stats_uploaded) {
+                size_t blob_n = (size_t)nl * nh_all * 4 * fc;
+                float * blob = (float *)malloc(blob_n * sizeof(float));
+                if (blob) {
+                    for (int li2 = 0; li2 < nl; li2++) {
+                        for (int h = 0; h < nh_all; h++) {
+                            struct tria_head_stats * hs = &rt->stats->heads[li2 * nh_all + h];
+                            float * dst = blob + ((size_t)(li2 * nh_all + h)) * 4 * fc;
+                            for (int f = 0; f < fc; f++) {
+                                dst[0 * fc + f] = hs->q_mean_real[f];
+                                dst[1 * fc + f] = hs->q_mean_imag[f];
+                                dst[2 * fc + f] = hs->q_abs_mean[f];
+                                dst[3 * fc + f] = hs->qma[f];
+                            }
+                        }
+                    }
+                    if (tria_cuda_upload_stats(rt->stats->omega, fc, blob, nl, nh_all) == 0) {
+                        tria_gpu_stats_uploaded = 1;
+                    } else {
+                        gpu_turbo = 0;
+                    }
+                    free(blob);
+                } else {
+                    gpu_turbo = 0;
+                }
+            }
+            if (gpu_turbo) {
+                if (tria_cuda_global_begin(n_old, n_new, key_pos + score_start, n_kv,
+                                           nkv, gqa_all, fc, rt->global_scores) != 0) {
+                    gpu_turbo = 0;
+                }
+            }
+        }
+    }
+#endif
+
     /* Random eviction mode: assign random scores, skip all scoring logic */
     if (tria_random_mode) {
         for (int s = 0; s < n_new; s++) {
@@ -608,6 +680,38 @@ int tria_maybe_score(
          * Max is commutative, so the result is bit-identical to the serial path
          * regardless of thread count/scheduling. Dequant above already ran serially
          * (the ggml backend is not thread-safe); only CPU math is parallel here. */
+#ifdef GGML_TRIA_CUDA
+        /* GPU turbo path (non-verify): extract complex pairs for all KV heads,
+         * then run the whole layer's scoring on the GPU and skip the CPU loop. */
+        if (gpu_turbo && !tria_gpu_turbo_verify) {
+            int nh_all = rt->stats->num_heads;
+            int gqa_all = nh_all / nkv;
+            for (int kvi = 0; kvi < nkv; kvi++) {
+                float * lk_real = k_real + (size_t)kvi * n_old * fc;
+                float * lk_imag = k_imag + (size_t)kvi * n_old * fc;
+                for (int s = 0; s < n_new; s++) {
+                    float * row = k_f32 + (size_t)s * n_embd_k_gqa + kvi * hd;
+                    if (rt->rope_neox) {
+                        for (int f = 0; f < fc; f++) {
+                            lk_real[s * fc + f] = row[f];
+                            lk_imag[s * fc + f] = row[fc + f];
+                        }
+                    } else {
+                        for (int f = 0; f < fc; f++) {
+                            lk_real[s * fc + f] = row[2 * f + 0];
+                            lk_imag[s * fc + f] = row[2 * f + 1];
+                        }
+                    }
+                }
+            }
+            float layer_weight = rt->stats->layer_budget_scales[li] / layer_weight_mean;
+            if (layer_weight < 0.25f) layer_weight = 0.25f;
+            if (layer_weight > 4.0f)  layer_weight = 4.0f;
+            tria_cuda_score_layer(k_real, k_imag, n_old, n_new, nkv, fc, gqa_all,
+                                  li, nh_all, tria_gpu_max_beta, layer_weight, score_start);
+            continue;  /* layer scored on GPU */
+        }
+#endif
 #ifdef _OPENMP
         #pragma omp parallel for schedule(dynamic, 1)
 #endif
@@ -681,7 +785,49 @@ int tria_maybe_score(
                     rt->global_scores[score_start + s] = wz;
             }
         }
+#ifdef GGML_TRIA_CUDA
+        /* GPU verify: re-score the same layer on the GPU into the device global
+         * buffer (reusing the k_real/k_imag the CPU loop just extracted). The
+         * device result is compared against the CPU result after the layer loop. */
+        if (gpu_turbo && tria_gpu_turbo_verify) {
+            int nh_all = rt->stats->num_heads;
+            int gqa_all = nh_all / nkv;
+            float layer_weight = rt->stats->layer_budget_scales[li] / layer_weight_mean;
+            if (layer_weight < 0.25f) layer_weight = 0.25f;
+            if (layer_weight > 4.0f)  layer_weight = 4.0f;
+            tria_cuda_score_layer(k_real, k_imag, n_old, n_new, nkv, fc, gqa_all,
+                                  li, nh_all, tria_gpu_max_beta, layer_weight, score_start);
+        }
+#endif
     }
+
+#ifdef GGML_TRIA_CUDA
+    if (gpu_turbo) {
+        if (!tria_gpu_turbo_verify) {
+            /* Production GPU path: pull the merged scores back into global_scores. */
+            tria_cuda_global_download(rt->global_scores, n_old);
+        } else {
+            /* Verify path: compare GPU result (device) vs CPU result (host). */
+            float * gtmp = (float *)malloc((size_t)n_old * sizeof(float));
+            if (gtmp && tria_cuda_global_download(gtmp, n_old) == 0) {
+                double max_abs = 0.0, max_rel = 0.0;
+                int worst = -1;
+                for (int i = score_start; i < n_old; i++) {
+                    float a = rt->global_scores[i];
+                    float b = gtmp[i];
+                    if (a < -1e29f && b < -1e29f) continue;  /* both unscored */
+                    double d = fabs((double)a - (double)b);
+                    if (d > max_abs) { max_abs = d; worst = i; }
+                    double r = d / (fabs((double)a) + 1e-6);
+                    if (r > max_rel) max_rel = r;
+                }
+                LLAMA_LOG_INFO("tria_gpu_verify: max_abs=%.6g max_rel=%.6g worst=%d n_new=%d\n",
+                               max_abs, max_rel, worst, n_new);
+            }
+            free(gtmp);
+        }
+    }
+#endif
 
     if (use_gpu_scoring && rt->gpu_global_scores) {
         g_tria_backend.scores_download(rt->global_scores + score_start, rt->gpu_global_scores, n_new);
