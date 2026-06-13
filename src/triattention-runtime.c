@@ -16,6 +16,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
 struct tria_runtime * g_tria_rt = NULL;
 
 /* ---- Inverse Turbo WHT for scoring ---- */
@@ -328,7 +332,8 @@ int tria_maybe_score(
         free(rt->scratch_key_pos);
         free(rt->scratch_phys);
         rt->scratch_k_f32   = (float *)malloc((size_t)n_old * n_embd_k_gqa * sizeof(float));
-        rt->scratch_scores  = (float *)malloc((size_t)n_old * sizeof(float));
+        /* nkv slices: one private score buffer per KV head for the parallel loop. */
+        rt->scratch_scores  = (float *)malloc((size_t)nkv * n_old * sizeof(float));
         rt->scratch_key_pos = (int   *)malloc((size_t)n_old * sizeof(int));
         rt->scratch_phys    = (int   *)malloc((size_t)n_old * sizeof(int));
         rt->scratch_capacity = n_old;
@@ -336,8 +341,10 @@ int tria_maybe_score(
     if (n_old > rt->scratch_fc_capacity) {
         free(rt->scratch_k_real);
         free(rt->scratch_k_imag);
-        rt->scratch_k_real = (float *)malloc((size_t)n_old * fc * sizeof(float));
-        rt->scratch_k_imag = (float *)malloc((size_t)n_old * fc * sizeof(float));
+        /* Sized nkv*n_old*fc so each KV head scores into a private slice in
+         * parallel without locking (see the OpenMP kvi loop below). */
+        rt->scratch_k_real = (float *)malloc((size_t)nkv * n_old * fc * sizeof(float));
+        rt->scratch_k_imag = (float *)malloc((size_t)nkv * n_old * fc * sizeof(float));
         rt->scratch_fc_capacity = n_old;
     }
     float * k_f32   = rt->scratch_k_f32;
@@ -595,21 +602,34 @@ int tria_maybe_score(
             free(k_phys);
         }
 
+        /* Score KV heads in parallel — heads are independent. Each head uses a
+         * private nkv-indexed slice of the scratch buffers, so there are no races
+         * during scoring; only the final max-merge into global_scores is guarded.
+         * Max is commutative, so the result is bit-identical to the serial path
+         * regardless of thread count/scheduling. Dequant above already ran serially
+         * (the ggml backend is not thread-safe); only CPU math is parallel here. */
+#ifdef _OPENMP
+        #pragma omp parallel for schedule(dynamic, 1)
+#endif
         for (int kvi = 0; kvi < nkv; kvi++) {
+            float * lk_real = k_real + (size_t)kvi * n_old * fc;
+            float * lk_imag = k_imag + (size_t)kvi * n_old * fc;
+            float * lscores = scores + (size_t)kvi * n_old;
+
             for (int s = 0; s < n_new; s++) {
-                float * row = k_f32 + s * n_embd_k_gqa + kvi * hd;
+                float * row = k_f32 + (size_t)s * n_embd_k_gqa + kvi * hd;
                 /* Extract complex pairs from post-RoPE K.
                  * NEOX/IMROPE: split-half [r0..r_{fc-1}, i0..i_{fc-1}]
                  * NORMAL:      interleaved [r0, i0, r1, i1, ...] */
                 if (rt->rope_neox) {
                     for (int f = 0; f < fc; f++) {
-                        k_real[s * fc + f] = row[f];
-                        k_imag[s * fc + f] = row[fc + f];
+                        lk_real[s * fc + f] = row[f];
+                        lk_imag[s * fc + f] = row[fc + f];
                     }
                 } else {
                     for (int f = 0; f < fc; f++) {
-                        k_real[s * fc + f] = row[2*f + 0];
-                        k_imag[s * fc + f] = row[2*f + 1];
+                        lk_real[s * fc + f] = row[2*f + 0];
+                        lk_imag[s * fc + f] = row[2*f + 1];
                     }
                 }
             }
@@ -621,22 +641,22 @@ int tria_maybe_score(
                 k_nr = malloc((size_t)n_new * nd * sizeof(float));
                 if (k_nr) {
                     for (int s = 0; s < n_new; s++) {
-                        float *row = k_f32 + s * n_embd_k_gqa + kvi * hd;
+                        float *row = k_f32 + (size_t)s * n_embd_k_gqa + kvi * hd;
                         memcpy(k_nr + s * nd, row + 2 * fc, nd * sizeof(float));
                     }
                 }
             }
 
-            tria_score_kv_head(rt->stats, k_real, k_imag, k_nr,
+            tria_score_kv_head(rt->stats, lk_real, lk_imag, k_nr,
                                key_pos + score_start,
-                               n_kv, n_new, li, kvi, scores);
+                               n_kv, n_new, li, kvi, lscores);
             free(k_nr);
 
             float mean = 0, var = 0;
-            for (int s = 0; s < n_new; s++) mean += scores[s];
+            for (int s = 0; s < n_new; s++) mean += lscores[s];
             mean /= n_new;
             for (int s = 0; s < n_new; s++) {
-                float d = scores[s] - mean;
+                float d = lscores[s] - mean;
                 var += d * d;
             }
             float std = sqrtf(var / n_new + 1e-8f);
@@ -651,8 +671,11 @@ int tria_maybe_score(
             if (layer_weight < 0.25f) layer_weight = 0.25f;
             if (layer_weight > 4.0f)  layer_weight = 4.0f;
 
+#ifdef _OPENMP
+            #pragma omp critical (tria_global_merge)
+#endif
             for (int s = 0; s < n_new; s++) {
-                float z = (scores[s] - mean) / std;
+                float z = (lscores[s] - mean) / std;
                 float wz = z > 0.0f ? z * layer_weight : z;
                 if (wz > rt->global_scores[score_start + s])
                     rt->global_scores[score_start + s] = wz;

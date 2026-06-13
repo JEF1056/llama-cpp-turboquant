@@ -57,6 +57,14 @@ target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
 
 target_link_libraries(llama PUBLIC ggml)
 
+# TriAttention KV-cache scoring parallelizes across KV heads via OpenMP.
+# Optional: if OpenMP is unavailable the pragmas are ignored and scoring runs
+# serially (the prior behavior), so this never breaks the build.
+find_package(OpenMP QUIET)
+if (OpenMP_C_FOUND)
+    target_link_libraries(llama PRIVATE OpenMP::OpenMP_C)
+endif()
+
 if (BUILD_SHARED_LIBS)
     set_target_properties(llama PROPERTIES POSITION_INDEPENDENT_CODE ON)
     target_compile_definitions(llama PRIVATE LLAMA_BUILD)
