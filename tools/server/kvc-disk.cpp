@@ -202,7 +202,14 @@ bool kvc_disk_write(
         return false;
     }
 
-    std::vector<uint8_t> kv_buf(kv_size);
+    std::vector<uint8_t> kv_buf;
+    try {
+        kv_buf.resize(kv_size);
+    } catch (const std::bad_alloc &) {
+        LOG_WRN("[KVC] slot seq=%d: out of memory allocating %.1f MiB KV buffer, skipping write\n",
+            (int) seq_id, (double) kv_size / (1024.0 * 1024.0));
+        return false;
+    }
     const size_t written = llama_state_seq_get_data_ext(ctx, kv_buf.data(), kv_size, seq_id, LLAMA_STATE_SEQ_FLAGS_NONE);
     if (written == 0 || written > kv_size) {
         LOG_WRN("[KVC] slot seq=%d: llama_state_seq_get_data returned %zu (expected %zu)\n",

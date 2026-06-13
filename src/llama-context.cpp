@@ -2526,6 +2526,22 @@ public:
             uint8_t * p, size_t len) : ptr(p), buf_size(len) {}
 
     ~llama_io_write_host() {
+        // If flush_tensors() was already called (e.g. from within the try/catch in
+        // state_seq_get_data), this is a no-op and avoids a double-copy or a crash
+        // during stack unwinding.  Otherwise fall back so callers that don't use
+        // flush_tensors() still work correctly.
+        if (!tensors_flushed) {
+            flush_tensors();
+        }
+    }
+
+    // Perform all deferred GPU→CPU tensor copies.
+    // Call this explicitly from within a try/catch to ensure C++ exceptions
+    // (e.g. std::bad_alloc) surface in the caller rather than in the destructor.
+    // Note: CUDA errors in ggml_backend_tensor_get still call GGML_ABORT().
+    void flush_tensors() {
+        // Mark early so destructor won't retry if a C++ exception is thrown mid-loop.
+        tensors_flushed = true;
         // TODO: add backend support to batch tensor_get? or some other way to speed this up
         for (const auto & winfo : winfos) {
             ggml_backend_tensor_get(winfo.tensor, winfo.ptr, winfo.offset, winfo.size);
@@ -2563,6 +2579,7 @@ private:
     uint8_t * ptr;
     size_t buf_size = 0;
     size_t size_written = 0;
+    bool tensors_flushed = false;
 
     struct write_info {
         ggml_tensor * tensor;
@@ -2973,17 +2990,26 @@ size_t llama_context::state_seq_get_size(llama_seq_id seq_id, llama_state_seq_fl
 
 size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, size_t size, llama_state_seq_flags flags) {
     std::unique_ptr<llama_io_write_i> io;
+    llama_io_write_host * host_io = nullptr;
     if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
         io = std::make_unique<llama_io_write_device>(dst, size, mem_storage[seq_id], sched.get());
     } else {
-        io = std::make_unique<llama_io_write_host>(dst, size);
+        auto h = std::make_unique<llama_io_write_host>(dst, size);
+        host_io = h.get();
+        io = std::move(h);
     }
 
     try {
         io->write(&io_magic, sizeof(io_magic));
         io->write(&seq_id, sizeof(seq_id));
 
-        return state_seq_write_data(*io, seq_id, flags);
+        const size_t n = state_seq_write_data(*io, seq_id, flags);
+        // Flush GPU→CPU copies inside the try/catch so C++ exceptions surface here
+        // instead of silently escaping through the destructor during stack unwinding.
+        if (host_io) {
+            host_io->flush_tensors();
+        }
+        return n;
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: error saving state: %s\n", __func__, err.what());
         return 0;

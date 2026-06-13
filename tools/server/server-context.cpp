@@ -734,7 +734,13 @@ public:
             // other path that terminates the queue and destroys the context.
             // The sleeping path already saves in handle_sleeping_state().
             if (!params_base.slot_save_path.empty() && ctx_tgt != nullptr) {
-                save_all_idle_slots_to_disk();
+                try {
+                    save_all_idle_slots_to_disk();
+                } catch (const std::exception & err) {
+                    SRV_WRN("KVC save on shutdown failed: %s\n", err.what());
+                } catch (...) {
+                    SRV_WRN("%s", "KVC save on shutdown failed: unknown exception\n");
+                }
             }
             // destroy() is already called when entering sleeping state
             // we don't call it again here to avoid double free
@@ -932,12 +938,19 @@ private:
                 + "slot" + std::to_string(slot.id) + ".llama_cache";
             SRV_INF("[KVC] slot %d: saving %d tokens → %s\n",
                 slot.id, slot.prompt.n_tokens(), path.c_str());
-            const bool ok = kvc_disk_write(
-                path, fp, slot.prompt.mtmd_positions,
-                ctx_tgt, slot.id,
-                slot.prompt.n_tokens(),
-                cur_pos,
-                slot.prompt.tokens.get_tokens_all()); // includes LLAMA_TOKEN_NULL for mtmd
+            bool ok = false;
+            try {
+                ok = kvc_disk_write(
+                    path, fp, slot.prompt.mtmd_positions,
+                    ctx_tgt, slot.id,
+                    slot.prompt.n_tokens(),
+                    cur_pos,
+                    slot.prompt.tokens.get_tokens_all()); // includes LLAMA_TOKEN_NULL for mtmd
+            } catch (const std::exception & err) {
+                SRV_WRN("[KVC] slot %d: exception during KV save: %s\n", slot.id, err.what());
+            } catch (...) {
+                SRV_WRN("[KVC] slot %d: unknown exception during KV save\n", slot.id);
+            }
             if (ok) {
                 slot.kvc_saved_pos_next = cur_pos;
                 n_saved++;
