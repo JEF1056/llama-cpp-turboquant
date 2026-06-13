@@ -2808,6 +2808,17 @@ public:
                     ggml_backend_tensor_copy(mbuf_cur.org[i], mbuf_cur.cpy[i]);
                 }
             }
+
+            // The async copies above are issued out-of-band, outside the sched's
+            // stream/event graph. Fence them before this destructor returns so the
+            // checkpoint is fully captured before the caller resumes compute (which
+            // may overwrite the live 'org' tensors) and before any old device buffer
+            // freed by the grow-realloc above goes out of scope while a copy into it
+            // is still in flight. Without this fence a deferred CUDA "illegal memory
+            // access" can surface (only with CUDA_LAUNCH_BLOCKING=0).
+            if (backend) {
+                ggml_backend_synchronize(backend);
+            }
         }
     }
 
@@ -2901,6 +2912,16 @@ public:
                 } else {
                     ggml_backend_tensor_copy(mbuf_cur.cpy[i], mbuf.org[i]);
                 }
+            }
+
+            // The async copies above restore the checkpoint into the LIVE recurrent/KV
+            // tensors out-of-band, outside the sched's stream/event graph. Fence them
+            // before this destructor returns so the restored state is fully materialized
+            // before the caller launches the next decode graph that reads these tensors.
+            // Without this fence the decode kernels race the in-flight copy and trigger a
+            // deferred CUDA "illegal memory access" (only with CUDA_LAUNCH_BLOCKING=0).
+            if (backend) {
+                ggml_backend_synchronize(backend);
             }
         }
 
