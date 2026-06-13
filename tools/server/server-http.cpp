@@ -274,7 +274,8 @@ bool server_http_context::init(const common_params & params) {
 
     // register server middlewares
     srv->set_pre_routing_handler([middleware_validate_api_key, middleware_server_state](const httplib::Request & req, httplib::Response & res) {
-        res.set_header("Access-Control-Allow-Origin", req.get_header_value("Origin"));
+        auto origin = req.get_header_value("Origin");
+        res.set_header("Access-Control-Allow-Origin", origin.empty() ? "*" : origin);
         // If this is OPTIONS request, skip validation because browsers don't include Authorization header
         if (req.method == "OPTIONS") {
             res.set_header("Access-Control-Allow-Credentials", "true");
