@@ -2675,9 +2675,19 @@ private:
     std::vector<uint8_t> temp_buffer;
 };
 
+// Helper: find the backend whose default buffer type matches 'buft' in the given scheduler.
+// Returns nullptr when no match (falls back to synchronous copy).
+static ggml_backend_t find_backend_for_buft(ggml_backend_sched_t sched, ggml_backend_buffer_type_t buft) {
+    for (int i = 0; i < ggml_backend_sched_get_n_backends(sched); ++i) {
+        ggml_backend_t b = ggml_backend_sched_get_backend(sched, i);
+        if (ggml_backend_get_default_buffer_type(b) == buft) return b;
+    }
+    return nullptr;
+}
+
 class llama_io_write_device : public llama_io_write_i {
 public:
-    llama_io_write_device(uint8_t * p, size_t len, llama_memory_buffers & mbufs) : ptr(p), buf_size(len), mbufs(mbufs)  {
+    llama_io_write_device(uint8_t * p, size_t len, llama_memory_buffers & mbufs, ggml_backend_sched_t sched = nullptr) : ptr(p), buf_size(len), mbufs(mbufs), sched_(sched)  {
     }
 
     ~llama_io_write_device() {
@@ -2773,8 +2783,13 @@ public:
                 }
             }
 
+            ggml_backend_t backend = sched_ ? find_backend_for_buft(sched_, buft) : nullptr;
             for (size_t i = 0; i < mbuf_cur.org.size(); ++i) {
-                ggml_backend_tensor_copy(mbuf_cur.org[i], mbuf_cur.cpy[i]);
+                if (backend) {
+                    ggml_backend_tensor_copy_async(backend, backend, mbuf_cur.org[i], mbuf_cur.cpy[i]);
+                } else {
+                    ggml_backend_tensor_copy(mbuf_cur.org[i], mbuf_cur.cpy[i]);
+                }
             }
         }
     }
@@ -2812,11 +2827,12 @@ private:
     std::vector<write_info> winfos;
 
     llama_memory_buffers & mbufs;
+    ggml_backend_sched_t sched_;
 };
 
 class llama_io_read_device : public llama_io_read_i {
 public:
-    llama_io_read_device(const uint8_t * p, size_t len, const llama_memory_buffers & mbufs) : ptr(p), buf_size(len), mbufs(mbufs) {
+    llama_io_read_device(const uint8_t * p, size_t len, const llama_memory_buffers & mbufs, ggml_backend_sched_t sched = nullptr) : ptr(p), buf_size(len), mbufs(mbufs), sched_(sched) {
     }
 
     ~llama_io_read_device() {
@@ -2861,8 +2877,13 @@ public:
                 GGML_ABORT("%s: memory buffer mismatch\n", __func__);
             }
 
+            ggml_backend_t backend = sched_ ? find_backend_for_buft(sched_, buft) : nullptr;
             for (size_t i = 0; i < mbuf_cur.org.size(); ++i) {
-                ggml_backend_tensor_copy(mbuf_cur.cpy[i], mbuf.org[i]);
+                if (backend) {
+                    ggml_backend_tensor_copy_async(backend, backend, mbuf_cur.cpy[i], mbuf.org[i]);
+                } else {
+                    ggml_backend_tensor_copy(mbuf_cur.cpy[i], mbuf.org[i]);
+                }
             }
         }
 
@@ -2902,6 +2923,7 @@ private:
     std::vector<read_info> rinfos;
 
     const llama_memory_buffers & mbufs;
+    ggml_backend_sched_t sched_;
 };
 
 size_t llama_context::state_get_size() {
@@ -2952,7 +2974,7 @@ size_t llama_context::state_seq_get_size(llama_seq_id seq_id, llama_state_seq_fl
 size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, size_t size, llama_state_seq_flags flags) {
     std::unique_ptr<llama_io_write_i> io;
     if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
-        io = std::make_unique<llama_io_write_device>(dst, size, mem_storage[seq_id]);
+        io = std::make_unique<llama_io_write_device>(dst, size, mem_storage[seq_id], sched.get());
     } else {
         io = std::make_unique<llama_io_write_host>(dst, size);
     }
@@ -2985,7 +3007,7 @@ size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * sr
 
         GGML_ASSERT(mem_storage.find(seq_id_read) != mem_storage.end());
 
-        io = std::make_unique<llama_io_read_device>(src, size, mem_storage[seq_id_read]);
+        io = std::make_unique<llama_io_read_device>(src, size, mem_storage[seq_id_read], sched.get());
     } else {
         io = std::make_unique<llama_io_read_host>(src, size);
     }
