@@ -1539,6 +1539,10 @@ void launch_fattn(
         mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0
     );
     CUDA_CHECK(cudaGetLastError());
+#ifdef GGML_CUDA_SYNC_DEBUG
+    CUDA_CHECK(cudaStreamSynchronize(main_stream));
+    CUDA_CHECK(cudaGetLastError());
+#endif
 
     if (stream_k) {
         if ((int)blocks_num.x % ntiles_dst == 0 && (int)blocks_num.x > ntiles_dst) {
@@ -1586,4 +1590,8 @@ void launch_fattn(
             (dst_tmp.ptr, dst_tmp_meta.ptr, (float *) KQV->data, parallel_blocks);
     }
     CUDA_CHECK(cudaGetLastError());
+#ifdef GGML_CUDA_SYNC_DEBUG
+    CUDA_CHECK(cudaStreamSynchronize(main_stream));
+    CUDA_CHECK(cudaGetLastError());
+#endif
 }

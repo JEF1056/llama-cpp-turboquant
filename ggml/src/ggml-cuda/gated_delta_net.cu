@@ -190,6 +190,9 @@ static void launch_gated_delta_net(
     int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
 
     switch (S_v) {
+#ifdef GGML_CUDA_SYNC_DEBUG
+    do { cudaError_t _e = cudaGetLastError(); if (_e != cudaSuccess) GGML_ABORT("pre-GDN CUDA error: %s", cudaGetErrorString(_e)); } while(0);
+#endif
         case 16:
             gated_delta_net_cuda<16, KDA, keep_rs_t><<<grid_dims, block_dims, 0, stream>>>(
                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, H,
@@ -220,6 +223,10 @@ static void launch_gated_delta_net(
             GGML_ABORT("fatal error");
             break;
     }
+#ifdef GGML_CUDA_SYNC_DEBUG
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    CUDA_CHECK(cudaGetLastError());
+#endif
 }
 
 void ggml_cuda_op_gated_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
