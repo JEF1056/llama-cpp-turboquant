@@ -1540,8 +1540,14 @@ void launch_fattn(
     );
     CUDA_CHECK(cudaGetLastError());
 #ifdef GGML_CUDA_SYNC_DEBUG
-    CUDA_CHECK(cudaStreamSynchronize(main_stream));
-    CUDA_CHECK(cudaGetLastError());
+    {
+        cudaStreamCaptureStatus _cap = cudaStreamCaptureStatusNone;
+        cudaStreamIsCapturing(main_stream, &_cap);
+        if (_cap == cudaStreamCaptureStatusNone) {
+            CUDA_CHECK(cudaStreamSynchronize(main_stream));
+            CUDA_CHECK(cudaGetLastError());
+        }
+    }
 #endif
 
     if (stream_k) {
@@ -1591,7 +1597,13 @@ void launch_fattn(
     }
     CUDA_CHECK(cudaGetLastError());
 #ifdef GGML_CUDA_SYNC_DEBUG
-    CUDA_CHECK(cudaStreamSynchronize(main_stream));
-    CUDA_CHECK(cudaGetLastError());
+    {
+        cudaStreamCaptureStatus _cap = cudaStreamCaptureStatusNone;
+        cudaStreamIsCapturing(main_stream, &_cap);
+        if (_cap == cudaStreamCaptureStatusNone) {
+            CUDA_CHECK(cudaStreamSynchronize(main_stream));
+            CUDA_CHECK(cudaGetLastError());
+        }
+    }
 #endif
 }

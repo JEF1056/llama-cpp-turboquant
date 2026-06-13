@@ -224,8 +224,14 @@ static void launch_gated_delta_net(
             break;
     }
 #ifdef GGML_CUDA_SYNC_DEBUG
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-    CUDA_CHECK(cudaGetLastError());
+    {
+        cudaStreamCaptureStatus _cap = cudaStreamCaptureStatusNone;
+        cudaStreamIsCapturing(stream, &_cap);
+        if (_cap == cudaStreamCaptureStatusNone) {
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            CUDA_CHECK(cudaGetLastError());
+        }
+    }
 #endif
 }
 
