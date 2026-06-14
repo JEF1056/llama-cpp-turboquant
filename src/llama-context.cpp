@@ -15,6 +15,10 @@
 #include "llama.h"
 #include "triattention-runtime.h"
 
+#ifdef GGML_TRIA_CUDA
+#include "ggml-cuda.h"
+#endif
+
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
@@ -786,6 +790,19 @@ const llama_cparams & llama_context::get_cparams() const {
 
 ggml_backend_sched_t llama_context::get_sched() const {
     return sched.get();
+}
+
+void llama_context::invalidate_cuda_graphs() {
+#ifdef GGML_TRIA_CUDA
+    // Discard cached CUDA graphs on every backend so the next decode re-captures
+    // from scratch. Required after an out-of-band device-side KV mutation (the
+    // TriAttention physical compaction rewrites the live K/V tensors and shrinks
+    // n_kv), which a stale captured graph would otherwise replay against the old
+    // layout and fault with an illegal memory access.
+    for (auto & backend : backends) {
+        ggml_backend_cuda_graph_clear(backend.get());
+    }
+#endif
 }
 
 uint32_t llama_context::n_ctx() const {

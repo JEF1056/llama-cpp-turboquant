@@ -66,6 +66,12 @@ struct llama_context {
 
     ggml_backend_sched_t get_sched() const;
 
+    // Discard cached CUDA graphs so the next decode re-captures from scratch.
+    // Must be called after out-of-band device-side mutations of the KV cache
+    // (e.g. TriAttention physical compaction) that change the KV layout/size
+    // underneath a captured graph. No-op on non-CUDA builds.
+    void invalidate_cuda_graphs();
+
     uint32_t n_ctx()     const;
     uint32_t n_ctx_seq() const;
     uint32_t n_batch()   const;

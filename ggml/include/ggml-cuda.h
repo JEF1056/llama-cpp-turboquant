@@ -24,6 +24,14 @@ GGML_BACKEND_API ggml_backend_t ggml_backend_cuda_init(int device);
 
 GGML_BACKEND_API bool ggml_backend_is_cuda(ggml_backend_t backend);
 
+// Discard any cached CUDA graphs for this backend, forcing a full re-capture on
+// the next compute. Must be called after out-of-band device-side mutations of
+// tensors that a captured graph reads/writes (e.g. an in-place KV-cache
+// compaction that changes the live KV layout/size), which would otherwise be
+// replayed against stale pointers/dimensions and fault. No-op for non-CUDA
+// backends or when CUDA graphs are not compiled in.
+GGML_BACKEND_API void ggml_backend_cuda_graph_clear(ggml_backend_t backend);
+
 // device buffer
 GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int device);
 

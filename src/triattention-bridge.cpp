@@ -200,6 +200,10 @@ int tria_compact_kv_with_positions(struct tria_runtime * rt, void * ctx_void, st
             return 0;
         }
 
+        /* Indirection remaps the active KV view; invalidate captured CUDA graphs
+         * for the same reason as the physical path below. No-op on non-CUDA builds. */
+        ctx->invalidate_cuda_graphs();
+
         int evicted = n_kv - (int)keep_positions.size();
         LLAMA_LOG_INFO("%s: TriAttention (Phase 3B indirection) evicted %d tokens (kept %d / %d)\n", __func__, evicted, (int)keep_positions.size(), n_kv);
         return evicted;
@@ -209,6 +213,12 @@ int tria_compact_kv_with_positions(struct tria_runtime * rt, void * ctx_void, st
     if (!kv->triattention_compact(keep_positions)) {
         return 0;
     }
+
+    /* The compaction rewrote the live K/V tensors in place and shrank n_kv. Any
+     * CUDA graph captured against the pre-compaction KV layout would be replayed
+     * with stale pointers/dimensions and fault, so force a full re-capture on the
+     * next decode. No-op on non-CUDA builds. */
+    ctx->invalidate_cuda_graphs();
 
     int evicted = n_kv - (int) keep_positions.size();
     LLAMA_LOG_INFO("%s: TriAttention evicted %d tokens (kept %d / %d)\n", __func__, evicted, (int)keep_positions.size(), n_kv);

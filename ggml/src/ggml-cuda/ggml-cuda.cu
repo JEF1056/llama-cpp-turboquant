@@ -5062,6 +5062,25 @@ bool ggml_backend_is_cuda(ggml_backend_t backend) {
     return backend != NULL && ggml_guid_matches(backend->guid, ggml_backend_cuda_guid());
 }
 
+void ggml_backend_cuda_graph_clear(ggml_backend_t backend) {
+#ifdef USE_CUDA_GRAPH
+    if (!ggml_backend_is_cuda(backend)) {
+        return;
+    }
+
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+
+    // Drop every cached graph so the next ggml_backend_cuda_graph_compute re-runs
+    // the full property check and re-captures from scratch. Synchronize first so we
+    // never destroy a cudaGraphExec that could still be in flight.
+    ggml_cuda_set_device(cuda_ctx->device);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    cuda_ctx->cuda_graphs.clear();
+#else
+    GGML_UNUSED(backend);
+#endif // USE_CUDA_GRAPH
+}
+
 int ggml_backend_cuda_get_device_count() {
     return ggml_cuda_info().device_count;
 }
