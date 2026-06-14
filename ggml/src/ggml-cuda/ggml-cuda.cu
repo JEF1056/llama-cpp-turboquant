@@ -3545,12 +3545,30 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
     const void * graph_key = ggml_cuda_graph_get_key(cgraph);
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
 
+    // NOTE (turboquant): the upstream uid fast-path (PR #21764 "graph_reused")
+    // short-circuits to "no update required" whenever the sched graph uid is
+    // unchanged, skipping the per-node property comparison below. Its correctness
+    // contract is that reusing a graph without re-splitting (so the uid stays
+    // stable) implies the graph is structurally identical. TriAttention breaks
+    // this: it mutates the KV cache out-of-band while a stable-uid graph is reused
+    // -- physical compaction shrinks n_kv (llama_kv_cache::triattention_compact)
+    // and spec-decode rollback trims rejected draft tokens (memory_seq_rm) -- so a
+    // stale CUDA graph is replayed against a changed KV layout, producing a
+    // deferred illegal memory access at the next synchronize. Disabling the
+    // fast-path restores the upstream pre-#21764 behaviour of always running the
+    // property comparison, which detects the changed node data pointers / ne / nb
+    // and forces a re-capture. The comparison is a cheap per-node memcpy+memcmp and
+    // graphs are still reused whenever the layout is genuinely unchanged, so this
+    // does not keep graphs cold. (Complements ggml_backend_cuda_graph_clear(), the
+    // explicit invalidation called from the TriAttention compaction path.)
+#if 0
     if (cgraph->uid != 0 &&
         cgraph->uid == graph->uid) {
         GGML_LOG_DEBUG("CUDA Graph id %zu reused\n", cgraph->uid);
         GGML_ASSERT((int)graph->node_props.size() == cgraph->n_nodes);
         return false;
     }
+#endif
 
     graph->uid = cgraph->uid;
 
