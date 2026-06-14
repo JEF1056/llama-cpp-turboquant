@@ -2745,6 +2745,17 @@ public:
             mbuf.cpy.push_back(ggml_new_tensor_1d(mbuf.ctx.get(), winfo.tensor->type, n));
         }
 
+        // Drain every backend before snapshotting the live KV/recurrent tensors.
+        // llama_context::graph_compute runs decode asynchronously
+        // (ggml_backend_sched_graph_compute_async) and, on CUDA with graphs enabled,
+        // via cudaGraphLaunch on the scheduler's compute stream. That decode graph is
+        // still in flight when this destructor runs, so reading 'org' without first
+        // synchronizing races the graph's KV writes. This is the same barrier the
+        // TriAttention scorer uses before reading KV on a separate stream.
+        if (sched_) {
+            ggml_backend_sched_synchronize(sched_);
+        }
+
         for (auto & [buft, mbuf] : mbufs_new) {
             auto & mbuf_cur = mbufs[buft];
 
@@ -2817,23 +2828,15 @@ public:
                 mbuf_cur.buf = std::move(buf);
             }
 
+            // Snapshot synchronously on the isolated per-thread stream. The decode
+            // has already been drained above, so this reads stable state; the
+            // synchronous ggml_backend_tensor_copy runs the D2D copy on
+            // cudaStreamPerThread with its own cudaStreamSynchronize, keeping the
+            // out-of-band checkpoint I/O off the scheduler's compute/graph stream so
+            // it never interleaves with CUDA-graph capture or replay (the cause of
+            // the deferred "illegal memory access" at high context with graphs on).
             for (size_t i = 0; i < mbuf_cur.org.size(); ++i) {
-                if (backend) {
-                    ggml_backend_tensor_copy_async(backend, backend, mbuf_cur.org[i], mbuf_cur.cpy[i]);
-                } else {
-                    ggml_backend_tensor_copy(mbuf_cur.org[i], mbuf_cur.cpy[i]);
-                }
-            }
-
-            // The async copies above are issued out-of-band, outside the sched's
-            // stream/event graph. Fence them before this destructor returns so the
-            // checkpoint is fully captured before the caller resumes compute (which
-            // may overwrite the live 'org' tensors) and before any old device buffer
-            // freed by the grow-realloc above goes out of scope while a copy into it
-            // is still in flight. Without this fence a deferred CUDA "illegal memory
-            // access" can surface (only with CUDA_LAUNCH_BLOCKING=0).
-            if (backend) {
-                ggml_backend_synchronize(backend);
+                ggml_backend_tensor_copy(mbuf_cur.org[i], mbuf_cur.cpy[i]);
             }
         }
     }
@@ -2914,6 +2917,14 @@ public:
             ggml_backend_view_init(mbuf.org.back());
         }
 
+        // Drain every backend before restoring into the LIVE KV/recurrent tensors.
+        // As in the write path, decode runs asynchronously (and via cudaGraphLaunch
+        // with CUDA graphs enabled); without this barrier the restore copy races the
+        // in-flight decode graph.
+        if (sched_) {
+            ggml_backend_sched_synchronize(sched_);
+        }
+
         for (auto & [buft, mbuf] : mbufs_new) {
             const auto & mbuf_cur = mbufs.at(buft);
 
@@ -2921,23 +2932,14 @@ public:
                 GGML_ABORT("%s: memory buffer mismatch\n", __func__);
             }
 
-            ggml_backend_t backend = sched_ ? find_backend_for_buft(sched_, buft) : nullptr;
+            // Restore synchronously on the isolated per-thread stream. The decode has
+            // been drained above, and the synchronous ggml_backend_tensor_copy runs the
+            // D2D copy on cudaStreamPerThread with its own cudaStreamSynchronize. That
+            // host-side sync establishes a happens-before so the next decode graph reads
+            // fully-restored state, while keeping the restore off the scheduler's
+            // compute/graph stream so it never interleaves with CUDA-graph replay.
             for (size_t i = 0; i < mbuf_cur.org.size(); ++i) {
-                if (backend) {
-                    ggml_backend_tensor_copy_async(backend, backend, mbuf_cur.cpy[i], mbuf.org[i]);
-                } else {
-                    ggml_backend_tensor_copy(mbuf_cur.cpy[i], mbuf.org[i]);
-                }
-            }
-
-            // The async copies above restore the checkpoint into the LIVE recurrent/KV
-            // tensors out-of-band, outside the sched's stream/event graph. Fence them
-            // before this destructor returns so the restored state is fully materialized
-            // before the caller launches the next decode graph that reads these tensors.
-            // Without this fence the decode kernels race the in-flight copy and trigger a
-            // deferred CUDA "illegal memory access" (only with CUDA_LAUNCH_BLOCKING=0).
-            if (backend) {
-                ggml_backend_synchronize(backend);
+                ggml_backend_tensor_copy(mbuf_cur.cpy[i], mbuf.org[i]);
             }
         }
 
