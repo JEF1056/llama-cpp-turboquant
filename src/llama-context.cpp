@@ -2708,19 +2708,6 @@ public:
     }
 
     ~llama_io_write_device() {
-        // Drain all pending scheduler compute before the out-of-band snapshot
-        // copies below read the live KV/recurrent tensors. At long context the
-        // backend may still be running decode kernels and asynchronous
-        // triattention KV eviction that mutate these tensors, possibly on a
-        // different stream than the snapshot copy. Without this fence the copy
-        // can race those writes and surface a deferred CUDA "illegal memory
-        // access" at the first cudaStreamSynchronize (only with
-        // CUDA_LAUNCH_BLOCKING=0). The post-copy fence below only orders work
-        // issued after the copy, not the compute that precedes it.
-        if (sched_) {
-            ggml_backend_sched_synchronize(sched_);
-        }
-
         llama_memory_buffers mbufs_new;
 
         for (const auto & winfo : winfos) {
