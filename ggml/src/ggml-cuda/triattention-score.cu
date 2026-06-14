@@ -320,6 +320,22 @@ int tria_cuda_global_begin(int n_old, int n_new, const int * key_pos_scored,
                            int cur_pos, int nkv, int gqa, int fc,
                            const float * global_init) {
     if (fc <= 0 || fc > TRIA_GPU_MAX_FC) return -1;
+
+    // Entry fence: this scorer issues all its work on the legacy default stream
+    // (stream 0), but ggml-cuda creates its compute/copy streams with
+    // cudaStreamNonBlocking (common.cuh), which explicitly opt OUT of the
+    // implicit synchronization that stream 0 normally has with other streams.
+    // So in-flight ggml work (the just-completed decode forward pass) can still
+    // be running when we start allocating/copying/launching here, and the CUDA
+    // allocator may recycle device memory across the two unsynchronized streams
+    // -> use-after-free -> a deferred "illegal memory access". tria_cuda_global_download
+    // already fences at the END; mirror it at the START so the whole scoring pass
+    // is bracketed. (Previously the only entry sync was the incidental device sync
+    // inside cudaMalloc/cudaFree during ensure_capacity GROWTH passes, so the first
+    // pass at a new context length was safe but every subsequent steady-state pass
+    // — which skips the malloc — raced. Matches CUDA_LAUNCH_BLOCKING=1 being immune.)
+    TRIA_CUDA_OK(cudaDeviceSynchronize());
+
     g_ctx.n_new = n_new; g_ctx.n_old = n_old; g_ctx.nkv = nkv;
     g_ctx.gqa = gqa; g_ctx.fc = fc; g_ctx.cur_pos = cur_pos;
 
