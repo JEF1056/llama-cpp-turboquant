@@ -223,6 +223,105 @@ server_models::server_models(
         LOG_WRN("using original argv[0] as fallback: %s\n", argv[0]);
     }
     load_models();
+    // start the liveness watchdog after the initial mapping is populated
+    watchdog_th = std::thread([this]() { watchdog_loop(); });
+}
+
+server_models::~server_models() {
+    watchdog_stop.store(true);
+    if (watchdog_th.joinable()) {
+        watchdog_th.join();
+    }
+}
+
+// Probe a child's /health endpoint. Any HTTP response (even 503 "loading") means
+// the child's HTTP server is alive; only a transport-level failure (no response)
+// indicates a wedged/dead backend. /health is unauthenticated in llama-server.
+static bool probe_child_health(const std::string & host, int port) {
+    httplib::Client cli(host, port);
+    cli.set_connection_timeout(2, 0);
+    cli.set_read_timeout(2, 0);
+    cli.set_write_timeout(2, 0);
+    auto res = cli.Get("/health");
+    return static_cast<bool>(res);
+}
+
+void server_models::mark_backend_dead(const std::string & name, subprocess_s * proc) {
+    std::unique_lock<std::mutex> lk(mutex);
+    auto it = mapping.find(name);
+    if (it != mapping.end() && it->second.subproc.get() == proc && it->second.meta.is_running()) {
+        it->second.meta.status    = SERVER_MODEL_STATUS_UNLOADED;
+        it->second.meta.exit_code = 1;
+        it->second.health_fail_count = 0;
+        cv.notify_all();
+    }
+}
+
+void server_models::watchdog_loop() {
+    struct probe_t {
+        std::string                   name;
+        std::shared_ptr<subprocess_s> subproc; // keep the struct alive while we probe it
+        int                           port;
+        server_model_status           st;
+    };
+    while (!watchdog_stop.load()) {
+        // 1) snapshot running instances under the lock (no blocking work here).
+        //    hold a shared_ptr so a concurrent reap/replace can't free the subprocess
+        //    out from under us between snapshot and probe.
+        std::vector<probe_t> probes;
+        {
+            std::unique_lock<std::mutex> lk(mutex);
+            std::lock_guard<std::mutex> lk2(stop_mutex); // lock order: mutex -> stop_mutex
+            for (auto & [name, inst] : mapping) {
+                // skip models we are intentionally stopping: their HTTP server is down
+                // while the child flushes KV to disk, so /health would falsely fail and
+                // a SIGKILL here would abort the graceful KVC save.
+                if (stopping_models.find(name) != stopping_models.end()) {
+                    continue;
+                }
+                if (inst.meta.status == SERVER_MODEL_STATUS_LOADED ||
+                    inst.meta.status == SERVER_MODEL_STATUS_SLEEPING) {
+                    probes.push_back({name, inst.subproc, inst.meta.port, inst.meta.status});
+                }
+            }
+        }
+        // 2) probe OUTSIDE the lock (subprocess_alive + /health may block briefly)
+        for (auto & p : probes) {
+            if (watchdog_stop.load()) {
+                break;
+            }
+            subprocess_s * proc = p.subproc.get();
+            bool dead   = !subprocess_alive(proc);
+            bool wedged = false;
+            if (!dead && p.st == SERVER_MODEL_STATUS_LOADED) {
+                // /health is served on the child's HTTP thread, independent of the
+                // inference loop, so it answers even mid-generation. Require several
+                // consecutive failures before declaring the backend wedged.
+                const bool healthy = probe_child_health(CHILD_ADDR, p.port);
+                std::unique_lock<std::mutex> lk(mutex);
+                auto it = mapping.find(p.name);
+                if (it != mapping.end() && it->second.subproc.get() == proc) {
+                    if (healthy) {
+                        it->second.health_fail_count = 0;
+                    } else {
+                        wedged = (++it->second.health_fail_count >= 3);
+                    }
+                }
+            }
+            if (dead || wedged) {
+                SRV_WRN("watchdog: model %s backend %s — marking UNLOADED for respawn\n",
+                    p.name.c_str(), dead ? "exited" : "unresponsive");
+                // force-kill so the child's stdout closes and the monitor thread
+                // unblocks to reap the process (clears the zombie).
+                subprocess_terminate(proc);
+                mark_backend_dead(p.name, proc);
+            }
+        }
+        // ~2s poll, interruptible
+        for (int i = 0; i < 20 && !watchdog_stop.load(); ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+    }
 }
 
 void server_models::add_model(server_model_meta && meta) {
@@ -1153,45 +1252,64 @@ bool server_models::ensure_model_ready(const std::string & name) {
 }
 
 server_http_res_ptr server_models::proxy_request(const server_http_req & req, const std::string & method, const std::string & name, bool update_last_used) {
-    auto meta = get_meta(name);
-    if (!meta.has_value()) {
-        throw std::runtime_error("model name=" + name + " is not found");
+    // Retry once if the backend dies during the connection phase (before any
+    // response bytes reach the client). A respawned child restores conversation KV
+    // from slot-save-path on startup, so the retried request resumes with context.
+    constexpr int MAX_ATTEMPTS = 2;
+    for (int attempt = 1; attempt <= MAX_ATTEMPTS; ++attempt) {
+        auto meta = get_meta(name);
+        if (!meta.has_value()) {
+            throw std::runtime_error("model name=" + name + " is not found");
+        }
+        if (!meta->is_running()) {
+            throw std::invalid_argument("model name=" + name + " is not running");
+        }
+        if (update_last_used) {
+            std::unique_lock<std::mutex> lk(mutex);
+            mapping[name].meta.last_used = ggml_time_ms();
+        }
+        subprocess_s * cur_proc = nullptr;
+        {
+            std::unique_lock<std::mutex> lk(mutex);
+            mapping[name].active_connections++;
+            cur_proc = mapping[name].subproc.get();
+        }
+        SRV_INF("proxying request to model %s on port %d\n", name.c_str(), meta->port);
+        std::string proxy_path = req.path;
+        if (!req.query_string.empty()) {
+            proxy_path += '?' + req.query_string;
+        }
+        auto proxy = std::make_unique<server_http_proxy>(
+                method,
+                "http",
+                CHILD_ADDR,
+                meta->port,
+                proxy_path,
+                req.headers,
+                req.body,
+                req.files,
+                req.should_stop,
+                base_params.timeout_read,
+                base_params.timeout_write
+                );
+        proxy->cleanup = [this, name]() {
+            std::unique_lock<std::mutex> lk(mutex);
+            mapping[name].active_connections--;
+            cv.notify_all();
+        };
+
+        if (attempt < MAX_ATTEMPTS && proxy->is_backend_down()) {
+            SRV_WRN("backend for model %s is down (attempt %d/%d) — respawning and retrying\n",
+                name.c_str(), attempt, MAX_ATTEMPTS);
+            proxy.reset(); // runs cleanup() → active_connections--
+            mark_backend_dead(name, cur_proc); // flip → UNLOADED (guarded by proc match)
+            ensure_model_ready(name); // respawn + block until ready
+            continue;
+        }
+        return proxy;
     }
-    if (!meta->is_running()) {
-        throw std::invalid_argument("model name=" + name + " is not running");
-    }
-    if (update_last_used) {
-        std::unique_lock<std::mutex> lk(mutex);
-        mapping[name].meta.last_used = ggml_time_ms();
-    }
-    {
-        std::unique_lock<std::mutex> lk(mutex);
-        mapping[name].active_connections++;
-    }
-    SRV_INF("proxying request to model %s on port %d\n", name.c_str(), meta->port);
-    std::string proxy_path = req.path;
-    if (!req.query_string.empty()) {
-        proxy_path += '?' + req.query_string;
-    }
-    auto proxy = std::make_unique<server_http_proxy>(
-            method,
-            "http",
-            CHILD_ADDR,
-            meta->port,
-            proxy_path,
-            req.headers,
-            req.body,
-            req.files,
-            req.should_stop,
-            base_params.timeout_read,
-            base_params.timeout_write
-            );
-    proxy->cleanup = [this, name]() {
-        std::unique_lock<std::mutex> lk(mutex);
-        mapping[name].active_connections--;
-        cv.notify_all();
-    };
-    return proxy;
+    // unreachable: the final attempt always returns its proxy
+    throw std::runtime_error("proxy_request: exhausted retries for model " + name);
 }
 
 bool server_models::is_child_server() {
@@ -1736,12 +1854,15 @@ server_http_proxy::server_http_proxy(
 
     // start the proxy thread
     SRV_DBG("start proxy thread %s %s\n", req.method.c_str(), req.path.c_str());
-    this->thread = std::thread([cli, pipe, req]() {
+    this->backend_down = std::make_shared<std::atomic<bool>>(false);
+    auto backend_down = this->backend_down; // capture into the detached thread
+    this->thread = std::thread([cli, pipe, req, backend_down]() {
         auto result = cli->send(std::move(req));
         if (result.error() != httplib::Error::Success) {
             auto err_str = httplib::to_string(result.error());
             SRV_ERR("http client error: %s\n", err_str.c_str());
-            pipe->write({{}, 500, "", ""}); // header
+            backend_down->store(true); // set BEFORE writing the header chunk
+            pipe->write({{}, 502, "", ""}); // header (502 = upstream gone)
             pipe->write({{}, 0, "proxy error: " + err_str, ""}); // body
         }
         pipe->close_write(); // signal EOF to reader

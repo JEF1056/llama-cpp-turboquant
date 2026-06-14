@@ -5,11 +5,13 @@
 #include "server-common.h"
 #include "server-http.h"
 
+#include <atomic>
 #include <mutex>
 #include <condition_variable>
 #include <functional>
 #include <memory>
 #include <set>
+#include <thread>
 
 // Signals between router parent and model child processes.
 // Also used by server.cpp (the child process entry point).
@@ -115,6 +117,7 @@ private:
         server_model_meta meta;
         FILE * stdin_file = nullptr;
         int active_connections = 0; // number of in-flight proxy requests; protected by mutex
+        int health_fail_count = 0;  // consecutive watchdog /health failures; protected by mutex
     };
 
     std::mutex mutex;
@@ -126,6 +129,11 @@ private:
     std::mutex stop_mutex;
     std::condition_variable cv_stop;
     std::set<std::string> stopping_models;
+
+    // liveness watchdog: detects children that crashed/wedged (e.g. CUDA abort that
+    // does not promptly close stdout) and flips them UNLOADED so the next request respawns.
+    std::thread watchdog_th;
+    std::atomic<bool> watchdog_stop{false};
 
     // set to true while load_models() is executing a reload; load() will wait until clear
     bool is_reloading = false;
@@ -145,8 +153,16 @@ private:
     // not thread-safe, caller must hold mutex
     void add_model(server_model_meta && meta);
 
+    // background loop that polls running children for liveness and recovers dead ones
+    void watchdog_loop();
+
+    // flip a running instance to UNLOADED so the next request respawns it.
+    // guarded by proc: ignored if the current instance's subprocess differs.
+    void mark_backend_dead(const std::string & name, subprocess_s * proc);
+
 public:
     server_models(const common_params & params, int argc, char ** argv);
+    ~server_models();
 
     // (re-)load the list of models from various sources and prepare the metadata mapping
     // - if this is called the first time, simply populate the metadata
@@ -240,6 +256,10 @@ struct server_models_routes {
  */
 struct server_http_proxy : server_http_res {
     std::function<void()> cleanup = nullptr;
+    // set by the send thread on a transport-level failure (backend gone/unreachable).
+    // reliable once the constructor returns (it blocks on the first response chunk).
+    std::shared_ptr<std::atomic<bool>> backend_down;
+    bool is_backend_down() const { return backend_down && backend_down->load(); }
 public:
     server_http_proxy(const std::string & method,
                       const std::string & scheme,
