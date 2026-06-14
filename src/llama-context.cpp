@@ -2946,7 +2946,18 @@ public:
             const auto & mbuf_cur = mbufs.at(buft);
 
             if (!mbuf_cur.buf || mbuf_cur.n_tensors != mbuf.n_tensors || mbuf_cur.total_size != mbuf.total_size) {
-                GGML_ABORT("%s: memory buffer mismatch\n", __func__);
+                // Defensive guard (belt-and-suspenders alongside the server's multi-slot
+                // host-path fallback): the on-device snapshot topology no longer matches
+                // the live restore target. A destructor cannot throw safely (it is
+                // implicitly noexcept), so instead of GGML_ABORT - which would take down
+                // the whole server and every concurrent request with it - log loudly and
+                // skip this buffer's restore so the failure stays contained to one request.
+                LLAMA_LOG_ERROR("%s: memory buffer mismatch (snapshot n_tensors=%d total_size=%zu, "
+                                "live n_tensors=%d total_size=%zu, buf=%s); skipping on-device "
+                                "checkpoint restore for this buffer\n",
+                                __func__, mbuf_cur.n_tensors, mbuf_cur.total_size,
+                                mbuf.n_tensors, mbuf.total_size, mbuf_cur.buf ? "present" : "null");
+                continue;
             }
 
             // Restore synchronously on the isolated per-thread stream. The decode has
