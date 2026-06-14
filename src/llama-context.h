@@ -30,7 +30,8 @@ struct llama_memory_context_i;
 // stores copy of the memory in device buffer. used for fast state save/load
 struct llama_memory_buffer {
     int n_tensors = 0;
-    size_t total_size = 0;
+    size_t total_size = 0;   // logical content bytes of the current checkpoint
+    size_t capacity   = 0;   // bytes actually allocated in `buf` (>= total_size, with headroom)
 
     ggml_backend_buffer_ptr buf;
 

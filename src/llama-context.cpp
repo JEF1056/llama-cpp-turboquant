@@ -2748,59 +2748,75 @@ public:
         for (auto & [buft, mbuf] : mbufs_new) {
             auto & mbuf_cur = mbufs[buft];
 
-            bool need_alloc = false;
+            ggml_backend_t backend = sched_ ? find_backend_for_buft(sched_, buft) : nullptr;
 
-            need_alloc = need_alloc || (!mbuf_cur.buf);
-            need_alloc = need_alloc || (mbuf_cur.org.size() != mbuf.org.size());
-            // Grow-only: only reallocate when new checkpoint is larger than existing buffer.
-            // Avoids a CUDA alloc/free on every spec-decode step when accepted-token count
-            // grows by a few cells (tiny total_size delta).
-            need_alloc = need_alloc || (mbuf.total_size > mbuf_cur.total_size);
-
-            if (!need_alloc) {
+            // The live KV/recurrent ring is fixed-size, but the checkpoint grows by a few
+            // cells each accepted spec-decode step, so the tensor topology (shapes / source
+            // views) differs from the stored checkpoint on essentially every step at high
+            // context. Detect that here; an unchanged topology lets us reuse the existing
+            // org/cpy tensors verbatim.
+            bool topology_changed = (!mbuf_cur.buf) || (mbuf_cur.org.size() != mbuf.org.size());
+            if (!topology_changed) {
                 for (size_t i = 0; i < mbuf_cur.org.size(); ++i) {
                     auto * org0 = mbuf_cur.org[i];
                     auto * org1 = mbuf.org[i];
 
-                    if (!ggml_are_same_shape(org0, org1)) {
-                        need_alloc = true;
-                        break;
-                    }
-
-                    if (org0->view_src != org1->view_src || org0->view_offs != org1->view_offs) {
-                        need_alloc = true;
+                    if (!ggml_are_same_shape(org0, org1) ||
+                        org0->view_src != org1->view_src || org0->view_offs != org1->view_offs) {
+                        topology_changed = true;
                         break;
                     }
                 }
             }
 
-            if (need_alloc) {
-                if (!mbuf_cur.buf || mbuf_cur.total_size != mbuf.total_size) {
-                    mbuf_cur = std::move(mbuf);
-
-                    mbuf_cur.buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(mbuf_cur.ctx.get(), buft));
-
-                    LLAMA_LOG_INFO("%s: allocated '%s' buffer %.3f MiB\n", __func__, ggml_backend_buft_name(buft), mbuf.total_size/1024.0/1024.0);
-                } else {
-                    //LLAMA_LOG_INFO("%s: reallocating tensors in '%s' buffer %.3f MiB\n", __func__, ggml_backend_buft_name(buft), mbuf.total_size/1024.0/1024.0);
-
-                    // save the old buffer and allocate the new tensors in it
-                    auto buf = std::move(mbuf_cur.buf);
-
-                    mbuf_cur = std::move(mbuf);
-
-                    ggml_tallocr talloc = ggml_tallocr_new(buf.get());
-
-                    for (size_t i = 0; i < mbuf_cur.org.size(); ++i) {
-                        ggml_backend_view_init(mbuf_cur.org[i]);
-                        ggml_tallocr_alloc(&talloc, mbuf_cur.cpy[i]);
-                    }
-
-                    mbuf_cur.buf = std::move(buf);
+            if (topology_changed) {
+                // Device bytes needed to pack the new copy tensors (with per-tensor alignment).
+                const size_t align = ggml_backend_buft_get_alignment(buft);
+                size_t needed = 0;
+                for (auto * t : mbuf.cpy) {
+                    needed += GGML_PAD(ggml_backend_buft_get_alloc_size(buft, t), align);
                 }
+
+                // cudaMalloc/cudaFree globally synchronize and, if issued while a CUDA-graph
+                // replay is in flight on this backend's stream, corrupt the replay (surfacing
+                // later as a deferred "illegal memory access"). At ~160k the checkpoint grows a
+                // few cells every spec step, which previously triggered a ~242 MiB realloc many
+                // times per second. Allocate with headroom so the common case re-suballocates
+                // into the existing buffer (no CUDA alloc/free), and only ever grow ~O(log)
+                // times per generation.
+                const bool need_bigger = (!mbuf_cur.buf) || (needed > mbuf_cur.capacity);
+
+                size_t capacity = mbuf_cur.capacity;
+                auto buf = std::move(mbuf_cur.buf);
+                if (need_bigger) {
+                    // Drain any in-flight graph launch so the free/alloc below cannot straddle a
+                    // CUDA-graph replay on this backend's stream.
+                    if (backend) {
+                        ggml_backend_synchronize(backend);
+                    }
+                    buf.reset();
+                    const size_t headroom = needed + needed/4;
+                    const size_t floor    = needed + (size_t) 4*1024*1024;
+                    capacity = headroom > floor ? headroom : floor;
+                    buf.reset(ggml_backend_buft_alloc_buffer(buft, capacity));
+
+                    LLAMA_LOG_INFO("%s: grew '%s' checkpoint buffer to %.3f MiB (need %.3f MiB)\n",
+                        __func__, ggml_backend_buft_name(buft), capacity/1024.0/1024.0, needed/1024.0/1024.0);
+                }
+
+                mbuf_cur = std::move(mbuf);
+                mbuf_cur.capacity = capacity;
+
+                // Re-suballocate the new tensor set into the (possibly reused) device buffer.
+                // No CUDA alloc/free happens here when the buffer was reused.
+                ggml_tallocr talloc = ggml_tallocr_new(buf.get());
+                for (size_t i = 0; i < mbuf_cur.org.size(); ++i) {
+                    ggml_backend_view_init(mbuf_cur.org[i]);
+                    ggml_tallocr_alloc(&talloc, mbuf_cur.cpy[i]);
+                }
+                mbuf_cur.buf = std::move(buf);
             }
 
-            ggml_backend_t backend = sched_ ? find_backend_for_buft(sched_, buft) : nullptr;
             for (size_t i = 0; i < mbuf_cur.org.size(); ++i) {
                 if (backend) {
                     ggml_backend_tensor_copy_async(backend, backend, mbuf_cur.org[i], mbuf_cur.cpy[i]);
