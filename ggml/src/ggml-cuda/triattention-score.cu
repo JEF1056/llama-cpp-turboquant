@@ -45,7 +45,8 @@ struct tria_cuda_ctx {
     float * d_raw     = nullptr;      // [nkv * gqa * n_new]
     float * d_lscores = nullptr;      // [nkv * n_new]
     float * d_global  = nullptr;      // [n_old]
-    size_t  cap_krki  = 0;            // capacity (elements) of d_kr / d_ki
+    size_t  cap_kr    = 0;            // capacity (elements) of d_kr
+    size_t  cap_ki    = 0;            // capacity (elements) of d_ki (separate: shared cap left d_ki under-sized on growth)
     size_t  cap_raw   = 0;
     size_t  cap_lsc   = 0;
     size_t  cap_keys  = 0;
@@ -322,8 +323,8 @@ int tria_cuda_global_begin(int n_old, int n_new, const int * key_pos_scored,
     g_ctx.n_new = n_new; g_ctx.n_old = n_old; g_ctx.nkv = nkv;
     g_ctx.gqa = gqa; g_ctx.fc = fc; g_ctx.cur_pos = cur_pos;
 
-    if (ensure_capacity(&g_ctx.d_kr, &g_ctx.cap_krki, (size_t)nkv * n_new * fc)) return -1;
-    if (ensure_capacity(&g_ctx.d_ki, &g_ctx.cap_krki, (size_t)nkv * n_new * fc)) return -1;
+    if (ensure_capacity(&g_ctx.d_kr, &g_ctx.cap_kr, (size_t)nkv * n_new * fc)) return -1;
+    if (ensure_capacity(&g_ctx.d_ki, &g_ctx.cap_ki, (size_t)nkv * n_new * fc)) return -1;
     if (ensure_capacity_i(&g_ctx.d_key_pos, &g_ctx.cap_keys, (size_t)n_new)) return -1;
     if (ensure_capacity(&g_ctx.d_raw, &g_ctx.cap_raw, (size_t)nkv * gqa * n_new)) return -1;
     if (ensure_capacity(&g_ctx.d_lscores, &g_ctx.cap_lsc, (size_t)nkv * n_new)) return -1;
