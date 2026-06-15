@@ -18,8 +18,6 @@
 	import { MessageRole, ChatMessageStatsView } from '$lib/enums';
 	import { config } from '$lib/stores/settings.svelte';
 	import { isRouterMode } from '$lib/stores/server.svelte';
-	import { modelsStore } from '$lib/stores/models.svelte';
-	import { ServerModelStatus } from '$lib/enums';
 
 	import { hasAgenticContent } from '$lib/utils';
 
@@ -270,13 +268,10 @@
 					<ModelsSelectorDropdown
 						currentModel={displayedModel}
 						disabled={isLoading()}
-						onModelChange={async (modelId: string, modelName: string) => {
-							const status = modelsStore.getModelStatus(modelId);
-
-							if (status !== ServerModelStatus.LOADED) {
-								await modelsStore.loadModel(modelId);
-							}
-
+						onModelChange={(_modelId: string, modelName: string) => {
+							// Rely on the router's auto-switch: regenerating names this
+							// model in the request, so the server loads it on demand
+							// (models_autoload). No eager /models/load force-switch needed.
 							onRegenerate(modelName);
 							return true;
 						}}

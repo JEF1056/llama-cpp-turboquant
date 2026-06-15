@@ -146,13 +146,13 @@ export function useModelsSelector(opts: UseModelsSelectorOptions): UseModelsSele
 			});
 		}
 
-		if (!onModelChange && isRouter && !modelsStore.isModelLoaded(option.model)) {
-			isLoadingModel = true;
-			modelsStore
-				.loadModel(option.model)
-				.catch((error) => console.error('Failed to load model:', error))
-				.finally(() => (isLoadingModel = false));
-		}
+		// Do NOT eagerly POST /models/load here. Selecting a model only updates
+		// internal selection state (selectModelById above); in router mode the
+		// server auto-loads the model on the first chat/completion request that
+		// names it (models_autoload). Eager-loading on selection would force-switch
+		// — evicting the currently-loaded model — the moment a different model is
+		// highlighted, even before the user sends anything. Manual load/unload
+		// remains available via the per-model buttons in ModelsSelectorOption.
 	}
 
 	function getDisplayOption(): ModelOption | undefined {
