@@ -138,6 +138,19 @@ static __device__ __forceinline__ void turbo_rotate_forward_64(float * x) {
     for (int i = 0; i < 64; i++) x[i] *= TURBO_WHT_SIGNS2_64[i];
 }
 
+// ---- Inverse rotation: signs2 → FWHT → signs1 ----
+// Inverse of turbo_rotate_forward. Matches the CPU inverse WHT in
+// src/triattention-runtime.c (tria_inverse_wht_group): multiply by SIGNS2,
+// run the normalized FWHT (turbo_fwht_128 includes the 1/sqrt(128) factor),
+// then multiply by SIGNS1. Used to recover the pre-rotation K values from a
+// dequantized (still WHT-rotated) turbo block for TriAttention scoring.
+
+static __device__ __forceinline__ void turbo_inverse_wht_128(float * x) {
+    for (int i = 0; i < 128; i++) x[i] *= TURBO_WHT_SIGNS2[i];
+    turbo_fwht_128(x);
+    for (int i = 0; i < 128; i++) x[i] *= TURBO_WHT_SIGNS1[i];
+}
+
 // ---- InnerQ per-channel equalization ----
 // Equalizes K channel variances before WHT rotation to reduce quantization error.
 // Enabled via TURBO_INNERQ=N env var (N = calibration token count).

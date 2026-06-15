@@ -5,6 +5,10 @@
 #include "llama-model.h"
 #include "llama-context.h"
 
+#ifdef GGML_TRIA_CUDA
+#include "triattention-cuda.h"
+#endif
+
 #include <algorithm>
 #include <cassert>
 #include <cmath>
@@ -2124,12 +2128,36 @@ bool llama_kv_cache::triattention_compact(const std::vector<uint32_t> & keep_pos
         cells.set(0, copied_cells);
     }
 
-    // Phase 2: Physical tensor memory compaction on the GPU/backend.
-    // We use a backend-agnostic approach: reading the kept tokens into a host buffer and
-    // writing them back to the contiguous [0...num_kept-1] range.
+    // Phase 2: Physical tensor memory compaction.
+    // Fallback path is backend-agnostic: ggml_backend_tensor_copy moves each
+    // contiguous kept range directly (device-to-device on CUDA). The GPU fast
+    // path below replaces that per-chunk copy loop with a single gather kernel
+    // per layer when the cache lives in CUDA memory.
 
     const uint32_t num_kept = keep_positions.size();
     if (num_kept == 0) return true;
+
+#ifdef GGML_TRIA_CUDA
+    // GPU fast path: a single gather kernel per layer replaces the CPU-driven loop
+    // of thousands of individually-synchronized per-chunk D2D copies. Eligible when
+    // the KV tensors live in a non-host (CUDA) buffer and TRIA_GPU_COMPACT != "0".
+    // Per layer the GPU attempt is independent, so a failure cleanly falls back to
+    // the backend-agnostic copy loop below for that layer only.
+    bool gpu_compact = false;
+    if (!layers.empty() && !ggml_backend_buffer_is_host(layers[0].k->buffer)) {
+        static int gpu_enabled = -1;
+        if (gpu_enabled < 0) {
+            const char * e = getenv("TRIA_GPU_COMPACT");
+            gpu_enabled = (e && e[0] == '0') ? 0 : 1;  // default ON
+        }
+        if (gpu_enabled) {
+            // keep_positions are physical row indices (legacy path); upload once.
+            static std::vector<int> keep_i;
+            keep_i.assign(keep_positions.begin(), keep_positions.end());
+            gpu_compact = (tria_cuda_compact_begin(keep_i.data(), (int) num_kept) == 0);
+        }
+    }
+#endif
 
     for (int il = 0; il < (int) layers.size(); ++il) {
         auto & layer = layers[il];
@@ -2139,6 +2167,13 @@ bool llama_kv_cache::triattention_compact(const std::vector<uint32_t> & keep_pos
 
         const size_t k_size_row = ggml_row_size(k->type, k->ne[0]);
         const size_t v_size_row = ggml_row_size(v->type, v->ne[0]);
+
+#ifdef GGML_TRIA_CUDA
+        if (gpu_compact &&
+            tria_cuda_compact_layer(k->data, k_size_row, v->data, v_size_row) == 0) {
+            continue;  // layer compacted on GPU
+        }
+#endif
 
         // Batch copies by finding contiguous ranges in keep_positions and copying directly on the device
         uint32_t i = 0;

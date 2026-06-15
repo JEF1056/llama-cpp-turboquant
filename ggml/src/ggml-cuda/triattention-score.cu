@@ -18,6 +18,7 @@
  */
 
 #include "common.cuh"
+#include "turbo-quant.cuh"
 
 #include <math.h>
 #include <stdio.h>
@@ -58,6 +59,13 @@ struct tria_cuda_ctx {
     int     gqa     = 0;
     int     fc      = 0;
     int     cur_pos = 0;
+
+    // physical KV compaction (gather) buffers
+    int   * d_keep      = nullptr;   // [num_kept] kept physical row indices
+    size_t  cap_keep    = 0;
+    void  * d_scratch   = nullptr;   // [num_kept * max_row_bytes] gather destination
+    size_t  cap_scratch = 0;         // capacity in bytes
+    int     num_kept    = 0;
 };
 
 static tria_cuda_ctx g_ctx;
@@ -86,6 +94,15 @@ static int ensure_capacity_i(int ** ptr, size_t * cap, size_t need) {
     *ptr = nullptr;
     TRIA_CUDA_OK(cudaMalloc((void **)ptr, need * sizeof(int)));
     *cap = need;
+    return 0;
+}
+
+static int ensure_capacity_bytes(void ** ptr, size_t * cap, size_t need_bytes) {
+    if (*cap >= need_bytes && *ptr) return 0;
+    if (*ptr) cudaFree(*ptr);
+    *ptr = nullptr;
+    TRIA_CUDA_OK(cudaMalloc(ptr, need_bytes));
+    *cap = need_bytes;
     return 0;
 }
 
@@ -286,6 +303,100 @@ __global__ void tria_k_fill(float * p, int n, float val) {
     if (i < n) p[i] = val;
 }
 
+// ----------------------------------------------------------------------------
+// Physical KV compaction gather kernel.
+// Each output row `r` in [0, num_kept) copies `row_size` bytes from source row
+// keep[r] of the live tensor into the contiguous scratch buffer. Gathering into
+// a separate scratch (rather than the live tensor) avoids the read-after-write
+// race of an in-place parallel gather (thread for row r' < r may read source
+// row r while the thread for row r overwrites it). The 16-byte fast path is used
+// when both the row stride and the data pointers are 16-byte aligned (turbo K/V
+// rows are padded to a 128-byte multiple, so this holds in practice); a byte
+// tail handles any remainder. blockIdx.y strides over rows to stay within the
+// 65535 gridDim.y limit at large num_kept.
+// ----------------------------------------------------------------------------
+__global__ void tria_gather_rows(
+        char       * __restrict__ dst,   // scratch [num_kept * row_size]
+        const char * __restrict__ src,   // live tensor data
+        const int  * __restrict__ keep,  // [num_kept] source row indices
+        int num_kept, size_t row_size) {
+    // When row_size is a multiple of 16 every per-row base (row*row_size) is also
+    // 16-byte aligned (the CUDA allocation base is 256-aligned), so the uint4 fast
+    // path is safe. Otherwise fall back to a plain byte copy to avoid a misaligned
+    // vector access.
+    const bool vec = (row_size & (size_t)0xF) == 0;
+    for (int row = blockIdx.y; row < num_kept; row += gridDim.y) {
+        const size_t base_dst = (size_t) row * row_size;
+        const size_t base_src = (size_t) keep[row] * row_size;
+        const size_t stride   = (size_t) gridDim.x * blockDim.x;
+        const size_t t0       = blockIdx.x * blockDim.x + threadIdx.x;
+
+        if (vec) {
+            const size_t n16 = row_size >> 4;
+            const uint4 * s16 = reinterpret_cast<const uint4 *>(src + base_src);
+            uint4       * d16 = reinterpret_cast<uint4 *>(dst + base_dst);
+            for (size_t w = t0; w < n16; w += stride) {
+                d16[w] = s16[w];
+            }
+        } else {
+            for (size_t b = t0; b < row_size; b += stride) {
+                dst[base_dst + b] = src[base_src + b];
+            }
+        }
+    }
+}
+
+// ============================================================================
+// Turbo K dequant + inverse WHT + complex-pair extraction (GPU offload).
+//
+// Replaces the CPU stage in triattention-runtime.c (ggml_backend_tensor_get +
+// traits->to_float + tria_inverse_wht_row + the per-kvi complex-pair extract)
+// for turbo K caches. One block per (kv head, scored token): 128 threads
+// dequantize the head's first 128-element WHT group from the quantized K tensor
+// in device memory, thread 0 runs the inverse WHT (matches the CPU
+// tria_inverse_wht_group exactly), then threads 0..fc-1 write the post-RoPE
+// complex pairs straight into the scorer's d_kr/d_ki buffers.
+//
+// Only the first 128-group of each head is needed: the scorer reads logical
+// indices 0..2*fc-1 (fc <= 64), all within that group, so padded heads spanning
+// multiple 128-groups still only require one inverse WHT here.
+// ============================================================================
+template <typename block_t, float (*deq_elem)(const block_t *, int, float)>
+__global__ void tria_k_dequant(
+        const char * __restrict__ d_base, int phys_base, size_t row_size,
+        int blocks_per_head, int n_new, int fc, int rope_neox,
+        float * __restrict__ d_kr, float * __restrict__ d_ki) {
+    const int kvi = blockIdx.x;
+    const int s   = blockIdx.y;
+    const int t   = threadIdx.x;            // 0..127
+
+    __shared__ float g[128];
+
+    const char *    row = d_base + (size_t)(phys_base + s) * row_size;
+    const block_t * blk = reinterpret_cast<const block_t *>(row) + (size_t)kvi * blocks_per_head;
+
+    const float norm = __half2float(blk->norm);
+    g[t] = deq_elem(blk, t, norm);
+    __syncthreads();
+
+    // Inverse WHT on the 128-element group (serial; matches CPU bit-for-bit).
+    if (t == 0) {
+        turbo_inverse_wht_128(g);
+    }
+    __syncthreads();
+
+    if (t < fc) {
+        const size_t out = ((size_t)kvi * n_new + s) * fc + t;
+        if (rope_neox) {
+            d_kr[out] = g[t];
+            d_ki[out] = g[fc + t];
+        } else {
+            d_kr[out] = g[2 * t + 0];
+            d_ki[out] = g[2 * t + 1];
+        }
+    }
+}
+
 // ============================================================================
 // Host entry points (extern "C")
 // ============================================================================
@@ -351,26 +462,12 @@ int tria_cuda_global_begin(int n_old, int n_new, const int * key_pos_scored,
     return 0;
 }
 
-// Score one attention layer. kr/ki are host [nkv][kvi_stride][fc] (kvi_stride in
-// elements-of-fc-rows, i.e. row index stride per KV head).
-int tria_cuda_score_layer(const float * kr_host, const float * ki_host,
-                          int kvi_stride_rows,
-                          int n_new, int nkv, int fc, int gqa,
-                          int layer_idx, int num_heads,
-                          float max_beta, float layer_weight, int score_start) {
-    if (fc <= 0 || fc > TRIA_GPU_MAX_FC) return -1;
-
-    // Upload kr/ki compacted to [nkv * n_new * fc]: copy per-kv slice (host has
-    // a larger n_old row stride, we only need the first n_new rows).
-    for (int kvi = 0; kvi < nkv; kvi++) {
-        const float * src_r = kr_host + (size_t)kvi * kvi_stride_rows * fc;
-        const float * src_i = ki_host + (size_t)kvi * kvi_stride_rows * fc;
-        float * dst_r = g_ctx.d_kr + (size_t)kvi * n_new * fc;
-        float * dst_i = g_ctx.d_ki + (size_t)kvi * n_new * fc;
-        TRIA_CUDA_OK(cudaMemcpy(dst_r, src_r, (size_t)n_new * fc * sizeof(float), cudaMemcpyHostToDevice));
-        TRIA_CUDA_OK(cudaMemcpy(dst_i, src_i, (size_t)n_new * fc * sizeof(float), cudaMemcpyHostToDevice));
-    }
-
+// Launch the 3 scoring kernels over d_kr/d_ki (already populated, either via the
+// host-copy path in tria_cuda_score_layer or the device dequant in
+// tria_cuda_dequant_layer). Returns 0 on success.
+static int tria_score_kernels(int n_new, int nkv, int fc, int gqa,
+                              int layer_idx, int num_heads,
+                              float max_beta, float layer_weight, int score_start) {
     const float * d_stats_layer = g_ctx.d_head_stats + (size_t)layer_idx * num_heads * 4 * fc;
 
     // Kernel 1: raw scores
@@ -398,10 +495,95 @@ int tria_cuda_score_layer(const float * kr_host, const float * ki_host,
 
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
-        fprintf(stderr, "tria_cuda_score_layer: kernel launch failed: %s\n", cudaGetErrorString(err));
+        fprintf(stderr, "tria_score_kernels: kernel launch failed: %s\n", cudaGetErrorString(err));
         return -1;
     }
     return 0;
+}
+
+// Score one attention layer. kr/ki are host [nkv][kvi_stride][fc] (kvi_stride in
+// elements-of-fc-rows, i.e. row index stride per KV head).
+int tria_cuda_score_layer(const float * kr_host, const float * ki_host,
+                          int kvi_stride_rows,
+                          int n_new, int nkv, int fc, int gqa,
+                          int layer_idx, int num_heads,
+                          float max_beta, float layer_weight, int score_start) {
+    if (fc <= 0 || fc > TRIA_GPU_MAX_FC) return -1;
+
+    // Upload kr/ki compacted to [nkv * n_new * fc]: copy per-kv slice (host has
+    // a larger n_old row stride, we only need the first n_new rows).
+    for (int kvi = 0; kvi < nkv; kvi++) {
+        const float * src_r = kr_host + (size_t)kvi * kvi_stride_rows * fc;
+        const float * src_i = ki_host + (size_t)kvi * kvi_stride_rows * fc;
+        float * dst_r = g_ctx.d_kr + (size_t)kvi * n_new * fc;
+        float * dst_i = g_ctx.d_ki + (size_t)kvi * n_new * fc;
+        TRIA_CUDA_OK(cudaMemcpy(dst_r, src_r, (size_t)n_new * fc * sizeof(float), cudaMemcpyHostToDevice));
+        TRIA_CUDA_OK(cudaMemcpy(dst_i, src_i, (size_t)n_new * fc * sizeof(float), cudaMemcpyHostToDevice));
+    }
+
+    return tria_score_kernels(n_new, nkv, fc, gqa, layer_idx, num_heads,
+                              max_beta, layer_weight, score_start);
+}
+
+// Dequantize one turbo K layer directly from device memory into d_kr/d_ki,
+// applying the inverse WHT and extracting post-RoPE complex pairs on the GPU.
+// d_k is the K tensor's device data pointer; ktype is the ggml_type. padded_hd
+// is the physical per-head width (multiple of 128); fc/rope_neox match the
+// scorer. Replaces the CPU dequant+WHT+extract stage. Returns 0 on success,
+// -1 on unsupported type (caller should fall back to the CPU path).
+int tria_cuda_dequant_layer(const void * d_k, int ktype,
+                            int phys_base, int n_new, int nkv,
+                            int padded_hd, int fc, int rope_neox) {
+    if (fc <= 0 || fc > TRIA_GPU_MAX_FC) return -1;
+    if (padded_hd <= 0 || (padded_hd % 128) != 0) return -1;
+
+    const int blocks_per_head = padded_hd / 128;
+    const int blocks_per_row  = nkv * blocks_per_head;
+
+    size_t row_size = 0;
+    const dim3 grid(nkv, n_new);
+    const int  threads = 128;
+    const char * d_base = reinterpret_cast<const char *>(d_k);
+
+    switch (ktype) {
+        case GGML_TYPE_TURBO4_0:
+            row_size = (size_t)blocks_per_row * sizeof(block_turbo4_0);
+            tria_k_dequant<block_turbo4_0, turbo4_dequant_element><<<grid, threads>>>(
+                d_base, phys_base, row_size, blocks_per_head, n_new, fc, rope_neox,
+                g_ctx.d_kr, g_ctx.d_ki);
+            break;
+        case GGML_TYPE_TURBO3_0:
+            row_size = (size_t)blocks_per_row * sizeof(block_turbo3_0);
+            tria_k_dequant<block_turbo3_0, turbo3_dequant_element><<<grid, threads>>>(
+                d_base, phys_base, row_size, blocks_per_head, n_new, fc, rope_neox,
+                g_ctx.d_kr, g_ctx.d_ki);
+            break;
+        case GGML_TYPE_TURBO2_0:
+            row_size = (size_t)blocks_per_row * sizeof(block_turbo2_0);
+            tria_k_dequant<block_turbo2_0, turbo2_dequant_element><<<grid, threads>>>(
+                d_base, phys_base, row_size, blocks_per_head, n_new, fc, rope_neox,
+                g_ctx.d_kr, g_ctx.d_ki);
+            break;
+        default:
+            return -1;  // unsupported K type — caller falls back to CPU
+    }
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "tria_cuda_dequant_layer: kernel launch failed: %s\n", cudaGetErrorString(err));
+        return -1;
+    }
+    return 0;
+}
+
+// Score one attention layer whose d_kr/d_ki were already filled on-device by
+// tria_cuda_dequant_layer (no host->device copy). Returns 0 on success.
+int tria_cuda_score_layer_device(int n_new, int nkv, int fc, int gqa,
+                                 int layer_idx, int num_heads,
+                                 float max_beta, float layer_weight, int score_start) {
+    if (fc <= 0 || fc > TRIA_GPU_MAX_FC) return -1;
+    return tria_score_kernels(n_new, nkv, fc, gqa, layer_idx, num_heads,
+                              max_beta, layer_weight, score_start);
 }
 
 int tria_cuda_global_download(float * dst_host, int n) {
@@ -410,10 +592,75 @@ int tria_cuda_global_download(float * dst_host, int n) {
     return 0;
 }
 
+// Begin a physical KV compaction pass: upload the kept physical row indices once
+// (reused across all layers). num_kept rows will be gathered to [0, num_kept).
+int tria_cuda_compact_begin(const int * keep_positions, int num_kept) {
+    if (num_kept <= 0) return -1;
+
+    // Entry fence: the caller has already issued llama_synchronize, but mirror the
+    // scorer's bracketing so the gather is isolated from any ggml work still queued
+    // on the non-blocking compute/copy streams (see tria_cuda_global_begin).
+    TRIA_CUDA_OK(cudaDeviceSynchronize());
+
+    if (ensure_capacity_i(&g_ctx.d_keep, &g_ctx.cap_keep, (size_t)num_kept)) return -1;
+    TRIA_CUDA_OK(cudaMemcpy(g_ctx.d_keep, keep_positions, (size_t)num_kept * sizeof(int), cudaMemcpyHostToDevice));
+    g_ctx.num_kept = num_kept;
+    return 0;
+}
+
+// Compact one layer's K and V tensors in place: gather the kept rows into scratch
+// then copy them back to the contiguous [0, num_kept) range. k_data/v_data are the
+// CUDA device pointers (tensor->data); *_row_size is the per-row byte stride.
+// All work runs on cudaStreamPerThread (the same stream ggml uses for D2D copies),
+// so gather -> copy-back -> next gather are ordered without explicit per-op syncs;
+// a single stream sync at the end guards the host return.
+int tria_cuda_compact_layer(void * k_data, size_t k_row_size,
+                            void * v_data, size_t v_row_size) {
+    if (g_ctx.num_kept <= 0) return -1;
+    if (!k_data || k_row_size == 0) return -1;
+
+    const int num_kept = g_ctx.num_kept;
+    const size_t max_row = k_row_size > v_row_size ? k_row_size : v_row_size;
+    if (ensure_capacity_bytes(&g_ctx.d_scratch, &g_ctx.cap_scratch, (size_t)num_kept * max_row)) return -1;
+
+    cudaStream_t stream = cudaStreamPerThread;
+    const int    threads = 256;
+    const int    grid_y  = num_kept < 65535 ? num_kept : 65535;
+
+    // ---- K ----
+    {
+        const int grid_x = (int)((k_row_size + threads - 1) / threads);
+        dim3 grid(grid_x > 0 ? grid_x : 1, grid_y);
+        tria_gather_rows<<<grid, threads, 0, stream>>>(
+            (char *)g_ctx.d_scratch, (const char *)k_data, g_ctx.d_keep, num_kept, k_row_size);
+        TRIA_CUDA_OK(cudaMemcpyAsync(k_data, g_ctx.d_scratch,
+            (size_t)num_kept * k_row_size, cudaMemcpyDeviceToDevice, stream));
+    }
+
+    // ---- V ----
+    if (v_data && v_row_size > 0) {
+        const int grid_x = (int)((v_row_size + threads - 1) / threads);
+        dim3 grid(grid_x > 0 ? grid_x : 1, grid_y);
+        tria_gather_rows<<<grid, threads, 0, stream>>>(
+            (char *)g_ctx.d_scratch, (const char *)v_data, g_ctx.d_keep, num_kept, v_row_size);
+        TRIA_CUDA_OK(cudaMemcpyAsync(v_data, g_ctx.d_scratch,
+            (size_t)num_kept * v_row_size, cudaMemcpyDeviceToDevice, stream));
+    }
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "tria_cuda_compact_layer: launch failed: %s\n", cudaGetErrorString(err));
+        return -1;
+    }
+    TRIA_CUDA_OK(cudaStreamSynchronize(stream));
+    return 0;
+}
+
 void tria_cuda_cleanup(void) {
     cudaFree(g_ctx.d_head_stats); cudaFree(g_ctx.d_omega);
     cudaFree(g_ctx.d_kr); cudaFree(g_ctx.d_ki); cudaFree(g_ctx.d_key_pos);
     cudaFree(g_ctx.d_raw); cudaFree(g_ctx.d_lscores); cudaFree(g_ctx.d_global);
+    cudaFree(g_ctx.d_keep); cudaFree(g_ctx.d_scratch);
     g_ctx = tria_cuda_ctx();
 }
 

@@ -10,6 +10,8 @@
 #ifndef TRIATTENTION_CUDA_H
 #define TRIATTENTION_CUDA_H
 
+#include <stddef.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -36,8 +38,34 @@ int tria_cuda_score_layer(const float * kr_host, const float * ki_host,
                           int layer_idx, int num_heads,
                           float max_beta, float layer_weight, int score_start);
 
+/* Dequantize one turbo K layer straight from device memory into the scorer's
+ * d_kr/d_ki buffers, applying the inverse WHT and extracting post-RoPE complex
+ * pairs on the GPU (replaces the CPU dequant+WHT+extract stage). d_k is the K
+ * tensor's device data pointer; ktype is the ggml_type (turbo2/3/4). padded_hd
+ * is the physical per-head width (multiple of 128). Returns 0 on success, -1 on
+ * unsupported type or bad geometry (caller should fall back to the CPU path). */
+int tria_cuda_dequant_layer(const void * d_k, int ktype,
+                            int phys_base, int n_new, int nkv,
+                            int padded_hd, int fc, int rope_neox);
+
+/* Score one attention layer whose d_kr/d_ki were already populated on-device by
+ * tria_cuda_dequant_layer (skips the host->device copy). Returns 0 on success. */
+int tria_cuda_score_layer_device(int n_new, int nkv, int fc, int gqa,
+                                 int layer_idx, int num_heads,
+                                 float max_beta, float layer_weight, int score_start);
+
 /* Download the merged global scores (n elements) to host. Returns 0 on success. */
 int tria_cuda_global_download(float * dst_host, int n);
+
+/* Physical KV compaction (GPU gather). tria_cuda_compact_begin uploads the kept
+ * physical row indices once; tria_cuda_compact_layer gathers those rows of one
+ * layer's K and V tensors into the contiguous [0, num_kept) range, in place.
+ * k_data/v_data are CUDA device pointers (tensor->data); *_row_size is the
+ * per-row byte stride. v_data may be NULL. Return 0 on success, non-zero on
+ * failure (caller should fall back to the backend-agnostic copy path). */
+int tria_cuda_compact_begin(const int * keep_positions, int num_kept);
+int tria_cuda_compact_layer(void * k_data, size_t k_row_size,
+                            void * v_data, size_t v_row_size);
 
 /* Free all device buffers. */
 void tria_cuda_cleanup(void);

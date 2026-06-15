@@ -612,6 +612,39 @@ int tria_maybe_score(
             continue;  /* skip CPU path for this layer */
         }
 
+#ifdef GGML_TRIA_CUDA
+        /* GPU turbo path: dequantize K, apply the inverse WHT, extract the
+         * post-RoPE complex pairs and score the whole layer on the GPU, reading
+         * the quantized K straight from device memory (no CPU dequant/WHT/copy).
+         * Falls through to the CPU path on any failure (unsupported geometry,
+         * host-resident KV, or a CUDA error). */
+        if (gpu_turbo && !tria_gpu_turbo_verify && k_tensor->buffer &&
+            !ggml_backend_buffer_is_host(k_tensor->buffer) &&
+            (k_tensor->type == GGML_TYPE_TURBO2_0 ||
+             k_tensor->type == GGML_TYPE_TURBO3_0 ||
+             k_tensor->type == GGML_TYPE_TURBO4_0)) {
+            int nh_all  = rt->stats->num_heads;
+            int gqa_all = nh_all / nkv;
+            int phys_hd = hd;
+            int64_t actual_row = k_tensor->ne[0];
+            if (actual_row != n_embd_k_gqa) phys_hd = (int)(actual_row / nkv);
+            int phys_base = (phys_idx && score_start < n_old) ? phys_idx[score_start] : (int)score_start;
+            if ((phys_hd % 128) == 0) {
+                float layer_weight = rt->stats->layer_budget_scales[li] / layer_weight_mean;
+                if (layer_weight < 0.25f) layer_weight = 0.25f;
+                if (layer_weight > 4.0f)  layer_weight = 4.0f;
+                if (tria_cuda_dequant_layer(k_tensor->data, (int)k_tensor->type,
+                                            phys_base, n_new, nkv, phys_hd, fc,
+                                            rt->rope_neox) == 0 &&
+                    tria_cuda_score_layer_device(n_new, nkv, fc, gqa_all, li, nh_all,
+                                                 tria_gpu_max_beta, layer_weight,
+                                                 score_start) == 0) {
+                    continue;  /* layer fully dequantized + scored on GPU */
+                }
+            }
+        }
+#endif
+
         /* Compute per-layer physical row width (turbo types may pad to 128 multiples) */
         int layer_phys_hd = hd;
         int n_embd_k_phys = n_embd_k_gqa;
