@@ -63,6 +63,12 @@ export interface ApiModelStatus {
 	value: ServerModelStatus;
 	/** Command line arguments used when loading (only for loaded models) */
 	args?: string[];
+	/**
+	 * Configured preset for this model, serialised as INI. Present for every
+	 * model (loaded or not) in ROUTER mode, so it can be used to surface
+	 * configuration (e.g. ctx-size) for unloaded models without loading them.
+	 */
+	preset?: string;
 }
 
 /**

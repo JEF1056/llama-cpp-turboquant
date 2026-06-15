@@ -207,7 +207,32 @@ class ModelsStore {
 		const props = this.getModelProps(modelId);
 		const nCtx = props?.default_generation_settings?.n_ctx;
 
-		return typeof nCtx === 'number' ? nCtx : null;
+		if (typeof nCtx === 'number') return nCtx;
+
+		// Fallback for unloaded ROUTER models: live props (with the resolved n_ctx)
+		// only exist once a model is loaded, but the router reports each model's
+		// configured preset in /v1/models regardless of load state. Derive the max
+		// context from the preset's ctx-size (or fit-ctx floor) so the UI can show
+		// it without force-loading the model.
+		return this.getConfiguredContextSize(modelId);
+	}
+
+	/**
+	 * Read a model's configured context size from the router-provided preset INI.
+	 * Returns null when no router entry/preset is available or no ctx key is set
+	 * (e.g. a fit-only model with no floor), in which case context stays unknown
+	 * until the model is loaded.
+	 */
+	getConfiguredContextSize(modelId: string): number | null {
+		const preset = this.routerModels.find((m) => m.id === modelId)?.status?.preset;
+		if (!preset) return null;
+
+		const readInt = (key: string): number | null => {
+			const match = preset.match(new RegExp(`^\\s*${key}\\s*=\\s*(\\d+)`, 'm'));
+			return match ? Number(match[1]) : null;
+		};
+
+		return readInt('ctx-size') ?? readInt('ctx_size') ?? readInt('fit-ctx') ?? null;
 	}
 
 	/**
