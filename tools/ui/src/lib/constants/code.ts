@@ -1,4 +1,5 @@
 export const NEWLINE = '\n';
+export const TAB = '\t';
 export const DEFAULT_LANGUAGE = 'text';
 // Matches language identifiers including special chars used in real language names:
 // c++, c#, f#, objective-c, shell-script, etc.

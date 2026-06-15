@@ -99,3 +99,22 @@ export { default as CollapsibleContentBlock } from './CollapsibleContentBlock.sv
  * ```
  */
 export { default as JsonTree } from './JsonTree.svelte';
+
+/**
+ * **MermaidPreview** - Interactive Mermaid diagram viewer
+ *
+ * Renders Mermaid-generated SVG diagrams with zoom, pan, and fit-to-view controls.
+ *
+ * **Features:**
+ * - Mouse wheel zoom in/out
+ * - Click-drag panning with pointer capture
+ * - Fit to view and reset view controls
+ * - Download as SVG
+ * - Responsive scaling with viewBox detection
+ *
+ * @example
+ * ```svelte
+ * <MermaidPreview svgHtml={diagramSvg} />
+ * ```
+ */
+export { default as MermaidPreview } from './MermaidPreview.svelte';
