@@ -993,8 +993,27 @@ private:
         std::vector<std::filesystem::path> files;
         for (const auto & entry : std::filesystem::directory_iterator(
                 params_base.slot_save_path, ec)) {
-            if (entry.is_regular_file() && entry.path().extension() == ".llama_cache") {
-                files.push_back(entry.path());
+            if (!entry.is_regular_file()) {
+                continue;
+            }
+            const std::filesystem::path & p = entry.path();
+            // Sweep stale temp files left behind when a save was interrupted
+            // (e.g. the router force-kills the child mid-flush on a model swap,
+            // or a hard crash). The atomic temp+rename means a *.tmp is never a
+            // valid cache, so it is always safe to delete here on startup.
+            if (p.extension() == ".tmp") {
+                std::error_code rm_ec;
+                std::filesystem::remove(p, rm_ec);
+                if (rm_ec) {
+                    SRV_WRN("[KVC] could not remove stale temp file '%s': %s\n",
+                        p.string().c_str(), rm_ec.message().c_str());
+                } else {
+                    SRV_INF("[KVC] removed stale temp file '%s'\n", p.string().c_str());
+                }
+                continue;
+            }
+            if (p.extension() == ".llama_cache") {
+                files.push_back(p);
             }
         }
         if (ec) {
