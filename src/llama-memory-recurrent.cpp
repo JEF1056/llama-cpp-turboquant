@@ -791,7 +791,11 @@ void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq
     }
 
     if ((flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) && cell_ranges.size() > 1) {
-        GGML_ABORT("cannot save/load multiple ranges of cells to/from device memory\n");
+        // Fragmented (>1) cell ranges can't be snapshotted to device memory. Throw
+        // instead of aborting so the state_seq_get_data try/catch turns this into a
+        // graceful return 0 (caller falls back to host path / recomputes) rather than
+        // killing the process — happens under multi-slot router swapping.
+        throw std::runtime_error("cannot save/load multiple ranges of cells to/from device memory");
     }
 
     // DEBUG CHECK: Sum of cell counts in ranges should equal the total cell count

@@ -3098,7 +3098,16 @@ size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * sr
         llama_seq_id seq_id_read;
         io->read(&seq_id_read, sizeof(seq_id_read));
 
-        GGML_ASSERT(mem_storage.find(seq_id_read) != mem_storage.end());
+        // Under a multiplexing router (n_parallel>1 at the router level swapping
+        // conversations through a single child slot), a host-blob restore can leave
+        // mem_storage without an on-device snapshot for this seq_id. Fail gracefully
+        // (caller recomputes) instead of aborting the whole process.
+        if (mem_storage.find(seq_id_read) == mem_storage.end()) {
+            LLAMA_LOG_ERROR("%s: on-device restore for seq_id %d has no device snapshot "
+                            "(stale/swapped slot); failing restore so caller recomputes\n",
+                            __func__, seq_id_read);
+            return 0;
+        }
 
         io = std::make_unique<llama_io_read_device>(src, size, mem_storage[seq_id_read], sched.get());
     } else {
