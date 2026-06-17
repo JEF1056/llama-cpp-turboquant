@@ -200,6 +200,43 @@ export function parseToolResultWithImages(
 }
 
 /**
+ * A renderable block of a tool result: either a run of text (rendered as JSON
+ * or markdown depending on its content) or an inline image attachment.
+ */
+export type ToolResultBlock =
+	| { kind: 'text'; text: string }
+	| { kind: 'image'; image: DatabaseMessageExtraImageFile };
+
+/**
+ * Groups parsed tool-result lines into renderable blocks, coalescing
+ * consecutive text lines so multi-line JSON / markdown / code is detected and
+ * rendered as a whole, while keeping inline image attachments in place.
+ */
+export function groupToolResultBlocks(lines: ToolResultLine[]): ToolResultBlock[] {
+	const blocks: ToolResultBlock[] = [];
+	let buffer: string[] = [];
+
+	const flush = () => {
+		if (buffer.length === 0) return;
+		const text = buffer.join(NEWLINE_SEPARATOR);
+		if (text.trim()) blocks.push({ kind: 'text', text });
+		buffer = [];
+	};
+
+	for (const line of lines) {
+		if (line.image) {
+			flush();
+			blocks.push({ kind: 'image', image: line.image });
+		} else {
+			buffer.push(line.text);
+		}
+	}
+
+	flush();
+	return blocks;
+}
+
+/**
  * Safely parse the toolCalls JSON string from a DatabaseMessage.
  */
 function parseToolCalls(toolCallsJson?: string): ApiChatCompletionToolCall[] {

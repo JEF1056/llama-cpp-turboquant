@@ -160,9 +160,11 @@ export { parseHeadersToArray, serializeHeaders } from './headers';
 export {
 	deriveAgenticSections,
 	parseToolResultWithImages,
+	groupToolResultBlocks,
 	hasAgenticContent,
 	type AgenticSection,
-	type ToolResultLine
+	type ToolResultLine,
+	type ToolResultBlock
 } from './agentic';
 
 // Cache utilities

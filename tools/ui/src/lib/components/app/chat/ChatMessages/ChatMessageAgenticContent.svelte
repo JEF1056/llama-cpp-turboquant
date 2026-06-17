@@ -23,6 +23,7 @@
 		deriveAgenticSections,
 		parsePartialJson,
 		parseToolResultWithImages,
+		groupToolResultBlocks,
 		type AgenticSection,
 		type ToolResultLine
 	} from '$lib/utils';
@@ -107,14 +108,19 @@
 
 	const sections = $derived(deriveAgenticSections(message, toolMessages, [], isStreaming));
 
-	// Parse tool results with images
+	// Parse tool results with images, then coalesce text lines into blocks so
+	// multi-line JSON / markdown / code is rendered as a whole (rich text).
 	const sectionsParsed = $derived(
-		sections.map((section) => ({
-			...section,
-			parsedLines: section.toolResult
+		sections.map((section) => {
+			const parsedLines = section.toolResult
 				? parseToolResultWithImages(section.toolResult, section.toolResultExtras || message?.extra)
-				: ([] as ToolResultLine[])
-		}))
+				: ([] as ToolResultLine[]);
+			return {
+				...section,
+				parsedLines,
+				resultBlocks: groupToolResultBlocks(parsedLines)
+			};
+		})
 	);
 
 	// Group flat sections into agentic turns
@@ -308,28 +314,31 @@
 						</div>
 					{/if}
 				{:else if section.toolResult}
-					<div class="overflow-auto rounded-lg border border-border bg-muted p-4">
-						{#each section.parsedLines as line, i (i)}
-							{@const lineJson = parsePartialJson(line.text)}
-							{#if lineJson.complete && lineJson.value !== null && typeof lineJson.value === 'object'}
-								<JsonTree
-									json={line.text}
-									partial={false}
-									callId="{section.toolName}-result-{i}"
-									maxHeight="16rem"
-								/>
-							{:else}
-								<div class="font-mono text-xs leading-relaxed whitespace-pre-wrap [overflow-wrap:anywhere]">
-									{line.text}
-								</div>
-							{/if}
-							{#if line.image}
+					<div class="tool-result overflow-auto rounded-lg border border-border bg-muted p-4">
+						{#each section.resultBlocks as block, i (i)}
+							{#if block.kind === 'image'}
 								<img
-									src={line.image.base64Url}
-									alt={line.image.name}
+									src={block.image.base64Url}
+									alt={block.image.name}
 									class="mt-2 mb-2 h-auto max-w-full rounded-lg"
 									loading="lazy"
 								/>
+							{:else}
+								{@const blockJson = parsePartialJson(block.text)}
+								{#if blockJson.complete && blockJson.value !== null && typeof blockJson.value === 'object'}
+									<JsonTree
+										json={block.text}
+										partial={false}
+										callId="{section.toolName}-result-{i}"
+										maxHeight="16rem"
+									/>
+								{:else}
+									<MarkdownContent
+										content={block.text}
+										attachments={section.toolResultExtras || message?.extra}
+										class="tool-result-markdown text-sm"
+									/>
+								{/if}
 							{/if}
 						{/each}
 					</div>
