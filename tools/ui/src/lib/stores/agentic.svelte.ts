@@ -301,6 +301,9 @@ class AgenticStore {
 		const maxTurns = Number(settings.agenticMaxTurns) || DEFAULT_AGENTIC_CONFIG.maxTurns;
 		const maxToolPreviewLines =
 			Number(settings.agenticMaxToolPreviewLines) || DEFAULT_AGENTIC_CONFIG.maxToolPreviewLines;
+		const maxParallelToolCalls =
+			Number(settings.agenticMaxParallelToolCalls) ||
+			DEFAULT_AGENTIC_CONFIG.maxParallelToolCalls;
 		const hasTools =
 			mcpStore.hasEnabledServers(perChatOverrides) ||
 			toolsStore.builtinTools.length > 0 ||
@@ -308,7 +311,8 @@ class AgenticStore {
 		return {
 			enabled: hasTools && DEFAULT_AGENTIC_CONFIG.enabled,
 			maxTurns,
-			maxToolPreviewLines
+			maxToolPreviewLines,
+			maxParallelToolCalls
 		};
 	}
 
@@ -739,172 +743,195 @@ class AgenticStore {
 				tool_calls: normalizedCalls
 			});
 
-			// Execute each tool call and create result messages
-			for (let i = 0; i < normalizedCalls.length; i++) {
-				const toolCall = normalizedCalls[i];
-
-				if (signal?.aborted) {
-					onFlowComplete?.(this.buildFinalTimings(capturedTimings, agenticTimings));
-					return;
-				}
-
-				// Check for pending steering message - skip remaining tool calls
-				if (this._steeringMessages.has(conversationId)) {
-					console.log(
-						`[AgenticStore] Steering message detected, skipping ${normalizedCalls.length - i} remaining tool call(s)`
-					);
-					for (let j = i; j < normalizedCalls.length; j++) {
-						const remainingCall = normalizedCalls[j];
-						const interruptedContent = 'Tool execution was interrupted by a new user message.';
-						if (createToolResultMessage) {
-							await createToolResultMessage(remainingCall.id, interruptedContent);
-						}
-						sessionMessages.push({
-							role: MessageRole.TOOL,
-							tool_call_id: remainingCall.id,
-							content: interruptedContent
-						});
-					}
-					break;
-				}
-
-				const toolName = toolCall.function.name;
-				const serverLabel = toolsStore.getToolServerLabel(toolName);
-
-				// Ask for permission before executing the tool
-				const permission = await this.requestPermission(
-					conversationId,
-					toolName,
-					serverLabel,
-					signal
+			// Execute the tool calls and create result messages.
+			// If the user steered (queued a message) during the assistant turn, don't run any
+			// tools this turn — mark them all interrupted and let the post-execution steering
+			// check exit the flow.
+			if (this._steeringMessages.has(conversationId)) {
+				console.log(
+					`[AgenticStore] Steering message detected, skipping ${normalizedCalls.length} tool call(s)`
 				);
+				for (const remainingCall of normalizedCalls) {
+					const interruptedContent = 'Tool execution was interrupted by a new user message.';
+					if (createToolResultMessage) {
+						await createToolResultMessage(remainingCall.id, interruptedContent);
+					}
+					sessionMessages.push({
+						role: MessageRole.TOOL,
+						tool_call_id: remainingCall.id,
+						content: interruptedContent
+					});
+				}
+			} else {
+				if (signal?.aborted) {
+					onFlowComplete?.(this.buildFinalTimings(capturedTimings, agenticTimings));
+					return;
+				}
 
-				// Yield to allow Svelte to flush the UI update (hide permission dialog)
-				await new Promise((r) => setTimeout(r, 0));
+				// 1) Resolve permissions sequentially — permission dialogs are modal, so they
+				// must be shown one at a time even though the tools themselves run in parallel.
+				const permissions = new Array<ToolPermissionDecision>(normalizedCalls.length);
+				for (let i = 0; i < normalizedCalls.length; i++) {
+					if (signal?.aborted) {
+						onFlowComplete?.(this.buildFinalTimings(capturedTimings, agenticTimings));
+						return;
+					}
+					const toolName = normalizedCalls[i].function.name;
+					const serverLabel = toolsStore.getToolServerLabel(toolName);
+					permissions[i] = await this.requestPermission(
+						conversationId,
+						toolName,
+						serverLabel,
+						signal
+					);
+					// Yield to allow Svelte to flush the UI update (hide permission dialog)
+					await new Promise((r) => setTimeout(r, 0));
+				}
 
 				if (signal?.aborted) {
 					onFlowComplete?.(this.buildFinalTimings(capturedTimings, agenticTimings));
 					return;
 				}
 
-				const toolStartTime = performance.now();
-				const toolSource = toolsStore.getToolSource(toolName);
+				// 2) Execute the tool calls with bounded concurrency. Outcomes are collected
+				// per-index so they can be appended in the original tool-call order regardless
+				// of which call finishes first.
+				type ToolExecOutcome = { result: string; toolSuccess: boolean; durationMs: number };
+				const outcomes = new Array<ToolExecOutcome>(normalizedCalls.length);
+				let executionAborted = false;
 
-				let result: string;
-				let toolSuccess = true;
+				const runToolCall = async (index: number): Promise<void> => {
+					const toolCall = normalizedCalls[index];
+					const permission = permissions[index];
+					const toolName = toolCall.function.name;
+					const toolStartTime = performance.now();
+					const toolSource = toolsStore.getToolSource(toolName);
 
-				if (permission === ToolPermissionDecision.DENY) {
-					result = 'Tool execution was denied by the user.';
-					toolSuccess = false;
-				} else {
-					try {
-						if (toolSource === ToolSource.BUILTIN) {
-							const args = this.parseToolArguments(toolCall.function.arguments);
-							const executionResult = await ToolsService.executeTool(toolName, args, signal);
+					let result: string;
+					let toolSuccess = true;
 
-							result = executionResult.content;
-
-							if (executionResult.isError) toolSuccess = false;
-						} else if (toolSource === ToolSource.FRONTEND) {
-							const args = this.parseToolArguments(toolCall.function.arguments);
-							const executionResult = await SandboxService.executeTool(toolName, args, signal);
-
-							result = executionResult.content;
-
-							if (executionResult.isError) toolSuccess = false;
-						} else {
-							const mcpCall: MCPToolCall = {
-								id: toolCall.id,
-								function: { name: toolName, arguments: toolCall.function.arguments }
-							};
-							try {
-								const executionResult = await mcpStore.executeTool(
-									mcpCall,
-									signal,
-									(progress) => {
+					if (permission === ToolPermissionDecision.DENY) {
+						result = 'Tool execution was denied by the user.';
+						toolSuccess = false;
+					} else {
+						try {
+							if (toolSource === ToolSource.BUILTIN) {
+								const args = this.parseToolArguments(toolCall.function.arguments);
+								const executionResult = await ToolsService.executeTool(toolName, args, signal);
+								result = executionResult.content;
+								if (executionResult.isError) toolSuccess = false;
+							} else if (toolSource === ToolSource.FRONTEND) {
+								const args = this.parseToolArguments(toolCall.function.arguments);
+								const executionResult = await SandboxService.executeTool(toolName, args, signal);
+								result = executionResult.content;
+								if (executionResult.isError) toolSuccess = false;
+							} else {
+								const mcpCall: MCPToolCall = {
+									id: toolCall.id,
+									function: { name: toolName, arguments: toolCall.function.arguments }
+								};
+								try {
+									const executionResult = await mcpStore.executeTool(mcpCall, signal, (progress) => {
 										this.setToolProgress(toolCall.id, {
 											progress: progress.progress,
 											total: progress.total,
 											message: progress.message
 										});
-									}
-								);
-
-								result = executionResult.content;
-							} finally {
-								this.clearToolProgress(toolCall.id);
+									});
+									result = executionResult.content;
+								} finally {
+									this.clearToolProgress(toolCall.id);
+								}
 							}
+						} catch (error) {
+							if (isAbortError(error)) {
+								executionAborted = true;
+								return;
+							}
+							result = `Error: ${error instanceof Error ? error.message : String(error)}`;
+							toolSuccess = false;
 						}
-					} catch (error) {
-						if (isAbortError(error)) {
-							onFlowComplete?.(this.buildFinalTimings(capturedTimings, agenticTimings));
-							return;
-						}
-						result = `Error: ${error instanceof Error ? error.message : String(error)}`;
-						toolSuccess = false;
 					}
-				}
 
-				const toolDurationMs = performance.now() - toolStartTime;
-				const toolTiming: ChatMessageToolCallTiming = {
-					name: toolCall.function.name,
-					duration_ms: Math.round(toolDurationMs),
-					success: toolSuccess
+					outcomes[index] = {
+						result,
+						toolSuccess,
+						durationMs: performance.now() - toolStartTime
+					};
 				};
 
-				agenticTimings.toolCalls!.push(toolTiming);
-				agenticTimings.toolCallsCount++;
-				agenticTimings.toolsMs += Math.round(toolDurationMs);
-				turnStats.toolCalls.push(toolTiming);
-				turnStats.toolsMs += Math.round(toolDurationMs);
+				await this.runWithConcurrencyLimit(
+					normalizedCalls.length,
+					agenticConfig.maxParallelToolCalls,
+					runToolCall
+				);
 
-				if (signal?.aborted) {
+				if (signal?.aborted || executionAborted) {
 					onFlowComplete?.(this.buildFinalTimings(capturedTimings, agenticTimings));
 					return;
 				}
 
-				const { cleanedResult, attachments } = this.extractBase64Attachments(result);
+				// 3) Append results in the original tool-call order so the conversation history
+				// stays aligned with the assistant's tool_calls array.
+				for (let i = 0; i < normalizedCalls.length; i++) {
+					const toolCall = normalizedCalls[i];
+					const { result, toolSuccess, durationMs } = outcomes[i];
 
-				// Create the tool result message in the DB
-				let toolResultMessage: DatabaseMessage | undefined;
-				if (createToolResultMessage) {
-					toolResultMessage = await createToolResultMessage(
-						toolCall.id,
-						cleanedResult,
-						attachments.length > 0 ? attachments : undefined
-					);
-				}
+					const toolTiming: ChatMessageToolCallTiming = {
+						name: toolCall.function.name,
+						duration_ms: Math.round(durationMs),
+						success: toolSuccess
+					};
 
-				if (attachments.length > 0 && toolResultMessage) {
-					onAttachments?.(toolResultMessage.id, attachments);
-				}
+					agenticTimings.toolCalls!.push(toolTiming);
+					agenticTimings.toolCallsCount++;
+					agenticTimings.toolsMs += Math.round(durationMs);
+					turnStats.toolCalls.push(toolTiming);
+					turnStats.toolsMs += Math.round(durationMs);
 
-				// Build content parts for session history (including images for vision models)
-				const contentParts: ApiChatMessageContentPart[] = [
-					{ type: ContentPartType.TEXT, text: cleanedResult }
-				];
-				for (const attachment of attachments) {
-					if (attachment.type === AttachmentType.IMAGE) {
-						if (modelsStore.modelSupportsVision(effectiveModel)) {
-							contentParts.push({
-								type: ContentPartType.IMAGE_URL,
-								image_url: {
-									url: (attachment as DatabaseMessageExtraImageFile).base64Url
-								}
-							});
-						} else {
-							console.info(
-								`[AgenticStore] Skipping image attachment (model "${effectiveModel}" does not support vision)`
-							);
+					const { cleanedResult, attachments } = this.extractBase64Attachments(result);
+
+					// Create the tool result message in the DB
+					let toolResultMessage: DatabaseMessage | undefined;
+					if (createToolResultMessage) {
+						toolResultMessage = await createToolResultMessage(
+							toolCall.id,
+							cleanedResult,
+							attachments.length > 0 ? attachments : undefined
+						);
+					}
+
+					if (attachments.length > 0 && toolResultMessage) {
+						onAttachments?.(toolResultMessage.id, attachments);
+					}
+
+					// Build content parts for session history (including images for vision models)
+					const contentParts: ApiChatMessageContentPart[] = [
+						{ type: ContentPartType.TEXT, text: cleanedResult }
+					];
+					for (const attachment of attachments) {
+						if (attachment.type === AttachmentType.IMAGE) {
+							if (modelsStore.modelSupportsVision(effectiveModel)) {
+								contentParts.push({
+									type: ContentPartType.IMAGE_URL,
+									image_url: {
+										url: (attachment as DatabaseMessageExtraImageFile).base64Url
+									}
+								});
+							} else {
+								console.info(
+									`[AgenticStore] Skipping image attachment (model "${effectiveModel}" does not support vision)`
+								);
+							}
 						}
 					}
-				}
 
-				sessionMessages.push({
-					role: MessageRole.TOOL,
-					tool_call_id: toolCall.id,
-					content: contentParts.length === 1 ? cleanedResult : contentParts
-				});
+					sessionMessages.push({
+						role: MessageRole.TOOL,
+						tool_call_id: toolCall.id,
+						content: contentParts.length === 1 ? cleanedResult : contentParts
+					});
+				}
 			}
 
 			if (turnStats.toolCalls.length > 0) {
@@ -940,6 +967,28 @@ class AgenticStore {
 			cache_n: capturedTimings?.cache_n,
 			agentic: agenticTimings
 		};
+	}
+
+	/**
+	 * Run `count` async tasks identified by index, with at most `limit` running
+	 * concurrently. A fixed pool of workers pulls indices in ascending order; the
+	 * `worker` callback is expected to handle its own errors (it must not reject).
+	 */
+	private async runWithConcurrencyLimit(
+		count: number,
+		limit: number,
+		worker: (index: number) => Promise<void>
+	): Promise<void> {
+		if (count <= 0) return;
+		let next = 0;
+		const poolSize = Math.min(Math.max(1, Math.floor(limit) || 1), count);
+		const runNext = async (): Promise<void> => {
+			while (next < count) {
+				const index = next++;
+				await worker(index);
+			}
+		};
+		await Promise.all(Array.from({ length: poolSize }, () => runNext()));
 	}
 
 	private normalizeToolCalls(toolCalls: ApiChatCompletionToolCall[]): AgenticToolCallList {

@@ -16,6 +16,7 @@ export interface AgenticConfig {
 	enabled: boolean;
 	maxTurns: number;
 	maxToolPreviewLines: number;
+	maxParallelToolCalls: number;
 }
 
 /**

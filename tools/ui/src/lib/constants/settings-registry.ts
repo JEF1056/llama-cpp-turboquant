@@ -654,6 +654,19 @@ const SETTINGS_REGISTRY: Record<string, SettingsSectionEntry> = {
 					serverKey: SETTINGS_KEYS.AGENTIC_MAX_TOOL_PREVIEW_LINES,
 					paramType: SyncableParameterType.NUMBER
 				}
+			},
+			{
+				key: SETTINGS_KEYS.AGENTIC_MAX_PARALLEL_TOOL_CALLS,
+				label: 'Max parallel tool calls',
+				help: 'How many tool calls from a single assistant turn run at the same time. Higher values let independent browser/search tasks execute concurrently; set to 1 to force sequential execution.',
+				defaultValue: 4,
+				type: SettingsFieldType.INPUT,
+				section: SETTINGS_SECTION_SLUGS.AGENTIC,
+				isPositiveInteger: true,
+				sync: {
+					serverKey: SETTINGS_KEYS.AGENTIC_MAX_PARALLEL_TOOL_CALLS,
+					paramType: SyncableParameterType.NUMBER
+				}
 			}
 		]
 	},

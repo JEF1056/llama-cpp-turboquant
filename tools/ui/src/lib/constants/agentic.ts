@@ -7,7 +7,8 @@ export const NEWLINE_SEPARATOR = '\n';
 export const DEFAULT_AGENTIC_CONFIG: AgenticConfig = {
 	enabled: true,
 	maxTurns: 100,
-	maxToolPreviewLines: 25
+	maxToolPreviewLines: 25,
+	maxParallelToolCalls: 4
 } as const;
 
 export const REASONING_TAGS = {
