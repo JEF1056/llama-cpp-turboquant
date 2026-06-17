@@ -270,7 +270,13 @@ class ModelsStore {
 			this.fetchModelProps(modelId);
 		}
 		const props = this.getModelProps(modelId);
-		return detectThinkingSupport(props?.chat_template ?? '');
+		if (props?.chat_template) {
+			return detectThinkingSupport(props.chat_template);
+		}
+		// Fallback for unloaded router models: live props only exist once a model
+		// is loaded, but the router reports a server-computed supports_thinking
+		// flag (and the raw chat template) in /models regardless of load state.
+		return this.getRouterThinkingSupport(modelId);
 	}
 
 	/**
@@ -285,7 +291,23 @@ class ModelsStore {
 		}
 
 		const props = this.getModelProps(modelId);
-		return detectThinkingSupport(props?.chat_template ?? '');
+		if (props?.chat_template) {
+			return detectThinkingSupport(props.chat_template);
+		}
+		return this.getRouterThinkingSupport(modelId);
+	}
+
+	/**
+	 * Thinking support derived from the router's /models metadata, which is
+	 * available even when the model is not loaded. Prefers the server-computed
+	 * `supports_thinking` flag, falling back to scanning the raw chat template.
+	 */
+	private getRouterThinkingSupport(modelId: string): boolean {
+		const entry = this.routerModels.find((m) => m.id === modelId);
+		if (!entry) return false;
+		if (typeof entry.supports_thinking === 'boolean') return entry.supports_thinking;
+		if (entry.chat_template) return detectThinkingSupport(entry.chat_template);
+		return false;
 	}
 
 	/**
@@ -303,7 +325,23 @@ class ModelsStore {
 			this.fetchModelProps(modelId);
 		}
 		const props = this.getModelProps(modelId);
-		return detectThinkingSupportWithReason(props?.chat_template ?? '');
+		if (props?.chat_template) {
+			return detectThinkingSupportWithReason(props.chat_template);
+		}
+		// Fallback to router /models metadata for unloaded models.
+		const entry = this.routerModels.find((m) => m.id === modelId);
+		if (entry?.chat_template) {
+			return detectThinkingSupportWithReason(entry.chat_template);
+		}
+		if (typeof entry?.supports_thinking === 'boolean') {
+			return {
+				supported: entry.supports_thinking,
+				reason: entry.supports_thinking
+					? 'Server reported thinking support'
+					: 'Server reported no thinking support'
+			};
+		}
+		return detectThinkingSupportWithReason('');
 	}
 
 	/**

@@ -77,6 +77,8 @@ struct server_model_meta {
     int exit_code = 0; // exit code of the model instance process (only valid if status == FAILED)
     int stop_timeout = 0; // seconds to wait before force-killing the model instance during shutdown
     mtmd_caps multimodal; // multimodal capabilities
+    std::string chat_template; // chat template read from the model GGUF (or preset override), populated offline
+    bool supports_thinking = false; // whether the chat template supports reasoning/thinking, computed offline
 
     bool is_ready() const {
         return status == SERVER_MODEL_STATUS_LOADED;

@@ -4,6 +4,8 @@
 #include "build-info.h"
 #include "preset.h"
 #include "download.h"
+#include "chat.h"
+#include "gguf.h"
 
 #include <cpp-httplib/httplib.h> // TODO: remove this once we use HTTP client from download.h
 #include <sheredom/subprocess.h>
@@ -186,6 +188,8 @@ void server_model_meta::update_caps() {
             "LLAMA_ARG_MMPROJ_URL",
             "LLAMA_ARG_HF_REPO",
             "LLAMA_ARG_HF_REPO_FILE",
+            "LLAMA_ARG_CHAT_TEMPLATE",
+            "LLAMA_ARG_CHAT_TEMPLATE_FILE",
         });
         params.offline = true; // avoid any unwanted network call during capability detection
         common_params_handle_models(params, LLAMA_EXAMPLE_SERVER);
@@ -194,9 +198,41 @@ void server_model_meta::update_caps() {
         } else {
             multimodal = mtmd_get_cap_from_file(params.mmproj.path.c_str());
         }
+
+        // Detect reasoning/thinking support offline so the web UI can show the
+        // reasoning toggle for models that are not currently loaded. The child
+        // server computes this the same way (see server-context.cpp), but only
+        // while running, so we mirror it here from GGUF metadata.
+        std::string tmpl_src = params.chat_template; // explicit override from preset, if any
+        if (tmpl_src.empty() && !params.model.path.empty()) {
+            struct gguf_init_params gguf_params = { /*no_alloc =*/ true, /*ctx =*/ nullptr };
+            gguf_context * ctx_gguf = gguf_init_from_file(params.model.path.c_str(), gguf_params);
+            if (ctx_gguf) {
+                int64_t key_id = gguf_find_key(ctx_gguf, "tokenizer.chat_template");
+                if (key_id >= 0) {
+                    const char * str = gguf_get_val_str(ctx_gguf, key_id);
+                    if (str) {
+                        tmpl_src = str;
+                    }
+                }
+                gguf_free(ctx_gguf);
+            }
+        }
+        chat_template = tmpl_src;
+        if (!tmpl_src.empty()) {
+            // Capability check only (mirrors the web UI's template heuristic, which is
+            // independent of whether --jinja is enabled). The child server additionally
+            // gates actual thinking on use_jinja at generation time.
+            common_chat_templates_ptr tmpls = common_chat_templates_init(/*model =*/ nullptr, tmpl_src);
+            supports_thinking = common_chat_templates_support_enable_thinking(tmpls.get());
+        } else {
+            supports_thinking = false;
+        }
     } catch (const std::exception & e) {
         LOG_WRN("failed to initialize common_params for multimodal capability detection: %s\n", e.what());
         multimodal = { false, false };
+        chat_template = "";
+        supports_thinking = false;
     }
 }
 
@@ -1533,8 +1569,14 @@ void server_models_routes::init_routes() {
                 {"created",      t},          // for OAI-compat
                 {"status",       status},
                 {"architecture", architecture},
+                // reasoning/thinking support, computed offline so it is available
+                // regardless of whether the model is currently loaded
+                {"supports_thinking", meta.supports_thinking},
                 // TODO: add other fields, may require reading GGUF metadata
             };
+            if (!meta.chat_template.empty()) {
+                model_info["chat_template"] = meta.chat_template;
+            }
 
             // merge with loaded_info from the child process if available
             if (meta.is_running()) {

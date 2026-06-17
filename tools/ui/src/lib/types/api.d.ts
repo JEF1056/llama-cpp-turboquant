@@ -98,6 +98,11 @@ export interface ApiModelDataEntry {
 	aliases?: string[];
 	/** Informational tags for this model */
 	tags?: string[];
+	/** Whether the model's chat template supports reasoning/thinking (computed
+	 *  server-side and available regardless of whether the model is loaded) */
+	supports_thinking?: boolean;
+	/** Raw chat template read from the model GGUF (present when known offline) */
+	chat_template?: string;
 	/** Legacy meta field (may be present in older responses) */
 	meta?: Record<string, unknown> | null;
 }
