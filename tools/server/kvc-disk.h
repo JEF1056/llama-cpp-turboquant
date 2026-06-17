@@ -11,12 +11,16 @@
 /**
  * kvc-disk: KV-cache disk persistence for llama-server.
  *
- * Each cache file uses the "TKVD v2" format:
+ * Each cache file uses the "TKVD" format:
  *   [validation header][CRC-checked KV state blob][token array]
  *
  * Header layout (little-endian):
  *   u32  magic (0x44564B54 = "TKVD")
- *   u32  version (2)
+ *   u32  version
+ *   u64  saved_unix_seconds — wall-clock time (time(2)) the file was last written.
+ *        Placed immediately after the version so it can be read with a single
+ *        16-byte prefix read (see kvc_disk_peek_timestamp) without touching the
+ *        large KV blob — used to expire stale caches cheaply.
  *   u8[32] model_arch (null-padded)
  *   u64  model_size_bytes
  *   u32  n_layer, n_head, n_head_kv, n_ctx_train
@@ -44,7 +48,9 @@
 
 // Magic bytes for TKVD cache files ("TKVD" in little-endian u32)
 static constexpr uint32_t KVC_DISK_MAGIC   = 0x44564B54u;
-static constexpr uint32_t KVC_DISK_VERSION = 2;
+// Slot-cache format version. Bumped to 4 when the saved_unix_seconds field was
+// added to the header; older files are treated as invalid and discarded.
+static constexpr uint32_t KVC_DISK_VERSION = 4;
 
 // Fingerprint of the model + context at save time.
 // Stored in the file header so we can detect stale / incompatible caches.
@@ -103,10 +109,27 @@ bool kvc_disk_read(
     llama_pos                      & n_pos_out,      // restored pos_next() value
     llama_tokens                   & tokens_out);    // restored token array
 
-static constexpr uint32_t KVC_DISK_VERSION_V3 = 3;
+// Prompt-cache format version. Bumped to 5 when the saved_unix_seconds field was
+// added to the header; older files are treated as invalid and discarded.
+static constexpr uint32_t KVC_DISK_VERSION_V3 = 5;
+
+// Quickly read just the last-updated timestamp from a TKVD cache file without
+// loading the (potentially multi-GiB) KV blob. Reads only the fixed 16-byte
+// prefix: magic(4) + version(4) + saved_unix_seconds(8).
+// Returns true and sets |out_unix_seconds| only for a well-formed file with a
+// recognised magic + version; returns false for an unreadable, truncated,
+// wrong-magic or unknown-version file (i.e. "invalid" — safe to delete).
+bool kvc_disk_peek_timestamp(const std::string & path, uint64_t & out_unix_seconds);
+
+// Refresh a TKVD cache file's last-updated timestamp to the current wall-clock
+// time by rewriting only the 8-byte field in place (no blob re-write). Used to
+// keep a still-loaded idle slot's on-disk cache from being expired-deleted while
+// its KV is live in RAM. Returns false for an unreadable / wrong-magic /
+// unknown-version file.
+bool kvc_disk_touch(const std::string & path);
 
 // Write a server_prompt cache entry (including draft data and speculative checkpoints) to |path|.
-// Uses version 3 format.
+// Uses the version-5 prompt format.
 bool kvc_disk_write_prompt(
     const std::string                    & path,
     const kvc_disk_fingerprint           & fp,

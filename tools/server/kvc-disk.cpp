@@ -9,6 +9,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <ctime>
 #include <filesystem>
 #include <vector>
 #include <string>
@@ -59,6 +60,65 @@ static uint32_t crc32_update(uint32_t crc, const uint8_t * data, size_t len) {
 
 uint32_t crc32_buf(const void * buf, size_t len) {
     return crc32_update(0xFFFFFFFFu, (const uint8_t *) buf, len) ^ 0xFFFFFFFFu;
+}
+
+// ---------------------------------------------------------------------------
+// Lightweight timestamp peek
+// ---------------------------------------------------------------------------
+
+bool kvc_disk_peek_timestamp(const std::string & path, uint64_t & out_unix_seconds) {
+    FILE * f = fopen(path.c_str(), "rb");
+    if (!f) {
+        return false;
+    }
+    // Fixed 16-byte prefix: magic(4) + version(4) + saved_unix_seconds(8).
+    uint32_t magic = 0, version = 0;
+    uint64_t ts = 0;
+    const bool ok = fread(&magic, 4, 1, f) == 1
+                 && fread(&version, 4, 1, f) == 1
+                 && fread(&ts, 8, 1, f) == 1;
+    fclose(f);
+    if (!ok) {
+        return false;
+    }
+    if (magic != KVC_DISK_MAGIC) {
+        return false;
+    }
+    if (version != KVC_DISK_VERSION && version != KVC_DISK_VERSION_V3) {
+        return false;
+    }
+    out_unix_seconds = ts;
+    return true;
+}
+
+bool kvc_disk_touch(const std::string & path) {
+    FILE * f = fopen(path.c_str(), "r+b");
+    if (!f) {
+        return false;
+    }
+    uint32_t magic = 0, version = 0;
+    if (fread(&magic, 4, 1, f) != 1 || fread(&version, 4, 1, f) != 1) {
+        fclose(f);
+        return false;
+    }
+    if (magic != KVC_DISK_MAGIC ||
+        (version != KVC_DISK_VERSION && version != KVC_DISK_VERSION_V3)) {
+        fclose(f);
+        return false;
+    }
+    // saved_unix_seconds lives at byte offset 8 (immediately after magic+version).
+    if (fseek(f, 8, SEEK_SET) != 0) {
+        fclose(f);
+        return false;
+    }
+    const uint64_t ts = (uint64_t) time(nullptr);
+    const bool ok = fwrite(&ts, 8, 1, f) == 1;
+    if (fflush(f) != 0) {
+        fclose(f);
+        return false;
+    }
+    fclose(f);
+    return ok;
 }
 
 // ---------------------------------------------------------------------------
@@ -241,6 +301,10 @@ bool kvc_disk_write(
     write_u32(KVC_DISK_MAGIC);
     write_u32(KVC_DISK_VERSION);
 
+    // Last-updated timestamp (wall-clock seconds). Placed right after the version
+    // so kvc_disk_peek_timestamp can read it from the fixed 16-byte prefix.
+    write_u64((uint64_t) time(nullptr));
+
     // fingerprint
     fwrite(fp.model_arch, 1, sizeof(fp.model_arch), f);
     write_u64(fp.model_size);
@@ -376,6 +440,14 @@ bool kvc_disk_read(
     if (version != KVC_DISK_VERSION) {
         KVC_SKIP("unsupported cache version %u (expected %u)", version, KVC_DISK_VERSION);
     }
+
+    // --- last-updated timestamp (unused on the restore path, but must be
+    // consumed so the file cursor lines up with the fingerprint below)
+    uint64_t saved_unix_seconds = 0;
+    if (!read_u64(saved_unix_seconds)) {
+        KVC_SKIP("unexpected EOF reading timestamp");
+    }
+    (void) saved_unix_seconds;
 
     // --- fingerprint
     kvc_disk_fingerprint saved = {};
@@ -582,6 +654,10 @@ bool kvc_disk_write_prompt(
     write_u32(KVC_DISK_MAGIC);
     write_u32(KVC_DISK_VERSION_V3);
 
+    // Last-updated timestamp (wall-clock seconds). Placed right after the version
+    // so kvc_disk_peek_timestamp can read it from the fixed 16-byte prefix.
+    write_u64((uint64_t) time(nullptr));
+
     // fingerprint
     fwrite(fp.model_arch, 1, sizeof(fp.model_arch), f);
     write_u64(fp.model_size);
@@ -749,6 +825,10 @@ bool kvc_disk_read_prompt(
     if (version != KVC_DISK_VERSION_V3) {
         KVC_SKIP("unsupported cache version %u (expected %u)", version, KVC_DISK_VERSION_V3);
     }
+
+    // last-updated timestamp (consumed so the cursor lines up with the fingerprint)
+    const uint64_t saved_unix_seconds = read_u64();
+    (void) saved_unix_seconds;
 
     kvc_disk_fingerprint saved = {};
     if (fread(saved.model_arch, 1, sizeof(saved.model_arch), f) != sizeof(saved.model_arch)) {

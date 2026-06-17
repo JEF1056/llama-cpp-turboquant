@@ -25,6 +25,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cinttypes>
+#include <ctime>
 #include <exception>
 #include <memory>
 #include <filesystem>
@@ -894,6 +895,66 @@ private:
         return params_base.slot_save_path + buf;
     }
 
+    // Remove stale or invalid *.llama_cache files from slot_save_path.
+    // A file is deleted when either:
+    //   (a) its 16-byte TKVD header prefix cannot be parsed as a current cache
+    //       (bad magic / unknown version / truncated) — i.e. "invalid", or
+    //   (b) --kv-cache-expiry is set and the file's last-updated timestamp is
+    //       older than that many seconds.
+    // Only the header prefix of each file is read (kvc_disk_peek_timestamp), so
+    // this stays cheap even when the cache blobs are multiple GiB.
+    void cleanup_expired_caches() {
+        if (params_base.slot_save_path.empty()) {
+            return;
+        }
+        const bool     expiry_on = params_base.kvc_cache_expiry > 0;
+        const uint64_t now        = (uint64_t) time(nullptr);
+        const uint64_t max_age    = expiry_on ? (uint64_t) params_base.kvc_cache_expiry : 0;
+
+        std::error_code ec;
+        int n_removed = 0;
+        for (const auto & entry : std::filesystem::directory_iterator(
+                params_base.slot_save_path, ec)) {
+            if (!entry.is_regular_file()) {
+                continue;
+            }
+            const std::filesystem::path p = entry.path();
+            if (p.extension() != ".llama_cache") {
+                continue;
+            }
+
+            uint64_t     ts     = 0;
+            const bool   valid  = kvc_disk_peek_timestamp(p.string(), ts);
+            const char * reason = nullptr;
+            if (!valid) {
+                reason = "invalid";
+            } else if (expiry_on && now > ts && (now - ts) > max_age) {
+                reason = "expired";
+            }
+            if (reason == nullptr) {
+                continue;
+            }
+
+            std::error_code rm_ec;
+            std::filesystem::remove(p, rm_ec);
+            if (rm_ec) {
+                SRV_WRN("[KVC] could not remove %s cache '%s': %s\n",
+                    reason, p.filename().string().c_str(), rm_ec.message().c_str());
+            } else {
+                n_removed++;
+                SRV_INF("[KVC] removed %s cache '%s'\n",
+                    reason, p.filename().string().c_str());
+            }
+        }
+        if (ec) {
+            SRV_WRN("[KVC] cache cleanup: cannot scan dir '%s': %s\n",
+                params_base.slot_save_path.c_str(), ec.message().c_str());
+        }
+        if (n_removed > 0) {
+            SRV_INF("[KVC] cache cleanup removed %d file(s)\n", n_removed);
+        }
+    }
+
     // Persist all idle (non-processing) slots with cached tokens to disk.
     void save_all_idle_slots_to_disk() {
         if (params_base.slot_save_path.empty() || ctx_tgt == nullptr) {
@@ -928,7 +989,13 @@ private:
             // Skip if nothing changed since the last write.
             const llama_pos cur_pos = slot.prompt.tokens.pos_next();
             if (slot.kvc_saved_pos_next >= 0 && cur_pos == slot.kvc_saved_pos_next) {
-                SRV_INF("[KVC] slot %d: unchanged (pos=%d), skipping write\n",
+                // Still loaded and idle: refresh the on-disk last-updated
+                // timestamp (8-byte in-place write, no blob re-write) so the
+                // cleanup pass below does not expire-delete a live cache.
+                const std::string path = params_base.slot_save_path
+                    + "slot" + std::to_string(slot.id) + ".llama_cache";
+                kvc_disk_touch(path);
+                SRV_INF("[KVC] slot %d: unchanged (pos=%d), refreshed timestamp\n",
                     slot.id, (int) cur_pos);
                 n_saved++; // counts as "already persisted"
                 continue;
@@ -965,6 +1032,9 @@ private:
             for (const auto & prompt : prompt_cache->states) {
                 const std::string path = get_prompt_cache_file_path(prompt);
                 if (std::filesystem::exists(path)) {
+                    // Live in RAM: refresh the on-disk timestamp so the cleanup
+                    // pass does not expire-delete a still-cached prompt.
+                    kvc_disk_touch(path);
                     n_prompt_saved++;
                     continue;
                 }
@@ -976,6 +1046,11 @@ private:
             }
         }
 
+        // Drop stale/invalid caches as part of the periodic autosave pass.
+        // Runs after the writes above so files just refreshed keep their new
+        // timestamps and are never collected here.
+        cleanup_expired_caches();
+
         SRV_INF("[KVC] autosave complete: %d/%d slots and %d prompt cache entries written\n",
             n_saved, n_total, n_prompt_saved);
     }
@@ -986,6 +1061,9 @@ private:
         if (params_base.slot_save_path.empty() || ctx_tgt == nullptr) {
             return;
         }
+
+        // Drop expired and invalid caches before attempting any restore.
+        cleanup_expired_caches();
 
         const kvc_disk_fingerprint expected = make_kvc_fingerprint();
 
@@ -1063,6 +1141,14 @@ private:
                             target_slot->id, (int) target_slot->prompt.n_tokens(), (int) n_pos_out);
                     }
                     n_loaded++;
+                } else {
+                    // Failed validation (CRC / fingerprint / format) — delete the
+                    // invalid cache so it is not re-scanned on the next startup.
+                    std::error_code rm_ec;
+                    std::filesystem::remove(fpath, rm_ec);
+                    if (!rm_ec) {
+                        SRV_INF("[KVC] deleted invalid cache '%s'\n", filename.c_str());
+                    }
                 }
             } else if (filename.rfind("prompt_cache_", 0) == 0) {
                 if (!prompt_cache) {
@@ -1082,6 +1168,14 @@ private:
                     if (!found) {
                         prompt_cache->states.push_back(std::move(prompt));
                         n_prompt_loaded++;
+                    }
+                } else {
+                    // Failed validation (CRC / fingerprint / format) — delete the
+                    // invalid prompt cache so it is not re-scanned on next startup.
+                    std::error_code rm_ec;
+                    std::filesystem::remove(fpath, rm_ec);
+                    if (!rm_ec) {
+                        SRV_INF("[KVC] deleted invalid cache '%s'\n", filename.c_str());
                     }
                 }
             }

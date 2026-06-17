@@ -619,6 +619,7 @@ struct common_params {
 
     // KV cache disk persistence (kvc-disk)
     int32_t kv_autosave_interval = -1; // if >0, save idle KV cache to disk every N seconds
+    int32_t kvc_cache_expiry = -1;     // if >0, delete *.llama_cache files older than N seconds
     // slot_save_path (below) is the single directory for all *.llama_cache files
 
     std::vector<std::string> api_keys;
