@@ -59,7 +59,8 @@ import type {
 	AgenticToolCallList,
 	AgenticFlowCallbacks,
 	AgenticFlowOptions,
-	SteeringMessage
+	SteeringMessage,
+	ToolProgress
 } from '$lib/types/agentic';
 import type {
 	ApiChatCompletionToolCall,
@@ -150,6 +151,9 @@ class AgenticStore {
 	/** Reactive: queued steering messages to inject between turns */
 	private _steeringMessages = new SvelteMap<string, SteeringMessage>();
 
+	/** Reactive: realtime progress per in-flight tool call, keyed by tool_call_id */
+	private _toolProgress = new SvelteMap<string, ToolProgress>();
+
 	get isReady(): boolean {
 		return true;
 	}
@@ -210,6 +214,21 @@ class AgenticStore {
 		conversationId: string
 	): { toolName: string; serverLabel: string } | null {
 		return this._pendingPermissions.get(conversationId) ?? null;
+	}
+
+	/** Current realtime progress for an in-flight tool call, or null. */
+	toolProgress(toolCallId: string): ToolProgress | null {
+		return this._toolProgress.get(toolCallId) ?? null;
+	}
+
+	/** Record realtime progress for an in-flight tool call. */
+	setToolProgress(toolCallId: string, progress: ToolProgress): void {
+		this._toolProgress.set(toolCallId, progress);
+	}
+
+	/** Clear progress for a tool call once it completes. */
+	clearToolProgress(toolCallId: string): void {
+		this._toolProgress.delete(toolCallId);
 	}
 
 	pendingContinueRequest(conversationId: string): boolean {
@@ -798,9 +817,23 @@ class AgenticStore {
 								id: toolCall.id,
 								function: { name: toolName, arguments: toolCall.function.arguments }
 							};
-							const executionResult = await mcpStore.executeTool(mcpCall, signal);
+							try {
+								const executionResult = await mcpStore.executeTool(
+									mcpCall,
+									signal,
+									(progress) => {
+										this.setToolProgress(toolCall.id, {
+											progress: progress.progress,
+											total: progress.total,
+											message: progress.message
+										});
+									}
+								);
 
-							result = executionResult.content;
+								result = executionResult.content;
+							} finally {
+								this.clearToolProgress(toolCall.id);
+							}
 						}
 					} catch (error) {
 						if (isAbortError(error)) {
@@ -994,6 +1027,10 @@ export function agenticStreamingToolCall(conversationId: string) {
 
 export function agenticPendingPermissionRequest(conversationId: string) {
 	return agenticStore.pendingPermissionRequest(conversationId);
+}
+
+export function agenticToolProgress(toolCallId: string) {
+	return agenticStore.toolProgress(toolCallId);
 }
 
 export function agenticResolvePermission(conversationId: string, decision: ToolPermissionDecision) {

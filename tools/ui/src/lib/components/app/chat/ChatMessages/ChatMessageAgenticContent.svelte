@@ -31,7 +31,8 @@
 		agenticResolvePermission,
 		agenticPendingContinueRequest,
 		agenticResolveContinue,
-		agenticLastError
+		agenticLastError,
+		agenticToolProgress
 	} from '$lib/stores/agentic.svelte';
 	import { config } from '$lib/stores/settings.svelte';
 
@@ -275,9 +276,37 @@
 					{/if}
 				</div>
 				{#if isPending}
-					<div class="rounded bg-muted/30 p-2 text-xs text-muted-foreground italic">
-						Waiting for result...
-					</div>
+					{@const progress = section.toolCallId ? agenticToolProgress(section.toolCallId) : null}
+					{#if progress}
+						<div class="rounded bg-muted/30 p-2">
+							<div class="flex items-center gap-2 text-xs text-muted-foreground">
+								<Loader2 class="h-3 w-3 animate-spin" />
+								<span class="[overflow-wrap:anywhere]">
+									{progress.message || 'Working...'}
+								</span>
+								{#if progress.total}
+									<span class="ml-auto tabular-nums">
+										{Math.round((progress.progress / progress.total) * 100)}%
+									</span>
+								{/if}
+							</div>
+							{#if progress.total}
+								<div class="mt-1.5 h-1 w-full overflow-hidden rounded-full bg-muted">
+									<div
+										class="h-full rounded-full bg-primary transition-all duration-300"
+										style="width: {Math.min(
+											100,
+											Math.round((progress.progress / progress.total) * 100)
+										)}%"
+									></div>
+								</div>
+							{/if}
+						</div>
+					{:else}
+						<div class="rounded bg-muted/30 p-2 text-xs text-muted-foreground italic">
+							Waiting for result...
+						</div>
+					{/if}
 				{:else if section.toolResult}
 					<div class="overflow-auto rounded-lg border border-border bg-muted p-4">
 						{#each section.parsedLines as line, i (i)}

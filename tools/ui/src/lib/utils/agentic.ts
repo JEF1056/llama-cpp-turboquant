@@ -15,6 +15,7 @@ export interface AgenticSection {
 	type: AgenticSectionType;
 	content: string;
 	toolName?: string;
+	toolCallId?: string;
 	toolArgs?: string;
 	toolResult?: string;
 	toolResultExtras?: DatabaseMessageExtra[];
@@ -79,6 +80,7 @@ function deriveSingleTurnSections(
 			type,
 			content: resultMsg?.content || '',
 			toolName: tc.function?.name,
+			toolCallId: tc.id,
 			toolArgs: tc.function?.arguments,
 			toolResult: resultMsg?.content,
 			toolResultExtras: resultMsg?.extra

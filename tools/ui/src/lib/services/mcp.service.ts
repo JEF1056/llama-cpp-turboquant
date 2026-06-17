@@ -9,7 +9,8 @@ import type {
 	Tool,
 	Prompt,
 	GetPromptResult,
-	ListChangedHandlers
+	ListChangedHandlers,
+	Progress
 } from '@modelcontextprotocol/sdk/types.js';
 import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
 import {
@@ -836,13 +837,15 @@ export class MCPService {
 	 * @param connection - The MCP connection to execute against
 	 * @param params - Tool name and arguments to execute
 	 * @param signal - Optional AbortSignal for cancellation support
+	 * @param onProgress - Optional callback invoked with realtime progress notifications
 	 * @returns Formatted tool execution result with content string and error flag
 	 * @throws {Error} If tool execution fails or is aborted
 	 */
 	static async callTool(
 		connection: MCPConnection,
 		params: ToolCallParams,
-		signal?: AbortSignal
+		signal?: AbortSignal,
+		onProgress?: (progress: Progress) => void
 	): Promise<ToolExecutionResult> {
 		throwIfAborted(signal);
 
@@ -850,7 +853,13 @@ export class MCPService {
 			const result = await connection.client.callTool(
 				{ name: params.name, arguments: params.arguments },
 				undefined,
-				{ signal, timeout: connection.requestTimeoutMs }
+				{
+					signal,
+					timeout: connection.requestTimeoutMs,
+					...(onProgress
+						? { onprogress: onProgress, resetTimeoutOnProgress: true }
+						: {})
+				}
 			);
 
 			return {

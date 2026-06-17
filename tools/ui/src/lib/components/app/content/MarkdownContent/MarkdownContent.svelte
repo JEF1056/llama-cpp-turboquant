@@ -15,6 +15,7 @@
 	import { SvelteMap } from 'svelte/reactivity';
 	import { rehypeRestoreTableHtml } from './plugins/rehype/table-html-restorer';
 	import { rehypeEnhanceLinks } from './plugins/rehype/enhance-links';
+	import { rehypeEnhanceBareUrls } from './plugins/rehype/enhance-bare-urls';
 	import { rehypeEnhanceCodeBlocks } from './plugins/rehype/enhance-code-blocks';
 	import { rehypeEnhanceMermaidBlocks } from './plugins/rehype/enhance-mermaid-blocks';
 	import { rehypeMermaidPre } from './plugins/rehype/mermaid-pre';
@@ -53,11 +54,15 @@
 		SVG_TAG_PREFIX,
 		SVG_SOURCE_ATTR,
 		SVG_RENDERED_ATTR,
-		SVG_INLINE_SHADOW_STYLE
+		SVG_INLINE_SHADOW_STYLE,
+		LINK_PREVIEW_URL_ATTR,
+		LINK_PREVIEW_READY_ATTR,
+		LINK_PREVIEW_NOT_READY_SELECTOR
 	} from '$lib/constants';
 	import { ColorMode, UrlProtocol } from '$lib/enums';
 	import { FileTypeText } from '$lib/enums/files.enums';
 	import { highlightCode, detectIncompleteCodeBlock, type IncompleteCodeBlock } from '$lib/utils';
+	import { fetchLinkPreview, type LinkPreviewData } from '$lib/utils';
 	import { sanitizeSvg } from '$lib/utils/sanitize-svg';
 	import { mountSvgShadow } from '$lib/utils/svg-shadow';
 	import '$styles/katex-custom.scss';
@@ -161,6 +166,7 @@
 			}) // Add syntax highlighting
 			.use(rehypeRestoreTableHtml) // Restore limited HTML (e.g., <br>, <ul>) inside Markdown tables
 			.use(rehypeEnhanceLinks) // Add target="_blank" to links
+			.use(rehypeEnhanceBareUrls) // Render bare image URLs as images, queue link previews
 			.use(rehypeMermaidPre) // Convert mermaid blocks to <pre class="mermaid">
 			.use(rehypeSvgPre) // Convert svg blocks to <pre class="svg-block">
 			.use(rehypeEnhanceCodeBlocks) // Wrap code blocks with header and actions
@@ -494,6 +500,91 @@
 	}
 
 	/**
+	 * Builds a link preview card inside the given placeholder element.
+	 * Uses textContent for all metadata to avoid injecting untrusted HTML.
+	 */
+	function renderLinkPreviewCard(placeholder: Element, data: LinkPreviewData) {
+		const card = document.createElement('a');
+		card.className = 'link-preview-card';
+		card.href = data.url;
+		card.target = '_blank';
+		card.rel = 'noopener noreferrer';
+
+		if (data.image) {
+			const img = document.createElement('img');
+			img.className = 'link-preview-card__image';
+			img.src = data.image;
+			img.alt = '';
+			img.loading = 'lazy';
+			img.addEventListener('error', () => img.remove());
+			card.appendChild(img);
+		}
+
+		const body = document.createElement('div');
+		body.className = 'link-preview-card__body';
+
+		if (data.siteName) {
+			const site = document.createElement('div');
+			site.className = 'link-preview-card__site';
+			site.textContent = data.siteName;
+			body.appendChild(site);
+		}
+
+		if (data.title) {
+			const title = document.createElement('div');
+			title.className = 'link-preview-card__title';
+			title.textContent = data.title;
+			body.appendChild(title);
+		}
+
+		if (data.description) {
+			const desc = document.createElement('div');
+			desc.className = 'link-preview-card__desc';
+			desc.textContent = data.description;
+			body.appendChild(desc);
+		}
+
+		const urlLine = document.createElement('div');
+		urlLine.className = 'link-preview-card__url';
+		urlLine.textContent = data.url;
+		body.appendChild(urlLine);
+
+		card.appendChild(body);
+
+		placeholder.replaceChildren(card);
+	}
+
+	/**
+	 * Hydrates link preview placeholders by fetching metadata and rendering a card.
+	 * Placeholders are marked immediately to avoid duplicate fetches; placeholders
+	 * with no available preview (e.g. proxy disabled) are removed.
+	 */
+	async function setupLinkPreviews() {
+		if (!containerRef) return;
+
+		const placeholders = containerRef.querySelectorAll(LINK_PREVIEW_NOT_READY_SELECTOR);
+
+		for (const placeholder of placeholders) {
+			placeholder.setAttribute(LINK_PREVIEW_READY_ATTR, BOOL_TRUE_STRING);
+
+			const url = placeholder.getAttribute(LINK_PREVIEW_URL_ATTR);
+			if (!url) {
+				placeholder.remove();
+				continue;
+			}
+
+			const data = await fetchLinkPreview(url);
+
+			if (!data) {
+				placeholder.remove();
+				continue;
+			}
+
+			renderLinkPreviewCard(placeholder, data);
+		}
+	}
+
+	/**
 	 * Opens the mermaid diagram in a full-screen preview dialog with zoom/pan support.
 	 * Also handles copy and preview button clicks for mermaid blocks.
 	 * Uses event delegation: a single handler on the container.
@@ -770,6 +861,7 @@
 		if ((hasRenderedBlocks || hasUnstableBlock) && containerRef) {
 			setupCodeBlockActions();
 			setupImageErrorHandlers();
+			setupLinkPreviews();
 			renderMermaidDiagrams();
 			renderSvgDiagrams();
 		}

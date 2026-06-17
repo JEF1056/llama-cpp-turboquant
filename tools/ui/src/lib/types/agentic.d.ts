@@ -73,6 +73,19 @@ export interface AgenticSession {
 }
 
 /**
+ * Realtime progress for an in-flight tool call, sourced from MCP progress
+ * notifications. Keyed by tool_call_id in the agentic store.
+ */
+export interface ToolProgress {
+	/** Current progress value (monotonic, as reported by the server). */
+	progress: number;
+	/** Optional total for computing a percentage. */
+	total?: number;
+	/** Optional human-readable status message for the current step. */
+	message?: string;
+}
+
+/**
  * Callbacks for agentic flow execution.
  *
  * The agentic loop creates separate DB messages for each turn:

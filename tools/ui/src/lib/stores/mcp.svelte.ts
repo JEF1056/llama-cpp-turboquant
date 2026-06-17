@@ -75,7 +75,7 @@ import type {
 	MCPResourceAttachment,
 	MCPResourceContent
 } from '$lib/types';
-import type { ListChangedHandlers } from '@modelcontextprotocol/sdk/types.js';
+import type { ListChangedHandlers, Progress } from '@modelcontextprotocol/sdk/types.js';
 import type { DatabaseMessageExtraMcpResource, McpServerOverride } from '$lib/types/database';
 import type { SettingsConfigType } from '$lib/types/settings';
 
@@ -1136,7 +1136,11 @@ class MCPStore {
 		return MCPService.getPrompt(connection, promptName, args);
 	}
 
-	async executeTool(toolCall: MCPToolCall, signal?: AbortSignal): Promise<ToolExecutionResult> {
+	async executeTool(
+		toolCall: MCPToolCall,
+		signal?: AbortSignal,
+		onProgress?: (progress: Progress) => void
+	): Promise<ToolExecutionResult> {
 		const toolName = toolCall.function.name;
 
 		const serverName = this.toolsIndex.get(toolName);
@@ -1148,7 +1152,12 @@ class MCPStore {
 		const args = this.parseToolArguments(toolCall.function.arguments);
 
 		try {
-			return await MCPService.callTool(connection, { name: toolName, arguments: args }, signal);
+			return await MCPService.callTool(
+				connection,
+				{ name: toolName, arguments: args },
+				signal,
+				onProgress
+			);
 		} catch (error) {
 			// Session expired (server restarted) - reconnect and retry once
 			if (MCPService.isSessionExpiredError(error)) {
@@ -1157,7 +1166,12 @@ class MCPStore {
 				const newConnection = this.connections.get(serverName);
 				if (!newConnection) throw new Error(`Failed to reconnect to "${serverName}"`);
 
-				return MCPService.callTool(newConnection, { name: toolName, arguments: args }, signal);
+				return MCPService.callTool(
+					newConnection,
+					{ name: toolName, arguments: args },
+					signal,
+					onProgress
+				);
 			}
 
 			throw error;

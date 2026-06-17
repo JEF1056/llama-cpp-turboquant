@@ -44,6 +44,9 @@ export { setConfigValue, getConfigValue, configToParameterRecord } from './confi
 // CORS Proxy
 export { buildProxiedUrl, buildProxiedHeaders } from './cors-proxy';
 
+// Link previews
+export { fetchLinkPreview, type LinkPreviewData } from './link-preview';
+
 // URL utilities
 export { extractRootDomain, sanitizeExternalUrl } from './url';
 
