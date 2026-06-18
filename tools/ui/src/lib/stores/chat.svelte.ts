@@ -1045,15 +1045,27 @@ class ChatStore {
 		const partialReasoning = lastMessage.reasoningContent || '';
 
 		// nothing to persist when both content and reasoning are empty (e.g. stop before any token)
-		if (!partialContent.trim() && !partialReasoning.trim()) return;
+		if (!partialContent.trim() && !partialReasoning.trim()) {
+			// Still clear any partial tool calls that were streamed into memory but not completed
+			if (lastMessage.toolCalls) {
+				lastMessage.toolCalls = '';
+				await DatabaseService.updateMessage(lastMessage.id, { toolCalls: '' }).catch(
+					console.error
+				);
+			}
+			return;
+		}
 
 		try {
 			const updateData: {
 				content: string;
 				reasoningContent?: string;
+				toolCalls?: string;
 				timings?: ChatMessageTimings;
 			} = {
-				content: partialContent
+				content: partialContent,
+				// Clear any incomplete tool calls that were streamed but not completed
+				toolCalls: ''
 			};
 			if (partialReasoning) {
 				updateData.reasoningContent = partialReasoning;
@@ -1073,9 +1085,11 @@ class ChatStore {
 			}
 			await DatabaseService.updateMessage(lastMessage.id, updateData);
 			lastMessage.content = partialContent;
+			lastMessage.toolCalls = '';
 			if (updateData.timings) lastMessage.timings = updateData.timings;
 		} catch (error) {
 			lastMessage.content = partialContent;
+			lastMessage.toolCalls = '';
 			console.error('Failed to save partial response:', error);
 		}
 	}
