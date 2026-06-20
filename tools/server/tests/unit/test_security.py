@@ -97,7 +97,7 @@ def test_openai_library_correct_api_key():
     ("localhost", "Access-Control-Allow-Origin", "localhost"),
     ("web.mydomain.fr", "Access-Control-Allow-Origin", "web.mydomain.fr"),
     ("origin", "Access-Control-Allow-Credentials", "true"),
-    ("web.mydomain.fr", "Access-Control-Allow-Methods", "GET, POST"),
+    ("web.mydomain.fr", "Access-Control-Allow-Methods", "GET, POST, DELETE"),
     ("web.mydomain.fr", "Access-Control-Allow-Headers", "*"),
 ])
 def test_cors_options(origin: str, cors_header: str, cors_header_value: str):
