@@ -1444,6 +1444,31 @@ static bool is_autoload(const common_params & params, const server_http_req & re
 }
 
 void server_models_routes::init_routes() {
+    this->get_router_health = [this](const server_http_req &) {
+        // The router process itself is always alive here, so a plain "ok" would mask a
+        // crashed backend. A model configured with load-on-startup=true is meant to be
+        // running at all times; if its child died abnormally (is_failed() => UNLOADED
+        // with a non-zero/negative exit code, e.g. an OOM kill or GGML_ABORT) report
+        // UNHEALTHY (503) so Docker's healthcheck stops reporting the container as
+        // healthy. Idle on-demand models, loading/loaded/sleeping models, and models
+        // that were deliberately unloaded (graceful exit_code 0) all stay OK.
+        auto res = std::make_unique<server_http_res>();
+        for (const auto & meta : models.get_all_meta()) {
+            std::string val;
+            const bool load_on_startup =
+                meta.preset.get_option(COMMON_ARG_PRESET_LOAD_ON_STARTUP, val) &&
+                common_arg_utils::is_truthy(val);
+            if (load_on_startup && meta.is_failed()) {
+                res_err(res, format_error_response(
+                    string_format("model '%s' failed (exit status %d)", meta.name.c_str(), meta.exit_code),
+                    ERROR_TYPE_UNAVAILABLE));
+                return res;
+            }
+        }
+        res_ok(res, {{"status", "ok"}});
+        return res;
+    };
+
     this->get_router_props = [this](const server_http_req & req) {
         std::string name = req.get_param("model");
         if (name.empty()) {

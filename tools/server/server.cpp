@@ -161,7 +161,9 @@ int main(int argc, char ** argv) {
         }
 
         // proxy handlers
-        // note: routes.get_health stays the same
+        // override health so a crashed load-on-startup backend is surfaced as UNHEALTHY
+        // instead of being masked by the still-alive router process (see get_router_health)
+        routes.get_health                  = models_routes->get_router_health;
         routes.get_metrics                 = models_routes->proxy_get;
         routes.post_props                  = models_routes->proxy_post;
         routes.post_completions            = models_routes->proxy_post;
