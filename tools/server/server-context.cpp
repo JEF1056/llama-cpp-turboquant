@@ -142,16 +142,16 @@ struct server_slot {
         if (prompt_cache.limit_size > 0 && prompt_cache.size() + cur_size > prompt_cache.limit_size) {
             if (ctx_tgt->get_tria_rt() != nullptr && !prompt.tokens.has_mtmd) {
                 // Free space by evicting older prompts in the cache if the new prompt size is huge
-                size_t max_allowed_size = prompt_cache.limit_size - prompt_cache.size();
-                while (prompt_cache.states.size() > 1 && max_allowed_size < 0.5 * cur_size) {
+                int64_t max_allowed_size = (int64_t)prompt_cache.limit_size - (int64_t)prompt_cache.size();
+                while (prompt_cache.states.size() > 1 && max_allowed_size < (int64_t)(0.5 * cur_size)) {
                     SRV_WRN(" - cache pressure: evicting oldest entry (size = %.3f MiB) to make room for new prompt\n",
                             prompt_cache.states.front().size() / (1024.0 * 1024.0));
                     prompt_cache.remove_prompt_file(prompt_cache.states.front());
                     prompt_cache.states.pop_front();
-                    max_allowed_size = prompt_cache.limit_size - prompt_cache.size();
+                    max_allowed_size = (int64_t)prompt_cache.limit_size - (int64_t)prompt_cache.size();
                 }
 
-                if (max_allowed_size < cur_size) {
+                if (max_allowed_size < (int64_t)cur_size) {
                     const int32_t n_tokens = (int32_t) prompt.tokens.size();
                     if (n_tokens > 2000) {
                         const double size_per_token = (double) cur_size / n_tokens;
