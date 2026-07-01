@@ -4230,6 +4230,12 @@ void common_params_add_preset_options(std::vector<common_arg> & args) {
         [](common_params &, int) { /* unused */ }
     ).set_env(COMMON_ARG_PRESET_STOP_TIMEOUT).set_preset_only());
 
+    args.push_back(common_arg(
+        {"remote-url"}, "URL",
+        "Remote server URL for a model backend (preset-only)",
+        [](common_params &, const std::string &) { /* unused */ }
+    ).set_env(COMMON_ARG_PRESET_REMOTE_URL).set_preset_only());
+
     // args.push_back(common_arg(
     //     {"pin"},
     //     "in server router mode, do not unload this model if models_max is exceeded",

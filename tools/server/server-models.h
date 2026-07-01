@@ -64,12 +64,19 @@ static std::string server_model_status_to_string(server_model_status status) {
     }
 }
 
+// address for child process, this is needed because router may run on 0.0.0.0
+// ref: https://github.com/ggml-org/llama.cpp/issues/17862
+#define CHILD_ADDR "127.0.0.1"
+
 struct server_model_meta {
     common_preset preset;
     std::string name;
     std::set<std::string> aliases; // additional names that resolve to this model
     std::set<std::string> tags;    // informational tags, not used for routing
     int port = 0;
+    bool is_remote = false;
+    bool is_https = false;
+    std::string host = CHILD_ADDR;
     server_model_status status = SERVER_MODEL_STATUS_UNLOADED;
     int64_t last_used = 0; // for LRU unloading
     std::vector<std::string> args; // args passed to the model instance, will be populated by render_args()
@@ -111,15 +118,34 @@ struct server_model_meta {
 
 struct subprocess_s;
 
+// Serializable view of backend information for API responses
+struct backend_info {
+    bool is_remote;
+    std::string host;
+    int port;
+    int active_connections;
+    int health_fail_count;
+    bool healthy; // derived: status == LOADED && health_fail_count < 3
+};
+
+struct backend_t {
+    bool is_remote = false;
+    std::string host = CHILD_ADDR;
+    int port = 0;
+    std::shared_ptr<subprocess_s> subproc;
+    FILE * stdin_file = nullptr;
+    int active_connections = 0;
+    int health_fail_count = 0;
+    server_model_status status = SERVER_MODEL_STATUS_UNLOADED;
+};
+
 struct server_models {
 private:
     struct instance_t {
-        std::shared_ptr<subprocess_s> subproc; // shared between main thread and monitoring thread
         std::thread th;
         server_model_meta meta;
-        FILE * stdin_file = nullptr;
-        int active_connections = 0; // number of in-flight proxy requests; protected by mutex
-        int health_fail_count = 0;  // consecutive watchdog /health failures; protected by mutex
+        std::vector<backend_t> backends;
+        int rr_index = 0; // round-robin index for backend selection
     };
 
     std::mutex mutex;
@@ -160,7 +186,7 @@ private:
 
     // flip a running instance to UNLOADED so the next request respawns it.
     // guarded by proc: ignored if the current instance's subprocess differs.
-    void mark_backend_dead(const std::string & name, subprocess_s * proc);
+    void mark_backend_dead(const std::string & name, subprocess_s * proc, int backend_idx = -1);
 
 public:
     server_models(const common_params & params, int argc, char ** argv);
@@ -206,6 +232,17 @@ public:
 
     // proxy an HTTP request to the model instance
     server_http_res_ptr proxy_request(const server_http_req & req, const std::string & method, const std::string & name, bool update_last_used);
+
+    // select a healthy backend for the given model using round-robin;
+    // returns the backend index, or -1 if no healthy backend is available.
+    // not thread-safe — caller must hold mutex.
+    int select_backend(const std::string & name);
+
+    // check if the model has at least one healthy backend available (thread-safe)
+    bool has_healthy_backend(const std::string & name);
+
+    // return backend info for the given model (thread-safe)
+    std::vector<backend_info> get_backends_info(const std::string & name);
 
     // return true if the current process is a child server instance
     static bool is_child_server();
