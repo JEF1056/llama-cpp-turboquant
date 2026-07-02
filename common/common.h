@@ -628,6 +628,7 @@ struct common_params {
     // slot_save_path (below) is the single directory for all *.llama_cache files
 
     std::vector<std::string> api_keys;
+    std::string remote_api_key;  // API key for authenticating with remote backends
 
     std::string ssl_file_key  = "";                                                                         // NOLINT
     std::string ssl_file_cert = "";                                                                         // NOLINT

@@ -78,6 +78,7 @@ struct server_model_meta {
     bool is_https = false;
     std::string host = CHILD_ADDR;
     std::vector<std::string> remote_urls; // all parsed remote URLs (empty for local models)
+    std::vector<std::string> remote_api_keys; // per-backend API keys (empty for local models)
     server_model_status status = SERVER_MODEL_STATUS_UNLOADED;
     int64_t last_used = 0; // for LRU unloading
     std::vector<std::string> args; // args passed to the model instance, will be populated by render_args()
@@ -125,6 +126,7 @@ struct backend_info {
     bool is_remote;
     std::string host;
     int port;
+    bool is_https;
     int active_connections;
     int health_fail_count;
     int priority;
@@ -135,12 +137,14 @@ struct backend_t {
     bool is_remote = false;
     std::string host = CHILD_ADDR;
     int port = 0;
+    bool is_https = false;
     std::shared_ptr<subprocess_s> subproc;
     FILE * stdin_file = nullptr;
     int active_connections = 0;
     int health_fail_count = 0;
     server_model_status status = SERVER_MODEL_STATUS_UNLOADED;
     int priority = 0; // higher = preferred; remote=1, local=0
+    std::string api_key;
 };
 
 struct server_models {
@@ -191,6 +195,9 @@ private:
     // flip a running instance to UNLOADED so the next request respawns it.
     // guarded by proc: ignored if the current instance's subprocess differs.
     void mark_backend_dead(const std::string & name, subprocess_s * proc, int backend_idx = -1);
+
+    // retrieve the configured backend API key (for authenticating remote health probes)
+    std::string get_backend_api_key();
 
 public:
     server_models(const common_params & params, int argc, char ** argv);

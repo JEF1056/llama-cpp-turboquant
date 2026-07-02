@@ -3036,6 +3036,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_API_KEY_FILE"));
     add_opt(common_arg(
+        {"--remote-api-key"}, "KEY",
+        "API key to use when authenticating with remote backends (separate from client-facing --api-key)",
+        [](common_params & params, const std::string & value) {
+            params.remote_api_key = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_REMOTE_API_KEY"));
+    add_opt(common_arg(
         {"--ssl-key-file"}, "FNAME",
         "path to file a PEM-encoded SSL private key",
         [](common_params & params, const std::string & value) {

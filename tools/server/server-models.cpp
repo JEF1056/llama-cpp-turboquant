@@ -201,6 +201,20 @@ void server_model_meta::update_args(common_preset_context & ctx_preset, std::str
         }
     }
 
+    // Parse remote API key(s) — comma-separated list matching remote_urls order
+    std::string remote_api_key_str;
+    bool has_api_key = preset.get_option(COMMON_ARG_PRESET_REMOTE_API_KEY, remote_api_key_str) && !remote_api_key_str.empty();
+
+    remote_api_keys.clear();
+    if (has_api_key) {
+        for (auto & entry : string_split<std::string>(remote_api_key_str, ',')) {
+            entry = string_strip(entry);
+            if (!entry.empty()) {
+                remote_api_keys.push_back(entry);
+            }
+        }
+    }
+
     // Determine if there's a local model source (separate from remote URL presence)
     const bool has_local = preset_has_local_model(preset);
     is_remote = !has_local && !remote_urls.empty();
@@ -353,13 +367,31 @@ server_models::~server_models() {
 // Probe a child's /health endpoint. Any HTTP response (even 503 "loading") means
 // the child's HTTP server is alive; only a transport-level failure (no response)
 // indicates a wedged/dead backend. /health is unauthenticated in llama-server.
-static bool probe_child_health(const std::string & host, int port) {
+static bool probe_child_health(const std::string & host, int port, const std::string & api_key = "") {
     httplib::Client cli(host, port);
     cli.set_connection_timeout(2, 0);
     cli.set_read_timeout(2, 0);
     cli.set_write_timeout(2, 0);
+
+    if (!api_key.empty()) {
+        httplib::Headers headers;
+        headers.emplace("Authorization", "Bearer " + api_key);
+        auto res = cli.Get("/health", headers);
+        return static_cast<bool>(res);
+    }
+
     auto res = cli.Get("/health");
     return static_cast<bool>(res);
+}
+
+std::string server_models::get_backend_api_key() {
+    if (!base_params.remote_api_key.empty()) {
+        return base_params.remote_api_key;
+    }
+    if (!base_params.api_keys.empty()) {
+        return base_params.api_keys[0];
+    }
+    return "";
 }
 
 void server_models::mark_backend_dead(const std::string & name, subprocess_s * proc, int backend_idx) {
@@ -411,6 +443,7 @@ void server_models::watchdog_loop() {
         int                           port;
         server_model_status           st;
         bool                          is_remote;
+        std::string                   api_key;  // per-backend API key captured at snapshot time
     };
     while (!watchdog_stop.load()) {
         // 1) snapshot running instances under the lock (no blocking work here).
@@ -432,7 +465,7 @@ void server_models::watchdog_loop() {
                     // Probe each backend independently
                     for (int bi = 0; bi < (int)inst.backends.size(); ++bi) {
                         auto & b = inst.backends[bi];
-                        probes.push_back({name, bi, b.subproc, b.host, b.port, b.status, b.is_remote});
+                        probes.push_back({name, bi, b.subproc, b.host, b.port, b.status, b.is_remote, b.api_key});
                     }
                 }
             }
@@ -447,7 +480,7 @@ void server_models::watchdog_loop() {
 
             if (p.is_remote) {
                 // Remote backends: no subprocess to check; rely on HTTP probe only.
-                const bool healthy = probe_child_health(p.host, p.port);
+                const bool healthy = probe_child_health(p.host, p.port, p.api_key);
                 std::unique_lock<std::mutex> lk(mutex);
                 auto it = mapping.find(p.name);
                 if (it != mapping.end() && (size_t)p.backend_idx < it->second.backends.size()) {
@@ -471,7 +504,7 @@ void server_models::watchdog_loop() {
                     // /health is served on the child's HTTP thread, independent of the
                     // inference loop, so it answers even mid-generation. Require several
                     // consecutive failures before declaring the backend wedged.
-                    const bool healthy = probe_child_health(p.host, p.port);
+                    const bool healthy = probe_child_health(p.host, p.port, p.api_key);
                     std::unique_lock<std::mutex> lk(mutex);
                     auto it = mapping.find(p.name);
                     if (it != mapping.end() && (size_t)p.backend_idx < it->second.backends.size()) {
@@ -700,8 +733,9 @@ void server_models::load_models() {
                 /* is_remote        */ false,
                 /* is_https         */ false,
                 /* host             */ CHILD_ADDR,
-                /* remote_urls      */ {},
-                /* status           */ SERVER_MODEL_STATUS_UNLOADED,
+                /* remote_urls        */ {},
+                /* remote_api_keys    */ {},
+                /* status             */ SERVER_MODEL_STATUS_UNLOADED,
                 /* last_used        */ 0,
                 /* args             */ std::vector<std::string>(),
                 /* loaded_info      */ {},
@@ -865,6 +899,7 @@ void server_models::load_models() {
                     /* is_https            */ false,
                     /* host                */ CHILD_ADDR,
                     /* remote_urls         */ {},
+                    /* remote_api_keys     */ {},
                     /* status              */ SERVER_MODEL_STATUS_UNLOADED,
                     /* last_used           */ 0,
                     /* args                */ std::vector<std::string>(),
@@ -1289,9 +1324,20 @@ void server_models::load(const std::string & name) {
         backend_t b;
         b.is_remote = true;
         b.priority = 1;
+        b.is_https = is_https_url;
         b.host = h;
         b.port = p;
         b.status = SERVER_MODEL_STATUS_LOADED;
+
+        // Assign per-backend API key from config (falls back to global if not set)
+        size_t backend_idx = inst.backends.size();
+        if (backend_idx < inst.meta.remote_api_keys.size()) {
+            b.api_key = inst.meta.remote_api_keys[backend_idx];
+        } else {
+            // Fallback to global backend API key
+            b.api_key = get_backend_api_key();
+        }
+
         inst.backends.push_back(std::move(b));
     }
 
@@ -1674,9 +1720,12 @@ bool server_models::ensure_model_ready(const std::string & name) {
         throw std::runtime_error("model name=" + name + " failed to load");
     }
 
-    // For remote backends, verify actual connectivity via /health probe.
-    if (!meta->remote_urls.empty()) {
-        const bool healthy = probe_child_health(meta->host, meta->port);
+    // For remote-only models, verify connectivity via /health probe.
+    // For mixed models (local + remote), local backend is already probed
+    // by wait_until_loading_finished; remote backends are trusted until
+    // the watchdog marks them unhealthy.
+    if (meta->is_remote && !meta->remote_urls.empty()) {
+        const bool healthy = probe_child_health(meta->host, meta->port, get_backend_api_key());
         if (!healthy) {
             // Remote server is unreachable — mark it UNLOADED so we don't
             // keep advertising a broken backend.
@@ -1747,6 +1796,7 @@ std::vector<backend_info> server_models::get_backends_info(const std::string & n
         info.is_remote = b.is_remote;
         info.host = b.host;
         info.port = b.port;
+        info.is_https = b.is_https;
         info.active_connections = b.active_connections;
         info.health_fail_count = b.health_fail_count;
         info.priority = b.priority;
@@ -1788,20 +1838,34 @@ server_http_res_ptr server_models::proxy_request(const server_http_req & req, co
             cur_proc = mapping[name].backends[backend_idx].subproc.get();
             host = mapping[name].backends[backend_idx].host;
             port = mapping[name].backends[backend_idx].port;
-            is_https = mapping[name].meta.is_https;
+            is_https = mapping[name].backends[backend_idx].is_https;
         }
         SRV_INF("proxying request to model %s on port %d\n", name.c_str(), port);
         std::string proxy_path = req.path;
         if (!req.query_string.empty()) {
             proxy_path += '?' + req.query_string;
         }
+
+        // Build headers map — override Authorization for remote backends
+        std::map<std::string, std::string> proxy_headers = req.headers;
+
+        // For remote backends, inject the backend API key to authenticate with the remote server
+        // This ensures the remote backend receives a valid API key even if the client didn't send one
+        if (mapping[name].backends[backend_idx].is_remote) {
+            const auto & b = mapping[name].backends[backend_idx];
+            std::string api_key = !b.api_key.empty() ? b.api_key : get_backend_api_key();
+            if (!api_key.empty()) {
+                proxy_headers["Authorization"] = "Bearer " + api_key;
+            }
+        }
+
         auto proxy = std::make_unique<server_http_proxy>(
                 method,
                 is_https ? "https" : "http",
                 host,
                 port,
                 proxy_path,
-                req.headers,
+                proxy_headers,
                 req.body,
                 req.files,
                 req.should_stop,
@@ -2095,6 +2159,7 @@ void server_models_routes::init_routes() {
                     {"type", b.is_remote ? "remote" : "local"},
                     {"host", b.host},
                     {"port", b.port},
+                    {"is_https", b.is_https},
                     {"healthy", b.healthy},
                     {"health_fail_count", b.health_fail_count},
                     {"priority", b.priority},
