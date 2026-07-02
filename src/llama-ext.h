@@ -2,6 +2,7 @@
 
 // this is a staging header for new llama.cpp API
 // breaking changes and C++ are allowed. everything here should be considered WIP
+// try as much as possible to not include this header in the rest of the codebase
 
 #include "llama.h"
 
@@ -101,9 +102,16 @@ LLAMA_API float * llama_get_embeddings_nextn(struct llama_context * ctx);
 // LLAMA_API float * llama_get_embeddings_ith(struct llama_context * ctx, int32_t i);
 LLAMA_API float * llama_get_embeddings_nextn_ith(struct llama_context * ctx, int32_t i);
 
+// Set whether the context outputs the input embeddings of a specific layer
+LLAMA_API void llama_set_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid, bool value);
+
+// mirrors:
+// LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);
+LLAMA_API float * llama_get_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid);
+
 LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
 
-// Returns the device-resident ggml_tensor* holding pre-norm hidden states from
+  // Returns the device-resident ggml_tensor* holding pre-norm hidden states from
 // the most recent llama_decode.  nullptr if embeddings_pre_norm was not enabled
 // or no decode has run yet.  Valid until the next llama_decode on this context.
 LLAMA_API struct ggml_tensor * llama_get_h_pre_norm_tensor(struct llama_context * ctx);
@@ -112,3 +120,12 @@ LLAMA_API struct ggml_tensor * llama_get_h_pre_norm_tensor(struct llama_context 
 // The tensor is consumed exactly once (cleared after set_inputs).  Pass nullptr
 // to revert to the normal host-buffer upload path.
 LLAMA_API void llama_set_next_embd_src_dev(struct llama_context * ctx, struct ggml_tensor * src);
+
+//
+// model/context data extraction
+//
+
+// returns pointer to the target-model layer indices
+LLAMA_API const int32_t * llama_model_target_layer_ids  (const struct llama_model * model);
+// returns the number of extracted layers from target model
+LLAMA_API uint32_t        llama_model_target_layer_ids_n(const struct llama_model * model);

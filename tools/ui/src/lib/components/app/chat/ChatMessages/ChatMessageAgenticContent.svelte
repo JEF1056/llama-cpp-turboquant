@@ -32,7 +32,7 @@
 		agenticResolvePermission,
 		agenticPendingContinueRequest,
 		agenticResolveContinue,
-		agenticLastError,
+ agenticLastError,
 		agenticToolProgress
 	} from '$lib/stores/agentic.svelte';
 	import { config } from '$lib/stores/settings.svelte';
@@ -58,6 +58,10 @@
 	const showToolCallInProgress = $derived(config().showToolCallInProgress as boolean);
 	const showThoughtInProgress = $derived(config().showThoughtInProgress as boolean);
 	const renderThinkingAsMarkdown = $derived(config().renderThinkingAsMarkdown as boolean);
+
+	const hasReasoningError = $derived(
+		isLastAssistantMessage ? !!agenticLastError(message.convId) : false
+	);
 
 	const hasReasoningError = $derived(
 		isLastAssistantMessage ? !!agenticLastError(message.convId) : false
