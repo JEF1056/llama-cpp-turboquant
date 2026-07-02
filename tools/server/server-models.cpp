@@ -106,6 +106,23 @@ static bool preset_has_model_source(const common_preset & preset) {
     return false;
 }
 
+// Returns true if the preset specifies a local model source (file path, URL,
+// or HuggingFace repo) — i.e. anything that requires a subprocess to load.
+// This excludes the __PRESET_REMOTE_URL key which is used for remote backends.
+static bool preset_has_local_model(const common_preset & preset) {
+    static const std::vector<std::string> local_model_keys = {
+        "LLAMA_ARG_MODEL", "LLAMA_ARG_MODEL_URL",
+        "LLAMA_ARG_HF_REPO", "LLAMA_ARG_HF_REPO_FILE",
+    };
+    std::string val;
+    for (const auto & key : local_model_keys) {
+        if (preset.get_option(key, val) && !val.empty()) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static void unset_reserved_args(common_preset & preset, bool unset_model_args) {
     preset.unset_option("LLAMA_ARG_SSL_KEY_FILE");
     preset.unset_option("LLAMA_ARG_SSL_CERT_FILE");
@@ -169,21 +186,43 @@ void server_model_meta::update_args(common_preset_context & ctx_preset, std::str
     // update params
     unset_reserved_args(preset, false);
 
-    // Check if this is a remote backend
-    std::string remote_url;
-    is_remote = preset.get_option(COMMON_ARG_PRESET_REMOTE_URL, remote_url) && !remote_url.empty();
+    // Parse remote URL(s) — comma-separated list of URLs
+    std::string remote_url_str;
+    bool has_remote = preset.get_option(COMMON_ARG_PRESET_REMOTE_URL, remote_url_str) && !remote_url_str.empty();
 
-    if (is_remote) {
-        // Parse remote URL to extract host and port
-        // Expected format: "http://host:port" or "https://host:port" or "host:port"
-        is_https = remote_url.rfind("https://", 0) == 0;
+    remote_urls.clear();
+    if (has_remote) {
+        for (auto & entry : string_split<std::string>(remote_url_str, ',')) {
+            entry = string_strip(entry);
+            if (!entry.empty()) {
+                remote_urls.push_back(entry);
+            }
+        }
+    }
+
+    // Determine if there's a local model source (separate from remote URL presence)
+    const bool has_local = preset_has_local_model(preset);
+    is_remote = !has_local && !remote_urls.empty();
+
+    // Set is_https if any remote URL uses https (regardless of local model presence)
+    if (!remote_urls.empty()) {
+        bool any_https = false;
+        for (const auto & url : remote_urls) {
+            bool this_https = url.rfind("https://", 0) == 0;
+            any_https = any_https || this_https;
+        }
+        is_https = any_https;
+
+        // Parse the first URL for host/port (display fallback)
+        const auto & first_url = remote_urls[0];
+        bool first_https = first_url.rfind("https://", 0) == 0;
         std::string address;
-        if (is_https) {
-            address = remote_url.substr(8);
-        } else if (remote_url.rfind("http://", 0) == 0) {
-            address = remote_url.substr(7);
+        if (first_https) {
+            address = first_url.substr(8);
+        } else if (first_url.rfind("http://", 0) == 0) {
+            address = first_url.substr(7);
         } else {
-            address = remote_url;
+            address = first_url;
         }
         size_t colon = address.rfind(':');
         if (colon != std::string::npos) {
@@ -191,14 +230,16 @@ void server_model_meta::update_args(common_preset_context & ctx_preset, std::str
             try {
                 port = std::stoi(address.substr(colon + 1));
             } catch (...) {
-                port = is_https ? 443 : 80;
+                port = first_https ? 443 : 80;
             }
         } else {
             host = address;
-            port = is_https ? 443 : 80;
+            port = first_https ? 443 : 80;
         }
-        // Don't override remote host/port with local values
-    } else {
+    }
+
+    // Configure local backend if there's a local model source
+    if (has_local) {
         preset.set_option(ctx_preset, "LLAMA_ARG_HOST",  CHILD_ADDR);
         preset.set_option(ctx_preset, "LLAMA_ARG_PORT",  std::to_string(port));
     }
@@ -403,6 +444,9 @@ void server_models::watchdog_loop() {
                 if (it != mapping.end() && (size_t)p.backend_idx < it->second.backends.size()) {
                     if (healthy) {
                         it->second.backends[p.backend_idx].health_fail_count = 0;
+                        if (it->second.backends[p.backend_idx].status == SERVER_MODEL_STATUS_UNLOADED) {
+                            it->second.backends[p.backend_idx].status = SERVER_MODEL_STATUS_LOADED;
+                        }
                     } else {
                         if (it->second.backends[p.backend_idx].health_fail_count < INT_MAX) {
                             it->second.backends[p.backend_idx].health_fail_count++;
@@ -425,6 +469,9 @@ void server_models::watchdog_loop() {
                         if (it->second.backends[p.backend_idx].subproc.get() == proc) {
                             if (healthy) {
                                 it->second.backends[p.backend_idx].health_fail_count = 0;
+                                if (it->second.backends[p.backend_idx].status == SERVER_MODEL_STATUS_UNLOADED) {
+                                    it->second.backends[p.backend_idx].status = SERVER_MODEL_STATUS_LOADED;
+                                }
                             } else {
                                 if (it->second.backends[p.backend_idx].health_fail_count < INT_MAX) {
                                     it->second.backends[p.backend_idx].health_fail_count++;
@@ -644,6 +691,7 @@ void server_models::load_models() {
                 /* is_remote      */ false,
                 /* is_https       */ false,
                 /* host           */ CHILD_ADDR,
+                /* remote_urls    */ {},
                 /* status         */ SERVER_MODEL_STATUS_UNLOADED,
                 /* last_used      */ 0,
                 /* args           */ std::vector<std::string>(),
@@ -806,6 +854,7 @@ void server_models::load_models() {
                     /* is_remote      */ false,
                     /* is_https       */ false,
                     /* host           */ CHILD_ADDR,
+                    /* remote_urls    */ {},
                     /* status         */ SERVER_MODEL_STATUS_UNLOADED,
                     /* last_used      */ 0,
                     /* args           */ std::vector<std::string>(),
@@ -1146,14 +1195,14 @@ void server_models::load(const std::string & name) {
     inst.meta.loaded_info = json{};
     inst.meta.last_used   = ggml_time_ms();
 
-    // Render args first — update_args() determines is_remote and sets host/port
+   // Render args first — update_args() parses remote_urls and determines has_local
     inst.meta.update_args(ctx_preset, bin_path);
 
-    // Check if this is a remote backend
-    const bool is_remote_backend = inst.meta.is_remote;
+    // Check if there's a local model to spawn
+    const bool has_local = preset_has_local_model(inst.meta.preset);
 
-    // Only allocate a local port for non-remote backends
-    if (!is_remote_backend) {
+    // Only allocate a local port for backends that have a local subprocess
+    if (has_local) {
         inst.meta.port = get_free_port();
         if (inst.meta.port <= 0) {
             throw std::runtime_error("failed to get a port number");
@@ -1162,24 +1211,16 @@ void server_models::load(const std::string & name) {
         inst.meta.update_args(ctx_preset, bin_path);
     }
 
-    if (is_remote_backend) {
-        // Remote backend: no subprocess to spawn
+    // 1) Local backend: spawn subprocess if there's a local model source
+    if (has_local) {
         backend_t b;
-        b.is_remote = true;
-        b.host = inst.meta.host;
+        b.is_remote = false;
+        b.priority = 0;
+        b.subproc = std::make_shared<subprocess_s>();
+        b.host = CHILD_ADDR;
         b.port = inst.meta.port;
-        b.status = SERVER_MODEL_STATUS_LOADED;
+        b.status = SERVER_MODEL_STATUS_LOADING;
         inst.backends.push_back(std::move(b));
-
-        // Remote backends are considered "loaded" — no local process to manage
-        inst.meta.status = SERVER_MODEL_STATUS_LOADED;
-    } else {
-        // Local backend: spawn subprocess
-        inst.backends.push_back(backend_t{});
-        inst.backends[0].subproc = std::make_shared<subprocess_s>();
-        inst.backends[0].host = CHILD_ADDR;
-        inst.backends[0].port = inst.meta.port;
-        inst.backends[0].status = SERVER_MODEL_STATUS_LOADING;
 
         {
             SRV_INF("spawning server instance with name=%s on port %d\n", inst.meta.name.c_str(), inst.meta.port);
@@ -1209,9 +1250,48 @@ void server_models::load(const std::string & name) {
         }
     }
 
-    // start a thread to manage the child process
+    // 2) Create remote backends for each remote URL
+    for (const auto & url : inst.meta.remote_urls) {
+        bool is_https_url = url.rfind("https://", 0) == 0;
+        std::string address;
+        if (is_https_url) {
+            address = url.substr(8);
+        } else if (url.rfind("http://", 0) == 0) {
+            address = url.substr(7);
+        } else {
+            address = url;
+        }
+        size_t colon = address.rfind(':');
+        std::string h;
+        int p = is_https_url ? 443 : 80;
+        if (colon != std::string::npos) {
+            h = address.substr(0, colon);
+            try {
+                p = std::stoi(address.substr(colon + 1));
+            } catch (...) {
+                p = is_https_url ? 443 : 80;
+            }
+        } else {
+            h = address;
+        }
+
+        backend_t b;
+        b.is_remote = true;
+        b.priority = 1;
+        b.host = h;
+        b.port = p;
+        b.status = SERVER_MODEL_STATUS_LOADED;
+        inst.backends.push_back(std::move(b));
+    }
+
+    // Remote-only models are considered "loaded" — no local process to manage
+    if (!has_local && !inst.meta.remote_urls.empty()) {
+        inst.meta.status = SERVER_MODEL_STATUS_LOADED;
+    }
+
+    // start a thread to manage the local child process (only if there's a local backend)
     // captured variables are guaranteed to be destroyed only after the thread is joined
-    if (!is_remote_backend) {
+    if (has_local) {
         inst.th = std::thread([this, name, child_proc = inst.backends[0].subproc, port = inst.meta.port, stop_timeout = inst.meta.stop_timeout]() {
             FILE * stdin_file = subprocess_stdin(child_proc.get());
             FILE * stdout_file = subprocess_stdout(child_proc.get()); // combined stdout/stderr
@@ -1331,7 +1411,7 @@ void server_models::load(const std::string & name) {
         this->update_status(name, SERVER_MODEL_STATUS_UNLOADED, exit_code, child_proc.get());
         SRV_INF("instance name=%s exited with status %d\n", name.c_str(), exit_code);
         });
-    } // end if (!is_remote_backend)
+    } // end if (has_local)
 
     // Drain / replace the old instance.
     // IMPORTANT: do NOT call th.join() while holding the mutex — the old monitoring
@@ -1344,13 +1424,21 @@ void server_models::load(const std::string & name) {
     {
         auto & old_instance = mapping[name];
         // old process should have exited already, but just in case, we clean it up here
-        // Skip for remote backends (null subproc).
-        if (!old_instance.backends.empty()
-            && !old_instance.meta.is_remote
-            && old_instance.backends[0].subproc
-            && subprocess_alive(old_instance.backends[0].subproc.get())) {
+        // Check if old instance has a local backend with an alive subprocess
+        bool old_has_local = false;
+        int old_local_idx = -1;
+        for (int i = 0; i < (int)old_instance.backends.size(); ++i) {
+            if (!old_instance.backends[i].is_remote && old_instance.backends[i].subproc) {
+                old_has_local = true;
+                old_local_idx = i;
+                break;
+            }
+        }
+        if (old_has_local
+            && old_instance.backends[old_local_idx].subproc
+            && subprocess_alive(old_instance.backends[old_local_idx].subproc.get())) {
             SRV_WRN("old process for model name=%s is still alive, this is unexpected\n", name.c_str());
-            subprocess_terminate(old_instance.backends[0].subproc.get()); // force kill
+            subprocess_terminate(old_instance.backends[old_local_idx].subproc.get()); // force kill
         }
         old_th = std::move(old_instance.th); // move out; join happens after lock release
     }
@@ -1369,9 +1457,18 @@ void server_models::unload(const std::string & name) {
     auto it = mapping.find(name);
     if (it != mapping.end()) {
         if (it->second.meta.is_running()) {
-            // Remote backends have no subprocess to manage — just flip to UNLOADED.
-            if (it->second.meta.is_remote) {
-                SRV_INF("unloading remote model name=%s\n", name.c_str());
+            // Check if there are any local backends with subprocesses to manage
+            bool has_local_backend = false;
+            for (const auto & b : it->second.backends) {
+                if (!b.is_remote && b.subproc) {
+                    has_local_backend = true;
+                    break;
+                }
+            }
+
+            if (!has_local_backend) {
+                // Remote-only backends have no subprocess to manage — just flip to UNLOADED.
+                SRV_INF("unloading remote-only model name=%s\n", name.c_str());
                 it->second.meta.status = SERVER_MODEL_STATUS_UNLOADED;
                 for (auto & b : it->second.backends) {
                     b.status = SERVER_MODEL_STATUS_UNLOADED;
@@ -1387,7 +1484,7 @@ void server_models::unload(const std::string & name) {
                 cv_stop.notify_all();
             }
             if (it->second.meta.status == SERVER_MODEL_STATUS_LOADING) {
-                // special case: if model is in loading state, unloading means force-killing it
+                // special case: if model is in loading state, unloading means force-killing local backends
                 SRV_WRN("model name=%s is still loading, force-killing\n", name.c_str());
                 for (auto & b : it->second.backends) {
                     if (b.subproc) {
@@ -1410,9 +1507,18 @@ void server_models::unload_all() {
         for (auto & [name, inst] : mapping) {
             if (!inst.meta.is_running()) continue;
 
-            // Remote backends: no subprocess to manage, just mark UNLOADED.
-            if (inst.meta.is_remote) {
-                SRV_INF("unloading remote model name=%s\n", name.c_str());
+            // Check if there are any local backends with subprocesses to manage
+            bool has_local_backend = false;
+            for (const auto & b : inst.backends) {
+                if (!b.is_remote && b.subproc) {
+                    has_local_backend = true;
+                    break;
+                }
+            }
+
+            if (!has_local_backend) {
+                // Remote-only backends: no subprocess to manage, just mark UNLOADED.
+                SRV_INF("unloading remote-only model name=%s\n", name.c_str());
                 inst.meta.status = SERVER_MODEL_STATUS_UNLOADED;
                 for (auto & b : inst.backends) {
                     b.status = SERVER_MODEL_STATUS_UNLOADED;
@@ -1531,10 +1637,24 @@ bool server_models::ensure_model_ready(const std::string & name) {
         load(name);
     }
 
-    // wait for loading to complete (only needed for local backends with subprocess)
-    if (!meta->is_remote) {
-        SRV_INF("waiting until model name=%s is fully loaded...\n", name.c_str());
-        wait_until_loading_finished(name);
+    // wait for loading to complete (only needed if there's a local backend with subprocess)
+    {
+        std::unique_lock<std::mutex> lk(mutex);
+        auto it = mapping.find(name);
+        if (it != mapping.end()) {
+            bool has_local_backend = false;
+            for (const auto & b : it->second.backends) {
+                if (!b.is_remote && b.subproc) {
+                    has_local_backend = true;
+                    break;
+                }
+            }
+            if (has_local_backend) {
+                SRV_INF("waiting until model name=%s is fully loaded...\n", name.c_str());
+                lk.unlock();
+                wait_until_loading_finished(name);
+            }
+        }
     }
 
     // check final status
@@ -1544,7 +1664,7 @@ bool server_models::ensure_model_ready(const std::string & name) {
     }
 
     // For remote backends, verify actual connectivity via /health probe.
-    if (meta->is_remote) {
+    if (!meta->remote_urls.empty()) {
         const bool healthy = probe_child_health(meta->host, meta->port);
         if (!healthy) {
             // Remote server is unreachable — mark it UNLOADED so we don't
@@ -1574,14 +1694,17 @@ int server_models::select_backend(const std::string & name) {
     if (n == 0) {
         return -1;
     }
-    // iterate from rr_index, wrapping around
-    for (int i = 0; i < n; ++i) {
-        int idx = (inst.rr_index + i) % n;
-        backend_t & b = inst.backends[idx];
-        if (b.status == SERVER_MODEL_STATUS_LOADED && b.health_fail_count < 3) {
-            // advance rr_index for next call
-            inst.rr_index = (idx + 1) % n;
-            return idx;
+    // Try priority-1 (remote) first, then priority-0 (local), each in round-robin order
+    for (int tier = 1; tier >= 0; --tier) {
+        for (int i = 0; i < n; ++i) {
+            int idx = (inst.rr_index + i) % n;
+            const backend_t & b = inst.backends[idx];
+            if (b.priority != tier) continue;
+            if (b.status == SERVER_MODEL_STATUS_LOADED && b.health_fail_count < 3) {
+                // advance rr_index for next call
+                inst.rr_index = (idx + 1) % n;
+                return idx;
+            }
         }
     }
     return -1;
@@ -1615,6 +1738,7 @@ std::vector<backend_info> server_models::get_backends_info(const std::string & n
         info.port = b.port;
         info.active_connections = b.active_connections;
         info.health_fail_count = b.health_fail_count;
+        info.priority = b.priority;
         info.healthy = b.status == SERVER_MODEL_STATUS_LOADED && b.health_fail_count < 3;
         result.push_back(info);
     }
@@ -1961,6 +2085,7 @@ void server_models_routes::init_routes() {
                     {"port", b.port},
                     {"healthy", b.healthy},
                     {"health_fail_count", b.health_fail_count},
+                    {"priority", b.priority},
                     {"active_connections", b.active_connections},
                 });
             }

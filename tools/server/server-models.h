@@ -77,6 +77,7 @@ struct server_model_meta {
     bool is_remote = false;
     bool is_https = false;
     std::string host = CHILD_ADDR;
+    std::vector<std::string> remote_urls; // all parsed remote URLs (empty for local models)
     server_model_status status = SERVER_MODEL_STATUS_UNLOADED;
     int64_t last_used = 0; // for LRU unloading
     std::vector<std::string> args; // args passed to the model instance, will be populated by render_args()
@@ -125,6 +126,7 @@ struct backend_info {
     int port;
     int active_connections;
     int health_fail_count;
+    int priority;
     bool healthy; // derived: status == LOADED && health_fail_count < 3
 };
 
@@ -137,6 +139,7 @@ struct backend_t {
     int active_connections = 0;
     int health_fail_count = 0;
     server_model_status status = SERVER_MODEL_STATUS_UNLOADED;
+    int priority = 0; // higher = preferred; remote=1, local=0
 };
 
 struct server_models {
@@ -234,6 +237,8 @@ public:
     server_http_res_ptr proxy_request(const server_http_req & req, const std::string & method, const std::string & name, bool update_last_used);
 
     // select a healthy backend for the given model using round-robin;
+    // prefers priority-1 (remote) over priority-0 (local); falls back to
+    // lower priority if no healthy backend is available at that tier.
     // returns the backend index, or -1 if no healthy backend is available.
     // not thread-safe — caller must hold mutex.
     int select_backend(const std::string & name);
