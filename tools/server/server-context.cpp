@@ -139,7 +139,7 @@ struct server_slot {
 
     server_prompt prompt;
 
-  void prompt_save(server_prompt_cache & prompt_cache) {
+   bool prompt_save(server_prompt_cache & prompt_cache) {
         GGML_ASSERT(prompt.data.size() == 0);
 
         size_t cur_size_tgt =           llama_state_seq_get_size_ext(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
@@ -3754,6 +3754,7 @@ private:
 
                     // check if we should process the image
                     while (slot.prompt.n_tokens() < slot.task->n_tokens() && input_tokens[slot.prompt.n_tokens()] == LLAMA_TOKEN_NULL) {
+                        auto cur_token_idx = slot.prompt.n_tokens();
                         // record the KV position before decoding so we can save/restore it
                         const llama_pos chunk_pos_start = slot.prompt.tokens.pos_next();
 
