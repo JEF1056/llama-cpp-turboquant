@@ -1335,7 +1335,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CTX_CHECKPOINTS").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
-        {"-cms", "--checkpoint-min-step"}, "N",
+        {"-cms", "--checkpoint-min-step", "--checkpoint-every-n-tokens"}, "N",
         string_format("minimum spacing between context checkpoints in tokens (default: %d, 0 = no minimum)", params.checkpoint_min_step),
         [](common_params & params, int value) {
             if (value < 0) {
