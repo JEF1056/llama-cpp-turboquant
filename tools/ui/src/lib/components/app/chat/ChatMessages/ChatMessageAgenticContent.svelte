@@ -63,10 +63,6 @@
 		isLastAssistantMessage ? !!agenticLastError(message.convId) : false
 	);
 
-	const hasReasoningError = $derived(
-		isLastAssistantMessage ? !!agenticLastError(message.convId) : false
-	);
-
 	let permissionDismissed = $state(false);
 
 	const pendingPermission = $derived(
