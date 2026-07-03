@@ -215,6 +215,17 @@ void server_model_meta::update_args(common_preset_context & ctx_preset, std::str
         }
     }
 
+    // Parse remote max concurrency (per remote backend). 0 = unlimited.
+    remote_max_concurrency = 0;
+    std::string remote_max_conc_str;
+    if (preset.get_option(COMMON_ARG_PRESET_REMOTE_MAX_CONCURRENCY, remote_max_conc_str) && !remote_max_conc_str.empty()) {
+        try {
+            remote_max_concurrency = std::max(0, std::stoi(string_strip(remote_max_conc_str)));
+        } catch (...) {
+            remote_max_concurrency = 0;
+        }
+    }
+
     // Determine if there's a local model source (separate from remote URL presence)
     const bool has_local = preset_has_local_model(preset);
     is_remote = !has_local && !remote_urls.empty();
@@ -735,6 +746,7 @@ void server_models::load_models() {
                 /* host             */ CHILD_ADDR,
                 /* remote_urls        */ {},
                 /* remote_api_keys    */ {},
+                /* remote_max_concurrency */ 0,
                 /* status             */ SERVER_MODEL_STATUS_UNLOADED,
                 /* last_used        */ 0,
                 /* args             */ std::vector<std::string>(),
@@ -898,19 +910,20 @@ void server_models::load_models() {
                     /* is_remote           */ false,
                     /* is_https            */ false,
                     /* host                */ CHILD_ADDR,
-                    /* remote_urls         */ {},
-                    /* remote_api_keys     */ {},
-                    /* status              */ SERVER_MODEL_STATUS_UNLOADED,
-                    /* last_used           */ 0,
-                    /* args                */ std::vector<std::string>(),
-                    /* loaded_info         */ {},
-                    /* exit_code           */ 0,
-                    /* stop_timeout        */ DEFAULT_STOP_TIMEOUT,
-                    /* multimodal          */ mtmd_caps{false, false},
-                    /* chat_template       */ {},
-                    /* supports_thinking   */ false,
-                    /* need_download       */ false,
-                };
+/* remote_urls        */ {},
+                /* remote_api_keys    */ {},
+                /* remote_max_concurrency */ 0,
+                /* status             */ SERVER_MODEL_STATUS_UNLOADED,
+                /* last_used        */ 0,
+                /* args             */ std::vector<std::string>(),
+                /* loaded_info      */ {},
+                /* exit_code        */ 0,
+                /* stop_timeout     */ DEFAULT_STOP_TIMEOUT,
+                /* multimodal       */ mtmd_caps{false, false},
+                /* chat_template    */ {},
+                /* supports_thinking */ false,
+                /* need_download    */ false,
+            };
                 add_model(std::move(meta));
                 newly_added.push_back(name);
             }
@@ -1189,11 +1202,151 @@ void server_models::unload_lru() {
     }
 }
 
+std::thread server_models::spawn_local_managing_thread(const std::string & name, std::shared_ptr<subprocess_s> child_proc, int port, int stop_timeout) {
+    // captured variables are guaranteed to be destroyed only after the thread is joined
+    return std::thread([this, name, child_proc, port, stop_timeout]() {
+        FILE * stdin_file = subprocess_stdin(child_proc.get());
+        FILE * stdout_file = subprocess_stdout(child_proc.get()); // combined stdout/stderr
+
+        std::thread log_thread([&]() {
+        // read stdout/stderr and forward to main server log
+        // also handle status report from child process
+        std::vector<char> vec_buf(128 * 1024); // large buffer for storing info
+        char * buffer = vec_buf.data();
+        if (stdout_file) {
+            while (fgets(buffer, vec_buf.size(), stdout_file) != nullptr) {
+                LOG("[%5d] %s", port, buffer);
+                std::string str(buffer);
+                if (string_starts_with(buffer, CMD_CHILD_TO_ROUTER_READY)) {
+                    this->update_status(name, SERVER_MODEL_STATUS_LOADED, 0, child_proc.get());
+                } else if (string_starts_with(buffer, CMD_CHILD_TO_ROUTER_ERROR)) {
+                    SRV_ERR("model name=%s loading error: %s\n", name.c_str(), buffer);
+                    this->update_status(name, SERVER_MODEL_STATUS_UNLOADED, 1, child_proc.get());
+                    std::string err_msg(buffer);
+                    size_t prefix_len = strlen(CMD_CHILD_TO_ROUTER_ERROR);
+                    if (err_msg.size() > prefix_len) {
+                        auto trimmed = err_msg.substr(prefix_len);
+                        while (!trimmed.empty() && (trimmed.back() == '\n' || trimmed.back() == '\r')) {
+                            trimmed.pop_back();
+                        }
+                        this->update_last_error(name, trimmed);
+                    }
+                } else if (string_starts_with(buffer, CMD_CHILD_TO_ROUTER_INFO)) {
+                    this->update_loaded_info(name, str);
+                } else if (string_starts_with(buffer, CMD_CHILD_TO_ROUTER_SLEEP)) {
+                    this->update_status(name, SERVER_MODEL_STATUS_SLEEPING, 0, child_proc.get());
+                }
+            }
+            // EOF on stdout — child process exited (could be a crash).
+            // Immediately mark UNLOADED so /v1/models stops advertising
+            // this model as loaded.
+            if (feof(stdout_file)) {
+                this->update_status(name, SERVER_MODEL_STATUS_UNLOADED, 1, child_proc.get());
+            }
+        } else {
+            SRV_ERR("failed to get stdout/stderr of child process for name=%s\n", name.c_str());
+        }
+    });
+
+    std::thread stopping_thread([&]() {
+        // thread to monitor stopping signal OR child crash
+        auto is_stopping = [this, &name]() {
+            return this->stopping_models.find(name) != this->stopping_models.end();
+        };
+        auto should_wake = [&]() {
+            return is_stopping() || !subprocess_alive(child_proc.get());
+        };
+        {
+            std::unique_lock<std::mutex> lk(this->stop_mutex);
+            this->cv_stop.wait(lk, should_wake);
+        }
+        // child may have already exited (e.g. crashed) — skip shutdown sequence
+        if (!subprocess_alive(child_proc.get())) {
+            return;
+        }
+        SRV_INF("stopping model instance name=%s\n", name.c_str());
+        // send interrupt to child process
+        fprintf(stdin_file, "%s\n", CMD_ROUTER_TO_CHILD_EXIT);
+        fflush(stdin_file);
+        // wait to stop gracefully or timeout
+        int64_t start_time = ggml_time_ms();
+        while (true) {
+            std::unique_lock<std::mutex> lk(this->stop_mutex);
+            if (!is_stopping()) {
+                return; // already stopped
+            }
+            int64_t elapsed = ggml_time_ms() - start_time;
+            if (elapsed >= stop_timeout * 1000) {
+                // timeout, force kill
+                SRV_WRN("force-killing model instance name=%s after %d seconds timeout\n", name.c_str(), stop_timeout);
+                subprocess_terminate(child_proc.get());
+                return;
+            }
+            this->cv_stop.wait_for(lk, std::chrono::seconds(1));
+        }
+    });
+
+    // we reach here when the child process exits
+    // note: we cannot join() prior to this point because it will close stdin_file
+    if (log_thread.joinable()) {
+        log_thread.join();
+    }
+
+    // The log thread may have detected EOF on stdout (child hung up)
+    // without the child actually exiting — e.g. the client disconnected.
+    // In that case the stopping thread is still waiting on cv_stop
+    // because is_stopping() is false and subprocess_alive() is true.
+    // Kill the child here so the stopping thread unblocks and cleanup
+    // (subprocess_join/destroy) runs, freeing GPU memory.
+    if (subprocess_alive(child_proc.get())) {
+        SRV_WRN("model name=%s child still alive after log thread EOF, force-killing\n", name.c_str());
+        subprocess_terminate(child_proc.get());
+    }
+
+    // stop the timeout monitoring thread
+    {
+        std::lock_guard<std::mutex> lk(this->stop_mutex);
+        stopping_models.erase(name);
+        cv_stop.notify_all();
+    }
+    if (stopping_thread.joinable()) {
+        stopping_thread.join();
+    }
+
+    // get the exit code
+    int exit_code = 0;
+    subprocess_join(child_proc.get(), &exit_code);
+    subprocess_destroy(child_proc.get());
+
+    // update status and exit code — pass child_proc so stale updates from a replaced
+    // instance don't overwrite the status of the new one (see update_status guard).
+    this->update_status(name, SERVER_MODEL_STATUS_UNLOADED, exit_code, child_proc.get());
+    SRV_INF("instance name=%s exited with status %d\n", name.c_str(), exit_code);
+    });
+}
+
 void server_models::load(const std::string & name) {
     if (!has_model(name)) {
         throw std::runtime_error("model name=" + name + " is not found");
     }
-    unload_lru();
+
+    // Decide up front whether this load will spawn a local child. A hybrid (local+remote)
+    // model is served from its remote backend(s) and does NOT spawn a local child on load;
+    // it only does so later via escalate_to_local() when no remote backend is usable. Like
+    // remote-only models, hybrid models occupy no local capacity and must not evict others.
+    bool will_spawn_local;
+    {
+        auto meta0 = get_meta(name);
+        const bool has_local0 = meta0.has_value() && preset_has_local_model(meta0->preset);
+        std::string rurl;
+        const bool has_remote0 = meta0.has_value()
+            && meta0->preset.get_option(COMMON_ARG_PRESET_REMOTE_URL, rurl) && !rurl.empty();
+        will_spawn_local = has_local0 && !has_remote0;
+    }
+
+    if (will_spawn_local) {
+        unload_lru();
+    }
 
     std::unique_lock<std::mutex> lk(mutex);
     // edge case: block until any in-progress reload has finished so we always load
@@ -1210,7 +1363,7 @@ void server_models::load(const std::string & name) {
     // exceeding models_max. Without this, the window between unload_lru()
     // releasing its lock and this lock_guard acquiring allows multiple
     // threads to each observe capacity and all proceed to load.
-    if (base_params.models_max > 0) {
+    if (will_spawn_local && base_params.models_max > 0) {
         size_t count_active = 0;
         for (const auto & m : mapping) {
             if (m.second.meta.is_running()) {
@@ -1246,9 +1399,13 @@ void server_models::load(const std::string & name) {
 
     // Check if there's a local model to spawn
     const bool has_local = preset_has_local_model(inst.meta.preset);
+    const bool has_remote = !inst.meta.remote_urls.empty();
+    // Hybrid models (local + remote) defer their local child to escalate_to_local(); only a
+    // local-only model spawns its child here at load time.
+    const bool spawn_local_now = has_local && !has_remote;
 
-    // Only allocate a local port for backends that have a local subprocess
-    if (has_local) {
+    // Only allocate a local port for backends that spawn a local subprocess now
+    if (spawn_local_now) {
         inst.meta.port = get_free_port();
         if (inst.meta.port <= 0) {
             throw std::runtime_error("failed to get a port number");
@@ -1257,8 +1414,8 @@ void server_models::load(const std::string & name) {
         inst.meta.update_args(ctx_preset, bin_path);
     }
 
-    // 1) Local backend: spawn subprocess if there's a local model source
-    if (has_local) {
+    // 1) Local backend: spawn subprocess if there's a local-only model source
+    if (spawn_local_now) {
         backend_t b;
         b.is_remote = false;
         b.priority = 0;
@@ -1328,6 +1485,7 @@ void server_models::load(const std::string & name) {
         b.host = h;
         b.port = p;
         b.status = SERVER_MODEL_STATUS_LOADED;
+        b.max_concurrency = inst.meta.remote_max_concurrency;
 
         // Assign per-backend API key from config (falls back to global if not set)
         size_t backend_idx = inst.backends.size();
@@ -1341,134 +1499,18 @@ void server_models::load(const std::string & name) {
         inst.backends.push_back(std::move(b));
     }
 
-    // Remote-only models are considered "loaded" — no local process to manage
-    if (!has_local && !inst.meta.remote_urls.empty()) {
+    // Models with no local child to spawn now (remote-only, or hybrid deferring to remote)
+    // are considered "loaded" as soon as their remote backend(s) are registered.
+    if (!spawn_local_now && !inst.meta.remote_urls.empty()) {
         inst.meta.status = SERVER_MODEL_STATUS_LOADED;
     }
 
-    // start a thread to manage the local child process (only if there's a local backend)
-    // captured variables are guaranteed to be destroyed only after the thread is joined
-    if (has_local) {
-        inst.th = std::thread([this, name, child_proc = inst.backends[0].subproc, port = inst.meta.port, stop_timeout = inst.meta.stop_timeout]() {
-            FILE * stdin_file = subprocess_stdin(child_proc.get());
-            FILE * stdout_file = subprocess_stdout(child_proc.get()); // combined stdout/stderr
-
-            std::thread log_thread([&]() {
-            // read stdout/stderr and forward to main server log
-            // also handle status report from child process
-            std::vector<char> vec_buf(128 * 1024); // large buffer for storing info
-            char * buffer = vec_buf.data();
-            if (stdout_file) {
-                while (fgets(buffer, vec_buf.size(), stdout_file) != nullptr) {
-                    LOG("[%5d] %s", port, buffer);
-                    std::string str(buffer);
-                    if (string_starts_with(buffer, CMD_CHILD_TO_ROUTER_READY)) {
-                        this->update_status(name, SERVER_MODEL_STATUS_LOADED, 0, child_proc.get());
-                    } else if (string_starts_with(buffer, CMD_CHILD_TO_ROUTER_ERROR)) {
-                        SRV_ERR("model name=%s loading error: %s\n", name.c_str(), buffer);
-                        this->update_status(name, SERVER_MODEL_STATUS_UNLOADED, 1, child_proc.get());
-                        std::string err_msg(buffer);
-                        size_t prefix_len = strlen(CMD_CHILD_TO_ROUTER_ERROR);
-                        if (err_msg.size() > prefix_len) {
-                            auto trimmed = err_msg.substr(prefix_len);
-                            while (!trimmed.empty() && (trimmed.back() == '\n' || trimmed.back() == '\r')) {
-                                trimmed.pop_back();
-                            }
-                            this->update_last_error(name, trimmed);
-                        }
-                    } else if (string_starts_with(buffer, CMD_CHILD_TO_ROUTER_INFO)) {
-                        this->update_loaded_info(name, str);
-                    } else if (string_starts_with(buffer, CMD_CHILD_TO_ROUTER_SLEEP)) {
-                        this->update_status(name, SERVER_MODEL_STATUS_SLEEPING, 0, child_proc.get());
-                    }
-                }
-                // EOF on stdout — child process exited (could be a crash).
-                // Immediately mark UNLOADED so /v1/models stops advertising
-                // this model as loaded.
-                if (feof(stdout_file)) {
-                    this->update_status(name, SERVER_MODEL_STATUS_UNLOADED, 1, child_proc.get());
-                }
-            } else {
-                SRV_ERR("failed to get stdout/stderr of child process for name=%s\n", name.c_str());
-            }
-        });
-
-        std::thread stopping_thread([&]() {
-            // thread to monitor stopping signal OR child crash
-            auto is_stopping = [this, &name]() {
-                return this->stopping_models.find(name) != this->stopping_models.end();
-            };
-            auto should_wake = [&]() {
-                return is_stopping() || !subprocess_alive(child_proc.get());
-            };
-            {
-                std::unique_lock<std::mutex> lk(this->stop_mutex);
-                this->cv_stop.wait(lk, should_wake);
-            }
-            // child may have already exited (e.g. crashed) — skip shutdown sequence
-            if (!subprocess_alive(child_proc.get())) {
-                return;
-            }
-            SRV_INF("stopping model instance name=%s\n", name.c_str());
-            // send interrupt to child process
-            fprintf(stdin_file, "%s\n", CMD_ROUTER_TO_CHILD_EXIT);
-            fflush(stdin_file);
-            // wait to stop gracefully or timeout
-            int64_t start_time = ggml_time_ms();
-            while (true) {
-                std::unique_lock<std::mutex> lk(this->stop_mutex);
-                if (!is_stopping()) {
-                    return; // already stopped
-                }
-                int64_t elapsed = ggml_time_ms() - start_time;
-                if (elapsed >= stop_timeout * 1000) {
-                    // timeout, force kill
-                    SRV_WRN("force-killing model instance name=%s after %d seconds timeout\n", name.c_str(), stop_timeout);
-                    subprocess_terminate(child_proc.get());
-                    return;
-                }
-                this->cv_stop.wait_for(lk, std::chrono::seconds(1));
-            }
-        });
-
-        // we reach here when the child process exits
-        // note: we cannot join() prior to this point because it will close stdin_file
-        if (log_thread.joinable()) {
-            log_thread.join();
-        }
-
-        // The log thread may have detected EOF on stdout (child hung up)
-        // without the child actually exiting — e.g. the client disconnected.
-        // In that case the stopping thread is still waiting on cv_stop
-        // because is_stopping() is false and subprocess_alive() is true.
-        // Kill the child here so the stopping thread unblocks and cleanup
-        // (subprocess_join/destroy) runs, freeing GPU memory.
-        if (subprocess_alive(child_proc.get())) {
-            SRV_WRN("model name=%s child still alive after log thread EOF, force-killing\n", name.c_str());
-            subprocess_terminate(child_proc.get());
-        }
-
-        // stop the timeout monitoring thread
-        {
-            std::lock_guard<std::mutex> lk(this->stop_mutex);
-            stopping_models.erase(name);
-            cv_stop.notify_all();
-        }
-        if (stopping_thread.joinable()) {
-            stopping_thread.join();
-        }
-
-        // get the exit code
-        int exit_code = 0;
-        subprocess_join(child_proc.get(), &exit_code);
-        subprocess_destroy(child_proc.get());
-
-        // update status and exit code — pass child_proc so stale updates from a replaced
-        // instance don't overwrite the status of the new one (see update_status guard).
-        this->update_status(name, SERVER_MODEL_STATUS_UNLOADED, exit_code, child_proc.get());
-        SRV_INF("instance name=%s exited with status %d\n", name.c_str(), exit_code);
-        });
-    } // end if (has_local)
+    // start a thread to manage the local child process (only if a local child was spawned).
+    // Hybrid models defer their local child to escalate_to_local(), which creates its
+    // managing thread on demand via spawn_local_managing_thread().
+    if (spawn_local_now) {
+        inst.th = spawn_local_managing_thread(name, inst.backends[0].subproc, inst.meta.port, inst.meta.stop_timeout);
+    }
 
     // Drain / replace the old instance.
     // IMPORTANT: do NOT call th.join() while holding the mutex — the old monitoring
@@ -1623,13 +1665,38 @@ void server_models::update_status(const std::string & name, server_model_status 
             }
         }
         auto & meta = it->second.meta;
-        meta.status    = status;
-        meta.exit_code = exit_code;
         // Update per-backend status: if a specific proc is given, only update that backend;
         // otherwise propagate to all backends so select_backend can filter.
         for (auto & b : it->second.backends) {
             if (proc == nullptr || (b.subproc && b.subproc.get() == proc)) {
                 b.status = status;
+            }
+        }
+        if (proc == nullptr) {
+            // Whole-model update (no specific backend): apply status directly.
+            meta.status    = status;
+            meta.exit_code = exit_code;
+        } else {
+            // Per-backend update: derive the model's aggregate status from its backends so a
+            // hybrid model stays LOADED while any backend (e.g. its remote) is still serving —
+            // a local child crash must not mark the whole model down while the remote is alive.
+            server_model_status agg = SERVER_MODEL_STATUS_UNLOADED;
+            bool any_loaded = false, any_loading = false, any_sleeping = false;
+            for (const auto & b : it->second.backends) {
+                switch (b.status) {
+                    case SERVER_MODEL_STATUS_LOADED:   any_loaded   = true; break;
+                    case SERVER_MODEL_STATUS_LOADING:  any_loading  = true; break;
+                    case SERVER_MODEL_STATUS_SLEEPING: any_sleeping = true; break;
+                    default: break;
+                }
+            }
+            if (any_loaded)        agg = SERVER_MODEL_STATUS_LOADED;
+            else if (any_loading)  agg = SERVER_MODEL_STATUS_LOADING;
+            else if (any_sleeping) agg = SERVER_MODEL_STATUS_SLEEPING;
+            meta.status = agg;
+            // Only record a failure exit code when the whole model ends up down.
+            if (agg == SERVER_MODEL_STATUS_UNLOADED) {
+                meta.exit_code = exit_code;
             }
         }
     }
@@ -1744,7 +1811,7 @@ bool server_models::ensure_model_ready(const std::string & name) {
     return true;
 }
 
-int server_models::select_backend(const std::string & name) {
+int server_models::select_backend(const std::string & name, bool ignore_capacity) {
     auto it = mapping.find(name);
     if (it == mapping.end()) {
         return -1;
@@ -1760,11 +1827,17 @@ int server_models::select_backend(const std::string & name) {
             int idx = (inst.rr_index + i) % n;
             const backend_t & b = inst.backends[idx];
             if (b.priority != tier) continue;
-            if (b.status == SERVER_MODEL_STATUS_LOADED && b.health_fail_count < 3) {
-                // advance rr_index for next call
-                inst.rr_index = (idx + 1) % n;
-                return idx;
+            if (b.status != SERVER_MODEL_STATUS_LOADED || b.health_fail_count >= 3) continue;
+            // Skip remote backends that are at their concurrency cap so the caller can
+            // fall back to a local switch. Passing ignore_capacity=true disables this,
+            // allowing the request to queue on the remote when no switch is possible.
+            if (!ignore_capacity && b.is_remote && b.max_concurrency > 0 &&
+                b.active_connections >= b.max_concurrency) {
+                continue;
             }
+            // advance rr_index for next call
+            inst.rr_index = (idx + 1) % n;
+            return idx;
         }
     }
     return -1;
@@ -1806,6 +1879,163 @@ std::vector<backend_info> server_models::get_backends_info(const std::string & n
     return result;
 }
 
+bool server_models::escalate_to_local(const std::string & name) {
+    // Called when no remote backend is usable (down or at its concurrency cap) for a hybrid
+    // (local+remote) model. Spawns the model's local child, evicting an idle local-only LRU
+    // model first if models_max requires it. Returns true if a local backend is now (being)
+    // loaded; false if switching was unsafe (models_max reached and no idle local-only victim),
+    // in which case the caller keeps routing to the remote (queueing).
+
+    // Reap a previously-escalated local child that has since exited (a dead backend lingering
+    // with an UNLOADED status). Its managing thread is finished but not yet joined — move it
+    // out and join outside the lock to avoid a deadlock with its final update_status().
+    std::thread stale_th;
+    {
+        std::unique_lock<std::mutex> lk(mutex);
+        auto it = mapping.find(name);
+        if (it == mapping.end()) {
+            return false;
+        }
+        bool has_live_local = false, has_dead_local = false;
+        for (const auto & b : it->second.backends) {
+            if (!b.is_remote && b.subproc) {
+                (b.status == SERVER_MODEL_STATUS_UNLOADED ? has_dead_local : has_live_local) = true;
+            }
+        }
+        if (has_live_local) {
+            return true; // a local child is already loaded or loading
+        }
+        if (has_dead_local) {
+            stale_th = std::move(it->second.th);
+            auto & bks = it->second.backends;
+            bks.erase(std::remove_if(bks.begin(), bks.end(), [](const backend_t & b) {
+                return !b.is_remote && b.subproc && b.status == SERVER_MODEL_STATUS_UNLOADED;
+            }), bks.end());
+        }
+    }
+    if (stale_th.joinable()) {
+        stale_th.join();
+    }
+
+    // 1) Make room if models_max requires it, but only by evicting an IDLE local-only model.
+    //    If none is idle, do not switch (the other model is busy) — caller queues on remote.
+    std::string victim;
+    {
+        std::unique_lock<std::mutex> lk(mutex);
+        if (base_params.models_max > 0) {
+            size_t count_local = 0;
+            int64_t lru_used = INT64_MAX;
+            for (const auto & m : mapping) {
+                bool spawned_local = false, has_remote = false;
+                int active = 0;
+                for (const auto & b : m.second.backends) {
+                    if (!b.is_remote && b.subproc) spawned_local = true;
+                    if (b.is_remote) has_remote = true;
+                    active += b.active_connections;
+                }
+                if (!spawned_local || !m.second.meta.is_running()) {
+                    continue;
+                }
+                count_local++;
+                // Only local-only models are evictable victims: evicting a hybrid's local child
+                // would need partial-unload handling we deliberately avoid here.
+                bool busy = m.second.meta.status == SERVER_MODEL_STATUS_LOADING || active > 0;
+                if (m.first != name && !has_remote && !busy && m.second.meta.last_used < lru_used) {
+                    victim = m.first;
+                    lru_used = m.second.meta.last_used;
+                }
+            }
+            if (count_local >= (size_t) base_params.models_max) {
+                if (victim.empty()) {
+                    SRV_INF("escalate_to_local: models_max reached and no idle local-only model to evict; "
+                            "keeping name=%s on remote\n", name.c_str());
+                    return false; // cannot switch safely
+                }
+            } else {
+                victim.clear(); // capacity available; no eviction needed
+            }
+        }
+    }
+    if (!victim.empty()) {
+        SRV_INF("escalate_to_local: switching name=%s to local; evicting idle LRU name=%s\n", name.c_str(), victim.c_str());
+        unload(victim);
+        std::unique_lock<std::mutex> lk(mutex);
+        cv.wait(lk, [this, &victim]() {
+            auto it = mapping.find(victim);
+            return it == mapping.end() || it->second.meta.status == SERVER_MODEL_STATUS_UNLOADED;
+        });
+    }
+
+    // 2) Spawn the local child and append it as a new backend on the existing instance.
+    std::shared_ptr<subprocess_s> child_proc;
+    {
+        std::unique_lock<std::mutex> lk(mutex);
+        auto it = mapping.find(name);
+        if (it == mapping.end()) {
+            return false;
+        }
+        // Re-check nobody spawned a local child while we released the lock.
+        for (const auto & b : it->second.backends) {
+            if (!b.is_remote && b.subproc) {
+                return true;
+            }
+        }
+        auto & inst = it->second;
+        inst.meta.port = get_free_port();
+        if (inst.meta.port <= 0) {
+            SRV_ERR("escalate_to_local: failed to get a port for name=%s\n", name.c_str());
+            return false;
+        }
+        inst.meta.update_args(ctx_preset, bin_path);
+
+        backend_t b;
+        b.is_remote = false;
+        b.priority  = 0;
+        b.subproc   = std::make_shared<subprocess_s>();
+        b.host      = CHILD_ADDR;
+        b.port      = inst.meta.port;
+        b.status    = SERVER_MODEL_STATUS_LOADING;
+
+        SRV_INF("escalate_to_local: spawning local backend for name=%s on port %d\n", name.c_str(), inst.meta.port);
+        std::vector<std::string> child_args = inst.meta.args;
+        std::vector<std::string> child_env  = base_env;
+        child_env.push_back("LLAMA_SERVER_ROUTER_PORT=" + std::to_string(base_params.port));
+        std::vector<char *> argv = to_char_ptr_array(child_args);
+        std::vector<char *> envp = to_char_ptr_array(child_env);
+        int options = subprocess_option_no_window | subprocess_option_combined_stdout_stderr;
+        if (subprocess_create_ex(argv.data(), options, envp.data(), b.subproc.get()) != 0) {
+            SRV_ERR("escalate_to_local: failed to spawn local backend for name=%s\n", name.c_str());
+            return false;
+        }
+        b.stdin_file = subprocess_stdin(b.subproc.get());
+        child_proc   = b.subproc;
+        int port         = inst.meta.port;
+        int stop_timeout = inst.meta.stop_timeout;
+        inst.backends.push_back(std::move(b));
+        // The remote-registered instance had no managing thread; attach one for the child.
+        inst.th = spawn_local_managing_thread(name, child_proc, port, stop_timeout);
+    }
+    cv.notify_all();
+
+    // 3) Wait until the local child reports ready (LOADED) or fails (UNLOADED).
+    {
+        std::unique_lock<std::mutex> lk(mutex);
+        cv.wait(lk, [this, &name, &child_proc]() {
+            auto it = mapping.find(name);
+            if (it == mapping.end()) {
+                return true;
+            }
+            for (const auto & b : it->second.backends) {
+                if (!b.is_remote && b.subproc.get() == child_proc.get()) {
+                    return b.status != SERVER_MODEL_STATUS_LOADING;
+                }
+            }
+            return true; // backend vanished — stop waiting
+        });
+    }
+    return true;
+}
+
 server_http_res_ptr server_models::proxy_request(const server_http_req & req, const std::string & method, const std::string & name, bool update_last_used) {
     // Retry once if the backend dies during the connection phase (before any
     // response bytes reach the client). A respawned child restores conversation KV
@@ -1830,9 +2060,35 @@ server_http_res_ptr server_models::proxy_request(const server_http_req & req, co
         bool is_https = false;
         {
             std::unique_lock<std::mutex> lk(mutex);
-            backend_idx = select_backend(name);
+            backend_idx = select_backend(name, /*ignore_capacity*/ false);
             if (backend_idx < 0) {
-                throw std::runtime_error("no healthy backend available for model name=" + name);
+                // No remote backend is usable (down or at its concurrency cap). For a hybrid
+                // model with no local child yet, try switching to local (evicting an idle
+                // local-only model if models_max requires it).
+                bool can_escalate = false;
+                auto it = mapping.find(name);
+                if (it != mapping.end()) {
+                    bool has_remote = false, has_local_backend = false;
+                    for (const auto & b : it->second.backends) {
+                        if (b.is_remote) has_remote = true;
+                        if (!b.is_remote && b.subproc) has_local_backend = true;
+                    }
+                    can_escalate = has_remote && !has_local_backend && preset_has_local_model(it->second.meta.preset);
+                }
+                if (can_escalate) {
+                    lk.unlock();
+                    escalate_to_local(name); // best-effort: no-op if switching is unsafe
+                    lk.lock();
+                    backend_idx = select_backend(name, false);
+                }
+                if (backend_idx < 0) {
+                    // Switch was unsafe or the remote is merely saturated: queue on a healthy
+                    // remote by ignoring its concurrency cap.
+                    backend_idx = select_backend(name, /*ignore_capacity*/ true);
+                }
+                if (backend_idx < 0) {
+                    throw std::runtime_error("no healthy backend available for model name=" + name);
+                }
             }
             mapping[name].backends[backend_idx].active_connections++;
             cur_proc = mapping[name].backends[backend_idx].subproc.get();

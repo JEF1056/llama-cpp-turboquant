@@ -4261,6 +4261,13 @@ void common_params_add_preset_options(std::vector<common_arg> & args) {
         [](common_params &, const std::string &) { /* unused */ }
     ).set_env(COMMON_ARG_PRESET_REMOTE_URL).set_preset_only());
 
+    args.push_back(common_arg(
+        {"remote-max-concurrency"}, "N",
+        "in server router mode, max concurrent requests to route to a remote backend before "
+        "falling back to a local switch (0 = unlimited; only fall back when the remote is down)",
+        [](common_params &, int) { /* unused */ }
+    ).set_env(COMMON_ARG_PRESET_REMOTE_MAX_CONCURRENCY).set_preset_only());
+
     // args.push_back(common_arg(
     //     {"pin"},
     //     "in server router mode, do not unload this model if models_max is exceeded",

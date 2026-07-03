@@ -79,6 +79,7 @@ struct server_model_meta {
     std::string host = CHILD_ADDR;
     std::vector<std::string> remote_urls; // all parsed remote URLs (empty for local models)
     std::vector<std::string> remote_api_keys; // per-backend API keys (empty for local models)
+    int remote_max_concurrency = 0; // max in-flight requests per remote backend before falling back to a local switch (0 = unlimited)
     server_model_status status = SERVER_MODEL_STATUS_UNLOADED;
     int64_t last_used = 0; // for LRU unloading
     std::vector<std::string> args; // args passed to the model instance, will be populated by render_args()
@@ -145,6 +146,7 @@ struct backend_t {
     server_model_status status = SERVER_MODEL_STATUS_UNLOADED;
     int priority = 0; // higher = preferred; remote=1, local=0
     std::string api_key;
+    int max_concurrency = 0; // remote only: cap on active_connections before falling back to local (0 = unlimited)
 };
 
 struct server_models {
@@ -199,6 +201,16 @@ private:
     // retrieve the configured backend API key (for authenticating remote health probes)
     std::string get_backend_api_key();
 
+    // spawn the local child process managing thread (subprocess is created by the caller).
+    // returns the monitoring thread that drives the child's lifecycle (LOADED/UNLOADED/etc).
+    std::thread spawn_local_managing_thread(const std::string & name, std::shared_ptr<subprocess_s> child_proc, int port, int stop_timeout);
+
+    // for a hybrid (local+remote) model currently served only by its remote backend(s),
+    // spawn the local child (evicting an idle local-only LRU model if models_max requires it).
+    // returns true if a local backend is now loaded; false if switching was unsafe (e.g. the
+    // other local model is busy) so the caller should keep routing to the remote (queueing).
+    bool escalate_to_local(const std::string & name);
+
 public:
     server_models(const common_params & params, int argc, char ** argv);
     ~server_models();
@@ -247,9 +259,10 @@ public:
     // select a healthy backend for the given model using round-robin;
     // prefers priority-1 (remote) over priority-0 (local); falls back to
     // lower priority if no healthy backend is available at that tier.
+    // remote backends over their max_concurrency are skipped unless ignore_capacity is set.
     // returns the backend index, or -1 if no healthy backend is available.
     // not thread-safe — caller must hold mutex.
-    int select_backend(const std::string & name);
+    int select_backend(const std::string & name, bool ignore_capacity = false);
 
     // check if the model has at least one healthy backend available (thread-safe)
     bool has_healthy_backend(const std::string & name);
