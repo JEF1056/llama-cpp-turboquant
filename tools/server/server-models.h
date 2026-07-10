@@ -80,6 +80,7 @@ struct server_model_meta {
     std::vector<std::string> remote_urls; // all parsed remote URLs (empty for local models)
     std::vector<std::string> remote_api_keys; // per-backend API keys (empty for local models)
     int remote_max_concurrency = 0; // max in-flight requests per remote backend before falling back to a local switch (0 = unlimited)
+    int remote_fallback_concurrency = 0; // default concurrency cap when max_concurrency=0, triggering local switch (0 = never switch)
     server_model_status status = SERVER_MODEL_STATUS_UNLOADED;
     int64_t last_used = 0; // for LRU unloading
     std::vector<std::string> args; // args passed to the model instance, will be populated by render_args()
@@ -146,7 +147,8 @@ struct backend_t {
     server_model_status status = SERVER_MODEL_STATUS_UNLOADED;
     int priority = 0; // higher = preferred; remote=1, local=0
     std::string api_key;
-    int max_concurrency = 0; // remote only: cap on active_connections before falling back to local (0 = unlimited)
+    int max_concurrency = 0; // remote only: cap on active_connections before falling back to local (0 = unlimited, uses fallback_concurrency)
+    int fallback_concurrency = 0; // effective cap when max_concurrency=0; 0 means never skip due to load
 };
 
 struct server_models {
@@ -260,6 +262,7 @@ public:
     // prefers priority-1 (remote) over priority-0 (local); falls back to
     // lower priority if no healthy backend is available at that tier.
     // remote backends over their max_concurrency are skipped unless ignore_capacity is set.
+    // when max_concurrency=0, fallback_concurrency acts as the effective cap.
     // returns the backend index, or -1 if no healthy backend is available.
     // not thread-safe — caller must hold mutex.
     int select_backend(const std::string & name, bool ignore_capacity = false);

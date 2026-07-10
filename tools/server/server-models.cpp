@@ -226,6 +226,19 @@ void server_model_meta::update_args(common_preset_context & ctx_preset, std::str
         }
     }
 
+    // Parse remote fallback concurrency: effective cap when max_concurrency=0,
+    // triggering a local switch once active_connections exceed this threshold.
+    // 0 means never apply a fallback cap (remote is never skipped due to load).
+    remote_fallback_concurrency = 0;
+    std::string remote_fallback_conc_str;
+    if (preset.get_option(COMMON_ARG_PRESET_REMOTE_FALLBACK_CONCURRENCY, remote_fallback_conc_str) && !remote_fallback_conc_str.empty()) {
+        try {
+            remote_fallback_concurrency = std::max(0, std::stoi(string_strip(remote_fallback_conc_str)));
+        } catch (...) {
+            remote_fallback_concurrency = 0;
+        }
+    }
+
     // Determine if there's a local model source (separate from remote URL presence)
     const bool has_local = preset_has_local_model(preset);
     is_remote = !has_local && !remote_urls.empty();
@@ -747,6 +760,7 @@ void server_models::load_models() {
                 /* remote_urls        */ {},
                 /* remote_api_keys    */ {},
                 /* remote_max_concurrency */ 0,
+                /* remote_fallback_concurrency */ 0,
                 /* status             */ SERVER_MODEL_STATUS_UNLOADED,
                 /* last_used        */ 0,
                 /* args             */ std::vector<std::string>(),
@@ -901,8 +915,8 @@ void server_models::load_models() {
                     SRV_WRN("(reload) skipping model preset '%s': no model source configured\n", name.c_str());
                     continue;
                 }
-                server_model_meta meta{
-                     /* preset            */ preset,
+ server_model_meta meta{
+                  /* preset            */ preset,
                     /* name                */ name,
                     /* aliases             */ {},
                     /* tags                */ {},
@@ -910,9 +924,10 @@ void server_models::load_models() {
                     /* is_remote           */ false,
                     /* is_https            */ false,
                     /* host                */ CHILD_ADDR,
-/* remote_urls        */ {},
+ /* remote_urls        */ {},
                 /* remote_api_keys    */ {},
                 /* remote_max_concurrency */ 0,
+                /* remote_fallback_concurrency */ 0,
                 /* status             */ SERVER_MODEL_STATUS_UNLOADED,
                 /* last_used        */ 0,
                 /* args             */ std::vector<std::string>(),
@@ -1486,6 +1501,7 @@ void server_models::load(const std::string & name) {
         b.port = p;
         b.status = SERVER_MODEL_STATUS_LOADED;
         b.max_concurrency = inst.meta.remote_max_concurrency;
+        b.fallback_concurrency = inst.meta.remote_fallback_concurrency;
 
         // Assign per-backend API key from config (falls back to global if not set)
         size_t backend_idx = inst.backends.size();
@@ -1831,8 +1847,14 @@ int server_models::select_backend(const std::string & name, bool ignore_capacity
             // Skip remote backends that are at their concurrency cap so the caller can
             // fall back to a local switch. Passing ignore_capacity=true disables this,
             // allowing the request to queue on the remote when no switch is possible.
-            if (!ignore_capacity && b.is_remote && b.max_concurrency > 0 &&
-                b.active_connections >= b.max_concurrency) {
+            // When max_concurrency=0 (unlimited), use fallback_concurrency as an
+            // effective cap to trigger a local switch once the remote is loaded.
+            int effective_cap = b.max_concurrency;
+            if (effective_cap == 0 && b.fallback_concurrency > 0) {
+                effective_cap = b.fallback_concurrency;
+            }
+            if (!ignore_capacity && b.is_remote && effective_cap > 0 &&
+                b.active_connections >= effective_cap) {
                 continue;
             }
             // advance rr_index for next call
