@@ -691,17 +691,20 @@ static __device__ __forceinline__ float vec_dot_q1_0_q8_1(
     const int v = bq1_0->qs[offset + 0] | (bq1_0->qs[offset + 1] << 8) |
                   (bq1_0->qs[offset + 2] << 16) | (bq1_0->qs[offset + 3] << 24);
 
-    // Unpack 32 bits into 32 signed values (-1 or +1)
+    // Unpack 32 bits into 32 raw UNSIGNED {0,1} lanes -- no per-element sign
+    // materialization. Symbol = 2*bit - 1, so sum(symbol*act) = 2*sum(bit*act)
+    // - sum(act); that affine correction is applied once at the end instead
+    // (matches the deferred-correction pattern vec_dot_q4_0_q8_1_impl uses).
     int vi_bytes[8];
 #pragma unroll
     for (int j = 0; j < 8; ++j) {
         const int shift = j * 4;
         const int bits4 = (v >> shift) & 0x0F;
-        const int b0 = (bits4 & 0x01) ? 1 : -1;
-        const int b1 = (bits4 & 0x02) ? 1 : -1;
-        const int b2 = (bits4 & 0x04) ? 1 : -1;
-        const int b3 = (bits4 & 0x08) ? 1 : -1;
-        vi_bytes[j] = (b0 & 0xFF) | ((b1 & 0xFF) << 8) | ((b2 & 0xFF) << 16) | ((b3 & 0xFF) << 24);
+        const int b0    = (bits4 >> 0) & 1;
+        const int b1    = (bits4 >> 1) & 1;
+        const int b2    = (bits4 >> 2) & 1;
+        const int b3    = (bits4 >> 3) & 1;
+        vi_bytes[j]     = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
     }
 
     // Compute dot product for this 32-element chunk
@@ -712,9 +715,10 @@ static __device__ __forceinline__ float vec_dot_q1_0_q8_1(
         sumi = ggml_cuda_dp4a(vi_bytes[j], u, sumi);
     }
 
-    // Apply Q1_0's single scale and this chunk's Q8_1 scale
-    const float d8 = __low2float(bq8_1_chunk->ds);
-    return d1 * d8 * sumi;
+    // ds.x = d8 (per-block activation scale), ds.y = sum(act) in real units
+    // (see quantize_q8_1: y[ib].ds = make_half2(d, sum)).
+    const float2 ds8f = __half22float2(bq8_1_chunk->ds);
+    return d1 * (2.0f * sumi * ds8f.x - ds8f.y);
 }
 
 static __device__ __forceinline__ float vec_dot_q4_0_q8_1(

@@ -295,6 +295,11 @@ struct server_slot {
         return spec && common_speculative_need_embd_nextn(spec);
     }
 
+    bool need_embd_capture() const {
+        GGML_ASSERT(task);
+        return spec && common_speculative_need_embd_capture(spec);
+    }
+
     // if the context does not have a memory module then all embeddings have to be computed within a single ubatch
     // also we cannot split if the pooling would require any past tokens
     // (MTP supports splitting — uses task->need_embd() not need_embd())
@@ -1172,6 +1177,15 @@ private:
             SRV_INF("%s", "speculative decoding context initialized\n");
         } else {
             ctx_dft.reset();
+        }
+
+        // dspark taps the target's hidden states at the drafter's target layers;
+        // engage capture on the target so common_speculative_process() can read
+        // them (every prefill row must also request output, see need_embd_capture)
+        if (spec && common_speculative_need_embd_capture(spec.get())) {
+            llama_set_capture_layers(ctx_tgt,
+                    llama_model_target_layer_ids  (model_dft.get()),
+                    llama_model_target_layer_ids_n(model_dft.get()));
         }
 
         for (int i = 0; i < params_base.n_parallel; i++) {
@@ -3244,12 +3258,13 @@ private:
 
                         // embedding requires all tokens in the batch to be output;
                         // MTP also wants logits at every prompt position so the
-                        // streaming hook can mirror t_h_nextn into ctx_dft.
+                        // streaming hook can mirror t_h_nextn into ctx_dft; dspark
+                        // needs every prefill row output so its target tap is captured.
                         common_batch_add(batch,
                             cur_tok,
                             slot.prompt.tokens.pos_next(),
                             { slot.id },
-                            slot.need_embd());
+                            slot.need_embd() || slot.need_embd_capture());
                         slot.prompt.tokens.push_back(cur_tok);
 
                         slot.n_prompt_tokens_processed++;
