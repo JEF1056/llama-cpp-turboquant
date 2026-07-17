@@ -51,6 +51,14 @@ static uint32_t server_n_outputs_max(const common_params & params) {
         return n_batch;
     }
 
+    // dspark captures the target's hidden state at every prefill position, so prompt
+    // processing flags up to n_batch rows as outputs regardless of the draft length.
+    for (const auto & type : params.speculative.types) {
+        if (type == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK) {
+            return n_batch;
+        }
+    }
+
     const uint32_t n_outputs_per_seq = 1 + common_speculative_n_max(&params.speculative);
 
     const uint64_t n_outputs = (uint64_t) params.n_parallel * n_outputs_per_seq;
