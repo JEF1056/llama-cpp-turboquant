@@ -1625,6 +1625,10 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
             }
 
             bool round_failed = false;
+            // stage the block anchor (dp.id_last -- the "prev" token for resample
+            // position 0) for the in-graph markov resample. Constant across this
+            // round's chunks, and ignored by graphs that don't fuse the resample.
+            llama_set_dspark_anchor(ctx_dft, (int32_t) dp.id_last);
             for (int64_t off = 0; off < ctx_len; off += ctx_per_chunk) {
                 const int64_t chunk = std::min<int64_t>(ctx_per_chunk, ctx_len - off);
                 const bool    last  = (off + chunk == ctx_len);
@@ -1701,6 +1705,41 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
             feat.clear();
             pos.clear();
             rows_since_accept[seq_id] = 0; // this round's rows were just consumed
+
+            // --- in-graph markov resample fast path -----------------------
+            // When the drafter fused the whole block_size sequential resample
+            // into its decode graph (vanilla markov head + the default
+            // LLAMA_DSPARK_MARKOV_INGRAPH), the block_size argmax draft ids are
+            // already computed on-device -- no logits device->host->device
+            // round-trip and no extra host/CUDA resample. Consume them directly;
+            // a null / short return means the graph produced none (target ctx,
+            // no markov head, or the env override), so fall through to the
+            // host/CUDA resample below.
+            {
+                int32_t n_draft_ids = 0;
+                const int32_t * draft_ids = llama_get_dspark_draft_ids(ctx_dft, &n_draft_ids);
+                if (draft_ids != nullptr && n_draft_ids >= block_size) {
+                    // A resample can legitimately emit mask_token_id (a real vocab
+                    // id) at a chained position; that only yields a poor draft the
+                    // target rejects, so warn once instead of aborting.
+                    static bool warned_ingraph_mask = false;
+                    for (int32_t k = 1; k < block_size && !warned_ingraph_mask; ++k) {
+                        if (draft_ids[k - 1] == mask_token_id) {
+                            LOG_WRN("%s: dspark in-graph markov resample produced mask_token_id at a "
+                                    "chained draft position -- drafter emitted the mask sentinel; "
+                                    "the target verify will reject it\n", __func__);
+                            warned_ingraph_mask = true;
+                        }
+                    }
+
+                    llama_tokens result(draft_ids, draft_ids + block_size);
+                    if (result.size() < (size_t) params.n_min) {
+                        continue; // dp.result stays empty: treated as a failed draft
+                    }
+                    *dp.result = std::move(result);
+                    continue;
+                }
+            }
 
             // --- sequential Markov resample -------------------------------
             // step_logits[k] = base_logits[k] + markov_w2(markov_w1(prev_token)),

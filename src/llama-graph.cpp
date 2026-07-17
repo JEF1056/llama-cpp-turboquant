@@ -159,6 +159,15 @@ void llm_graph_input_dspark_ctx::set_input(const llama_ubatch *) {
     }
 }
 
+void llm_graph_input_dspark_anchor::set_input(const llama_ubatch *) {
+    // ignores ubatch: the anchor is the staged dp.id_last, independent of the
+    // current ubatch's tokens (mirrors llm_graph_input_dspark_ctx).
+    if (anchor && dctx) {
+        const int32_t tok = dctx->anchor_token;
+        ggml_backend_tensor_set(anchor, &tok, 0, sizeof(tok));
+    }
+}
+
 void llm_graph_input_pos::set_input(const llama_ubatch * ubatch) {
     if (ubatch->pos && pos) {
         const int64_t n_tokens = ubatch->n_tokens;
@@ -930,6 +939,7 @@ void llm_graph_result::reset() {
 
     t_h_nextn  = nullptr;
     t_h_capture   = nullptr;
+    t_dspark_draft = nullptr;
     t_sampled.clear();
     t_sampled_probs.clear();
     t_sampled_logits.clear();
@@ -982,6 +992,9 @@ void llm_graph_result::set_outputs(const llm_graph_params & params) {
     }
     if (t_h_capture != nullptr) {
         ggml_set_output(t_h_capture);
+    }
+    if (t_dspark_draft != nullptr) {
+        ggml_set_output(t_dspark_draft);
     }
     for (auto & [seq_id, t] : t_sampled) {
         if (t != nullptr) {

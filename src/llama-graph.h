@@ -88,6 +88,11 @@ struct llama_dspark_ctx {
     int64_t n_embd_cap = 0; // n_capture_layers * n_embd (raw tap width, pre dspark.fc)
     int64_t n_ctx_rows = 0; // number of staged context rows for the next decode call
 
+    // draft-block anchor token (dp.id_last): the "prev" token for the in-graph
+    // markov resample at draft position 0. Positions 1.. chain from the previous
+    // position's argmax on-device. Defaults to 0 (reserve-safe).
+    int32_t anchor_token = 0;
+
     // [n_ctx_rows * n_embd_cap], row-major: row i is the concatenated multi-layer
     // tap feature for the i-th staged context row (e.g. from
     // llama_get_embeddings_capture_ith on the target's context, one row per
@@ -199,6 +204,22 @@ public:
     ggml_tensor * feat = nullptr; // F32 [n_freq, n_draft]
 
     std::vector<float> v_feat;
+};
+
+// dspark drafter: the single anchor token for the in-graph vanilla Markov
+// resample (the "prev" token for draft position 0). Reserve-safe like
+// llm_graph_input_dspark_ctx: reads dctx->anchor_token, which defaults to 0
+// when nothing is staged.
+class llm_graph_input_dspark_anchor : public llm_graph_input_i {
+public:
+    llm_graph_input_dspark_anchor(const llama_dspark_ctx * dctx) : dctx(dctx) {}
+    virtual ~llm_graph_input_dspark_anchor() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    ggml_tensor * anchor = nullptr; // I32 [1]
+
+    const llama_dspark_ctx * dctx;
 };
 
 class llm_graph_input_pos : public llm_graph_input_i {
@@ -771,6 +792,8 @@ public:
     // multi-layer hidden-state tap: the per-layer outputs concatenated along dim0
     // into a single [n_capture * n_embd, n_outputs] tensor, in capture order.
     ggml_tensor * get_h_capture()   const { return t_h_capture; }
+    // dspark in-graph vanilla Markov resample: [block_size] I32 argmax draft ids
+    ggml_tensor * get_dspark_draft() const { return t_dspark_draft; }
 
     ggml_cgraph  * get_gf()  const { return gf; }
     ggml_context * get_ctx() const { return ctx_compute.get(); }
@@ -803,6 +826,9 @@ public:
     // [n_capture * n_embd, n_outputs] concatenated multi-layer hidden states, set
     // by the per-model graph builder when cparams.n_capture_layers > 0.
     ggml_tensor * t_h_capture   = nullptr;
+    // [block_size] I32 draft token ids from the dspark in-graph markov resample,
+    // set by the dspark graph builder when the drafter carries a markov head.
+    ggml_tensor * t_dspark_draft = nullptr;
 
     std::vector<ggml_tensor *> t_layer_inp;
 

@@ -998,6 +998,16 @@ float * llama_context::get_embeddings_capture_ith(int32_t i) {
     }
 }
 
+const int32_t * llama_context::get_dspark_draft_ids(int32_t * n_ids) {
+    // no output_reorder(): the draft-id buffer is a single contiguous
+    // block_size-long row produced by the last decode, not an output-indexed
+    // buffer, so it needs no reordering.
+    if (n_ids) {
+        *n_ids = (int32_t) dspark_draft_ids.size();
+    }
+    return dspark_draft_ids.empty() ? nullptr : dspark_draft_ids.data();
+}
+
 llama_token llama_context::get_sampled_token_ith(int32_t idx) {
     output_reorder();
 
@@ -1258,6 +1268,10 @@ void llama_context::set_dspark_ctx(
     dspark_ctx.n_embd_cap = n_embd_cap;
 
     dspark_ctx.v_ctx_feat.assign(feat, feat + (size_t) n_ctx_rows * (size_t) n_embd_cap);
+}
+
+void llama_context::set_dspark_anchor(int32_t anchor_token) {
+    dspark_ctx.anchor_token = anchor_token;
 }
 
 void llama_context::set_causal_attn(bool value) {
@@ -1943,6 +1957,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
     int64_t n_outputs_prev = 0;
     int64_t n_tokens_prev  = 0;
 
+    // dspark: reset the in-graph resample draft ids so a stale value from a prior
+    // decode is never read when the current graph produces none.
+    dspark_draft_ids.clear();
+
     do {
         const auto & ubatch = mctx->get_ubatch();
 
@@ -2134,6 +2152,18 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 }
                 memset(embd_capture_out, 0, n_outputs*row*sizeof(float));
             }
+        }
+
+        // extract dspark in-graph markov resample draft ids ([block_size] I32).
+        // only the final draft chunk requests outputs; skip throwaway chunks
+        // (n_outputs == 0) so their discarded resample doesn't overwrite.
+        if (res->get_dspark_draft() != nullptr && n_outputs > 0) {
+            ggml_tensor * t_draft = res->get_dspark_draft();
+            ggml_backend_t backend_d = ggml_backend_sched_get_tensor_backend(sched.get(), t_draft);
+            GGML_ASSERT(backend_d != nullptr);
+            const int64_t n_ids = t_draft->ne[0];
+            dspark_draft_ids.resize((size_t) n_ids);
+            ggml_backend_tensor_get_async(backend_d, t_draft, dspark_draft_ids.data(), 0, n_ids * sizeof(int32_t));
         }
 
         // Copy backend sampling output if this ubatch produced any sampling tensors.
@@ -3954,6 +3984,15 @@ void llama_set_dspark_ctx(
               int64_t   n_ctx_rows,
               int64_t   n_embd_cap) {
     ctx->set_dspark_ctx(feat, n_ctx_rows, n_embd_cap);
+}
+
+void llama_set_dspark_anchor(llama_context * ctx, int32_t anchor_token) {
+    ctx->set_dspark_anchor(anchor_token);
+}
+
+const int32_t * llama_get_dspark_draft_ids(llama_context * ctx, int32_t * n_ids) {
+    ctx->synchronize();
+    return ctx->get_dspark_draft_ids(n_ids);
 }
 
 bool llama_set_sampler(llama_context * ctx, llama_seq_id seq_id, llama_sampler * smpl) {

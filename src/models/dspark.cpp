@@ -412,5 +412,58 @@ llama_model_dspark::graph::graph(const llama_model & model, const llm_graph_para
     cb(cur, "result_output", -1);
     res->t_logits = cur;
 
-    ggml_build_forward_expand(gf, cur);
+    // --- in-graph vanilla Markov resample (fused into this decode) -----------
+    // Sequentially correct + argmax the block_size draft logits on-device,
+    // chaining each position's argmax into the next position's markov lookup:
+    //   corr[v]  = sum_r w1[prev, r] * w2[v, r]
+    //   step[v]  = base_logits[k][v] + corr[v]
+    //   out[k]   = argmax_v step[v];  prev = out[k]  (anchor for k == 0)
+    // This is the same math as the host/CUDA resample in common/speculative.cpp,
+    // but it runs inside this decode -- no logits device->host->device round-trip
+    // and no extra sync. Each stage's argmax is a normal tensor dependency of the
+    // next stage's get_rows index, so the sequential chain is structural (never
+    // batched over the block). Built only when the drafter carries a vanilla
+    // markov head; disable with LLAMA_DSPARK_MARKOV_INGRAPH=0 to fall back to the
+    // host/CUDA path (the driver reads t_dspark_draft only when it is produced).
+    static const bool ingraph_markov = [] {
+        const char * e = getenv("LLAMA_DSPARK_MARKOV_INGRAPH");
+        return !(e && (e[0] == '0' || e[0] == 'n' || e[0] == 'N' || e[0] == 'f' || e[0] == 'F'));
+    }();
+    if (ingraph_markov && model.dspark_markov_head_a && model.dspark_markov_head_b) {
+        // clamp to the actual draft-logit width; n_draft already equals the block
+        // size here, this just makes the column views structurally in-bounds.
+        int64_t block = hparams.dspark_block_size > 0 ? (int64_t) hparams.dspark_block_size : n_draft;
+        block = std::min(block, res->t_logits->ne[1]);
+
+        auto anchor_input = std::make_unique<llm_graph_input_dspark_anchor>(params.dspark_ctx);
+        anchor_input->anchor = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 1);
+        ggml_set_input(anchor_input->anchor);
+        ggml_set_name(anchor_input->anchor, "dspark_anchor");
+        ggml_tensor * prev_idx = anchor_input->anchor;
+        res->add_input(std::move(anchor_input));
+
+        ggml_tensor * draft_ids = nullptr;
+        for (int64_t k = 0; k < block; ++k) {
+            // base logits for draft position k: column k of t_logits ([n_vocab,
+            // n_draft]); the block occupies output rows 0..block-1 in order.
+            ggml_tensor * logit_k = ggml_view_2d(ctx0, res->t_logits,
+                    res->t_logits->ne[0], 1,
+                    res->t_logits->nb[1], (size_t) k * res->t_logits->nb[1]);
+
+            ggml_tensor * w1row = ggml_get_rows(ctx0, model.dspark_markov_head_a, prev_idx); // [markov_rank, 1]
+            ggml_tensor * corr  = ggml_mul_mat(ctx0, model.dspark_markov_head_b, w1row);      // [n_vocab, 1]
+            ggml_tensor * step  = ggml_add(ctx0, logit_k, corr);                              // [n_vocab, 1]
+            ggml_tensor * idx_k = ggml_argmax(ctx0, step);                                    // [1] I32
+
+            prev_idx  = idx_k; // chain the SAMPLED token into the next lookup
+            draft_ids = draft_ids ? ggml_concat(ctx0, draft_ids, idx_k, 0) : idx_k;
+        }
+        ggml_set_name(draft_ids, "dspark_draft_ids");
+        res->t_dspark_draft = draft_ids;
+    }
+
+    ggml_build_forward_expand(gf, res->t_logits);
+    if (res->t_dspark_draft != nullptr) {
+        ggml_build_forward_expand(gf, res->t_dspark_draft);
+    }
 }

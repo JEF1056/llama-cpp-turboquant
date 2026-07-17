@@ -96,6 +96,11 @@ struct llama_context {
     float *  get_embeddings_capture_ith(int32_t i);
     uint32_t get_n_capture() const;
 
+    // dspark drafter: the in-graph markov resample draft token ids for the last
+    // decode (nullptr / n == 0 when the current graph produced none). See
+    // llm_graph_result::t_dspark_draft.
+    const int32_t * get_dspark_draft_ids(int32_t * n_ids);
+
     llama_token * get_sampled_tokens() const;
     llama_token   get_sampled_token_ith(int32_t idx);
 
@@ -131,6 +136,10 @@ struct llama_context {
     // position pos[i]'s raw concatenated multi-layer tap feature, pre dspark.fc).
     // pass n_ctx_rows <= 0 (or feat == nullptr) to clear the staged context.
     void set_dspark_ctx(const float * feat, int64_t n_ctx_rows, int64_t n_embd_cap);
+
+    // dspark drafter: set the draft-block anchor token (dp.id_last) for the
+    // in-graph markov resample on the next decode() call.
+    void set_dspark_anchor(int32_t anchor_token);
 
     void set_causal_attn(bool value);
     void set_warmup(bool value);
@@ -324,6 +333,12 @@ private:
     // [n_outputs][n_capture_layers * n_embd]). populated only when
     // cparams.n_capture_layers > 0 and the model graph filled t_h_capture.
     buffer_view<float> embd_capture = {nullptr, 0};
+
+    // dspark drafter: [block_size] host copy of the in-graph markov resample
+    // draft token ids, extracted after a decode that produced t_dspark_draft.
+    // empty when the last decode produced none (target ctx, no markov head, or
+    // LLAMA_DSPARK_MARKOV_INGRAPH=0).
+    std::vector<int32_t> dspark_draft_ids;
 
     struct sampling_info {
         // !samplers.empty() to check if any samplers are active

@@ -158,6 +158,20 @@ LLAMA_API void llama_set_dspark_ctx(
               int64_t           n_ctx_rows,
               int64_t           n_embd_cap);
 //
+// dspark drafter: in-graph vanilla Markov resample
+//
+// When the drafter carries a vanilla markov head, its graph fuses the whole
+// block_size sequential resample (markov-correct + chained argmax) into the
+// draft decode, avoiding the logits device->host->device round-trip and the
+// extra sync the host/CUDA resample paths incur. Set the block anchor token
+// (dp.id_last, the "prev" for draft position 0) before the decode, then read
+// the block_size argmax draft ids afterward. llama_get_dspark_draft_ids returns
+// nullptr (and sets *n_ids = 0) when the last decode produced no in-graph
+// resample (target context, no markov head, or LLAMA_DSPARK_MARKOV_INGRAPH=0),
+// so the caller falls back to the host/CUDA resample path.
+LLAMA_API void            llama_set_dspark_anchor   (struct llama_context * ctx, int32_t anchor_token);
+LLAMA_API const int32_t * llama_get_dspark_draft_ids(struct llama_context * ctx, int32_t * n_ids);
+//
 // dspark drafter: model-level metadata + auxiliary-head weights
 //
 // The Phase 2 block-draft loop (common/speculative.cpp) needs a handful of
