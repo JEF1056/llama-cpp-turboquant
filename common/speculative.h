@@ -53,6 +53,13 @@ common_speculative_draft_params & common_speculative_get_draft_params(common_spe
 // optionally call once at the beginning of a new generation
 void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, const llama_tokens & prompt);
 
+// reset per-sequence state before (re)processing a prompt, keeping the first
+// n_keep context rows already resident in the draft cache (the reused
+// prompt-cache prefix; 0 for a full reprocess). Must run before the prompt is
+// decoded so process() can stage the remaining context cleanly. Only dspark
+// acts on this; other implementations treat it as a no-op.
+void common_speculative_reset(common_speculative * spec, llama_seq_id seq_id, llama_pos n_keep);
+
 // process the batch and update the internal state of the speculative context
 bool common_speculative_process(common_speculative * spec, const llama_batch & batch);
 

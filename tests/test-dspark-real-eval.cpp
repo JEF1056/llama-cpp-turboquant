@@ -410,7 +410,7 @@ int main(int argc, char ** argv) {
 
         const auto t_sp0 = std::chrono::steady_clock::now();
 
-        common_speculative_begin(spec, seq_id, prompt_tgt);
+        common_speculative_reset(spec, seq_id, /* n_keep = */ 0);
 
         common_sampler_ptr smpl(common_sampler_init(model_tgt, sparams_smpl));
 

@@ -3135,6 +3135,13 @@ private:
 
                         slot.prompt.tokens.keep_first(n_past);
 
+                        // reset draft host-side staging before prefill so this prompt's
+                        // capture rows are not mixed with leftovers from a prior request;
+                        // keep the n_past tokens already resident in ctx_dft.
+                        if (slot.can_speculate()) {
+                            common_speculative_reset(spec.get(), slot.id, n_past);
+                        }
+
                         // this is to signal the client that the request has started processing
                         if (slot.task->params.stream) {
                             if (slot.task->params.return_progress) {

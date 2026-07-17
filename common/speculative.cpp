@@ -173,6 +173,12 @@ struct common_speculative_impl {
 
     virtual void begin(llama_seq_id seq_id, const llama_tokens & prompt) = 0;
 
+    // reset per-seq state before a prompt is (re)processed, keeping the first
+    // n_keep context rows already resident in the draft cache (0 for a full
+    // reprocess). Default no-op; only dspark needs it, since its capture rows
+    // are staged during prefill and must not be wiped at generation start.
+    virtual void reset(llama_seq_id /*seq_id*/, llama_pos /*n_keep*/) {}
+
     virtual bool process(const llama_batch & batch) = 0;
 
     virtual void draft(common_speculative_draft_params_vec & dparams) = 0;
@@ -1429,19 +1435,29 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
     }
 
     void begin(llama_seq_id seq_id, const llama_tokens & /*prompt*/) override {
+        // per-seq state is reset in reset() BEFORE the prompt is prefilled, so the
+        // capture rows staged by process() during prefill survive into the first
+        // draft (round 1's ctx_len covers the whole new prompt). Clearing here
+        // would instead wipe that just-staged context, so this is a no-op.
+        (void) seq_id;
+    }
+
+    void reset(llama_seq_id seq_id, llama_pos n_keep) override {
         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
             return;
         }
 
-        // fresh generation: drop any leftover state from a prior generation
-        // that reused this seq slot, and make sure ctx_dft's own cache for
-        // this seq starts empty.
-        n_cache[seq_id] = 0;
+        // drop stale per-seq staging left by a prior generation that reused this
+        // slot, keeping the n_keep context rows the driver already has resident in
+        // ctx_dft (the reused prompt-cache prefix; 0 for a full reprocess). Called
+        // before the prompt is decoded, so process() then stages positions
+        // [n_keep, N) cleanly and round 1 sees ctx_len == staged rows.
+        n_cache[seq_id] = n_keep;
         ctx_feat[seq_id].clear();
         ctx_pos[seq_id].clear();
         rows_since_accept[seq_id] = 0;
 
-        llama_memory_seq_rm(llama_get_memory(params.ctx_dft), seq_id, 0, -1);
+        llama_memory_seq_rm(llama_get_memory(params.ctx_dft), seq_id, n_keep, -1);
     }
 
     bool process(const llama_batch & batch_in) override {
@@ -2615,6 +2631,16 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
         common_time_meas tm(impl->t_begin_us, !impl->gen_perf);
         impl->begin(seq_id, prompt);
         impl->n_call_begin++;
+    }
+}
+
+void common_speculative_reset(common_speculative * spec, llama_seq_id seq_id, llama_pos n_keep) {
+    if (spec == nullptr) {
+        return;
+    }
+
+    for (auto & impl : spec->impls) {
+        impl->reset(seq_id, n_keep);
     }
 }
 
