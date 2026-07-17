@@ -1557,7 +1557,7 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
 
     void draft(common_speculative_draft_params_vec & dparams) override {
         auto * ctx_dft = params.ctx_dft;
-        const int64_t n_batch_max = (int64_t) llama_n_batch(ctx_dft);
+        const int64_t n_ubatch_max = (int64_t) llama_n_ubatch(ctx_dft);
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             auto & dp = dparams[seq_id];
@@ -1587,65 +1587,93 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
             GGML_ASSERT(pos.front() == (int32_t) L        && "dspark: staged rows do not start at the drafter's cache position");
             GGML_ASSERT(pos.back()  == (int32_t) start - 1 && "dspark: staged rows do not end just before the anchor position");
 
-            const int64_t n_tokens = ctx_len + block_size;
-            if (n_tokens > n_batch_max) {
-                LOG_ERR("%s: seq %d round needs %lld tokens > n_batch=%lld -- skipping\n",
-                        __func__, (int) seq_id, (long long) n_tokens, (long long) n_batch_max);
+            // dspark conditions the draft block on the whole staged context in a
+            // single non-causal decode, which llama.cpp bounds by n_ubatch. When
+            // the context is larger than one ubatch, prefill it into the drafter
+            // KV cache in n_ubatch-sized chunks: context rows issue no query and
+            // their K/V is a pure function of their own tap features, so writing
+            // them across several decodes is equivalent to one -- the same
+            // growing-cache mechanism the multi-round loop already relies on to
+            // attend to earlier committed context. Only the final chunk carries
+            // the real draft block; earlier chunks append a throwaway block (the
+            // graph requires >= 1 draft row) that is cropped away immediately.
+            const int64_t ctx_per_chunk = n_ubatch_max - block_size;
+            if (ctx_per_chunk < 1) {
+                LOG_ERR("%s: seq %d n_ubatch=%lld cannot hold a draft block of %d plus context -- skipping\n",
+                        __func__, (int) seq_id, (long long) n_ubatch_max, (int) block_size);
                 continue;
             }
 
-            llama_set_dspark_ctx(ctx_dft, feat.data(), ctx_len, n_embd_cap);
+            bool round_failed = false;
+            for (int64_t off = 0; off < ctx_len; off += ctx_per_chunk) {
+                const int64_t chunk = std::min<int64_t>(ctx_per_chunk, ctx_len - off);
+                const bool    last  = (off + chunk == ctx_len);
+                const int64_t cbeg  = L + off;      // first context position in this chunk
+                const int64_t cend  = cbeg + chunk; // the block sits here; == start on the final chunk
 
-            common_batch_clear(batch);
-            for (int64_t i = 0; i < ctx_len; ++i) {
-                // dummy token id: this row's real content comes from the
-                // staged dspark ctx feature above, not the token embedding
-                // (see src/models/dspark.cpp -- these columns are sliced away
-                // before the residual stream even forms). logits=false: this
-                // impl never reads output for context rows.
-                common_batch_add(batch, /* token = */ 0, (llama_pos)(L + i), { seq_id }, /* logits = */ false);
+                // stage only this chunk's tap features (feat is row-major
+                // [ctx_len, n_embd_cap], ordered by position starting at L).
+                llama_set_dspark_ctx(ctx_dft, feat.data() + (size_t) off * (size_t) n_embd_cap,
+                        chunk, n_embd_cap);
+
+                common_batch_clear(batch);
+                for (int64_t i = 0; i < chunk; ++i) {
+                    // dummy token id: this row's real content comes from the
+                    // staged dspark ctx feature above, not the token embedding
+                    // (see src/models/dspark.cpp -- these columns are sliced away
+                    // before the residual stream even forms). logits=false: this
+                    // impl never reads output for context rows.
+                    common_batch_add(batch, /* token = */ 0, (llama_pos)(cbeg + i), { seq_id }, /* logits = */ false);
+                }
+                // block position 0 is seeded with the REAL last-accepted token
+                // (the "anchor"), NOT mask_token_id -- matches the Python reference
+                // reference's evaluator._propose (draft_input_ids[:,0] =
+                // output_ids[:,start]). Positions 1..block_size-1 are masked. Only
+                // the final chunk's block attends to the whole context, so only it
+                // requests logits; earlier throwaway blocks do not.
+                common_batch_add(batch, dp.id_last, (llama_pos) cend, { seq_id }, /* logits = */ last);
+                for (int32_t k = 1; k < block_size; ++k) {
+                    common_batch_add(batch, mask_token_id, (llama_pos)(cend + k), { seq_id }, /* logits = */ last);
+                }
+
+                const int32_t rc = llama_decode(ctx_dft, batch);
+
+                // always clear the staged ctx immediately after use, success or not.
+                llama_set_dspark_ctx(ctx_dft, nullptr, 0, 0);
+
+                if (rc != 0) {
+                    LOG_WRN("%s: llama_decode(ctx_dft) failed rc=%d for seq %d (context offset %lld)\n",
+                            __func__, rc, (int) seq_id, (long long) off);
+                    round_failed = true;
+                    break;
+                }
+
+                // crop away the just-written draft block, keeping the committed
+                // context rows [.., cend). On the final chunk cend == start, so
+                // this mirrors past_key_values_draft.crop(start) in the Python
+                // reference; on earlier chunks it drops the throwaway block before
+                // the next chunk appends more context.
+                if (!llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, (llama_pos) cend, -1)) {
+                    // Could not crop just the speculative tail (e.g. the backend
+                    // rejected the partial removal): the physical drafter cache still
+                    // contains the draft rows, so advancing n_cache would desync
+                    // bookkeeping from the cache and corrupt every later round.
+                    // Recover deterministically by wiping the whole drafter sequence
+                    // and resetting bookkeeping so the next round rebuilds its context
+                    // from scratch (a full-sequence removal always succeeds).
+                    LOG_ERR("%s: failed to crop drafter cache tail for seq %d at %lld -- "
+                            "resetting the drafter sequence to recover\n",
+                            __func__, (int) seq_id, (long long) cend);
+                    llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, -1, -1);
+                    n_cache[seq_id] = 0;
+                    feat.clear();
+                    pos.clear();
+                    rows_since_accept[seq_id] = 0;
+                    round_failed = true;
+                    break;
+                }
             }
-            // block position 0 is seeded with the REAL last-accepted token
-            // (the "anchor"), NOT mask_token_id -- matches the Python reference
-            // reference's evaluator._propose (draft_input_ids[:,0] =
-            // output_ids[:,start]). Positions 1..block_size-1 are masked.
-            common_batch_add(batch, dp.id_last, (llama_pos) start, { seq_id }, /* logits = */ true);
-            for (int32_t k = 1; k < block_size; ++k) {
-                common_batch_add(batch, mask_token_id, (llama_pos)(start + k), { seq_id }, /* logits = */ true);
-            }
-
-            const int32_t rc = llama_decode(ctx_dft, batch);
-
-            // always clear the staged ctx immediately after use, success or not.
-            llama_set_dspark_ctx(ctx_dft, nullptr, 0, 0);
-
-            if (rc != 0) {
-                LOG_WRN("%s: llama_decode(ctx_dft) failed rc=%d for seq %d\n", __func__, rc, (int) seq_id);
-                continue;
-            }
-
-            // crop away the just-written draft block, keeping only the
-            // (now-committed) context rows -- mirrors
-            // past_key_values_draft.crop(start) in the Python reference implementation.
-            // The speculative tail is discarded every round regardless of
-            // what the target ultimately accepts; only accept()/process()
-            // decide what becomes real context for the NEXT round.
-            if (!llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, (llama_pos) start, -1)) {
-                // Could not crop just the speculative tail (e.g. the backend
-                // rejected the partial removal): the physical drafter cache still
-                // contains the draft rows, so advancing n_cache to `start` would
-                // desync bookkeeping from the cache and corrupt every later round.
-                // Recover deterministically by wiping the whole drafter sequence
-                // and resetting bookkeeping so the next round rebuilds its context
-                // from scratch (a full-sequence removal always succeeds).
-                LOG_ERR("%s: failed to crop drafter cache tail for seq %d at start=%lld -- "
-                        "resetting the drafter sequence to recover\n",
-                        __func__, (int) seq_id, (long long) start);
-                llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, -1, -1);
-                n_cache[seq_id] = 0;
-                feat.clear();
-                pos.clear();
-                rows_since_accept[seq_id] = 0;
+            if (round_failed) {
                 continue;
             }
             n_cache[seq_id] = start;
