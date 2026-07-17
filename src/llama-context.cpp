@@ -2155,9 +2155,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
 
         // extract dspark in-graph markov resample draft ids ([block_size] I32).
-        // only the final draft chunk requests outputs; skip throwaway chunks
-        // (n_outputs == 0) so their discarded resample doesn't overwrite.
-        if (res->get_dspark_draft() != nullptr && n_outputs > 0) {
+        // t_dspark_draft is a fixed-width side output independent of n_outputs
+        // (the block requests no host logits under the in-graph path), so gate on
+        // the tensor alone. Chunked prefill decodes the throwaway chunks first and
+        // the real block last, so the final iteration's ids win.
+        if (res->get_dspark_draft() != nullptr) {
             ggml_tensor * t_draft = res->get_dspark_draft();
             ggml_backend_t backend_d = ggml_backend_sched_get_tensor_backend(sched.get(), t_draft);
             GGML_ASSERT(backend_d != nullptr);

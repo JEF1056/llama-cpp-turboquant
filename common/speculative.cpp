@@ -1285,6 +1285,11 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
     std::vector<float> markov_bias;
     int64_t markov_rank = 0;
     bool    has_markov  = false;
+    // in-graph markov resample fused into the drafter decode (src/models/dspark.cpp).
+    // when on, the block draft ids come back via llama_get_dspark_draft_ids and the
+    // drafter needs no host logits, so the block requests no output (skips the
+    // per-round block_size*n_vocab logits D2H). Mirrors the graph-side env gate.
+    bool    markov_ingraph = false;
 #ifdef LLAMA_DSPARK_MARKOV_CUDA
     bool                        markov_use_cuda = false; // device-side resample (default when built with CUDA; LLAMA_DSPARK_MARKOV_CUDA=0 to disable)
     struct dspark_markov_cuda * markov_cuda     = nullptr;
@@ -1375,6 +1380,15 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
             throw std::runtime_error("dspark: vocab size exceeds cblas integer range");
         }
         markov_bias.resize((size_t) n_vocab);
+
+        // in-graph resample default-on when the drafter carries a vanilla markov
+        // head; disable with LLAMA_DSPARK_MARKOV_INGRAPH=0 (matches the graph gate
+        // in src/models/dspark.cpp so the block-output decision stays consistent).
+        markov_ingraph = has_markov;
+        if (const char * e = getenv("LLAMA_DSPARK_MARKOV_INGRAPH")) {
+            const char c   = e[0];
+            markov_ingraph = markov_ingraph && !(c == '0' || c == 'n' || c == 'N' || c == 'f' || c == 'F');
+        }
 
 #ifdef LLAMA_DSPARK_MARKOV_CUDA
         // Device path is the DEFAULT when built with CUDA and a real markov head:
@@ -1654,10 +1668,14 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
                 // reference's evaluator._propose (draft_input_ids[:,0] =
                 // output_ids[:,start]). Positions 1..block_size-1 are masked. Only
                 // the final chunk's block attends to the whole context, so only it
-                // requests logits; earlier throwaway blocks do not.
-                common_batch_add(batch, dp.id_last, (llama_pos) cend, { seq_id }, /* logits = */ last);
+                // requests logits; earlier throwaway blocks do not. With the
+                // in-graph resample the draft ids come back on-device, so the block
+                // requests NO host logits at all (skips the block_size*n_vocab D2H);
+                // the host/CUDA fallback still needs them, hence the guard.
+                const bool block_logits = last && !markov_ingraph;
+                common_batch_add(batch, dp.id_last, (llama_pos) cend, { seq_id }, /* logits = */ block_logits);
                 for (int32_t k = 1; k < block_size; ++k) {
-                    common_batch_add(batch, mask_token_id, (llama_pos)(cend + k), { seq_id }, /* logits = */ last);
+                    common_batch_add(batch, mask_token_id, (llama_pos)(cend + k), { seq_id }, /* logits = */ block_logits);
                 }
 
                 const int32_t rc = llama_decode(ctx_dft, batch);
