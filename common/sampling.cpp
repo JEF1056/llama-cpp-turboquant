@@ -156,6 +156,34 @@ struct common_sampler {
             const auto * logits = llama_get_logits_ith(ctx, idx);
             GGML_ASSERT(logits != nullptr);
 
+            // On-device verify top-K (LLAMA_DSPARK_VERIFY_TOPK_GPU): the backend
+            // already selected the top-K token ids for this row; build the
+            // candidate list from those ids and look up their logit values from
+            // the resident full-logits buffer, skipping the O(n_vocab) host scan.
+            // gpu_cand_count is 0 unless the backend actually produced top-K ids
+            // for this output row (otherwise sampled_ids is the full-vocab fallback).
+            const uint32_t gpu_cand_count = llama_get_sampled_candidates_count_ith(ctx, idx);
+            const bool can_use_gpu_topk =
+                gpu_cand_count > 0 &&
+                (int) gpu_cand_count < n_vocab &&
+                sampled_ids != nullptr &&
+                grmr == nullptr &&
+                params.mirostat == 0 &&
+                params.xtc_probability <= 0.0f &&
+                params.n_probs <= (int32_t) gpu_cand_count &&
+                params.top_k > 0 &&
+                (int) gpu_cand_count >= params.top_k;
+
+            if (can_use_gpu_topk) {
+                cur.resize(gpu_cand_count);
+                for (uint32_t i = 0; i < gpu_cand_count; ++i) {
+                    const llama_token id = sampled_ids[i];
+                    cur[i] = llama_token_data{ id, logits[id], 0.0f };
+                }
+                cur_p = { cur.data(), cur.size(), -1, false };
+                return;
+            }
+
             // Optional host-side top-K pre-truncation before the sampler chain.
             // The chain used for verification is monotone-shrinking: penalties
             // (DRY/repeat/freq/presence) only DECREASE logits and top_k/top_p/min_p/

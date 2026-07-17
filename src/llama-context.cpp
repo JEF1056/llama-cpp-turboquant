@@ -2181,6 +2181,28 @@ int llama_context::decode(const llama_batch & batch_inp) {
             copy_tensor_async_candidates(res->t_candidates,     sampling.candidates, stride, sampling.candidates_count, seq_to_output_row, sched.get());
         }
 
+        // dspark on-device verify top-K: copy the [k, n_outputs] ids into the
+        // per-row candidates buffer so common_sampler::set_logits can build a
+        // pre-truncated candidate list (looking up logit values from the resident
+        // full-logits buffer) without scanning the full vocab. Independent of the
+        // per-seq backend-sampler framework above; gated on the tensor's presence.
+        if (res->get_dspark_topk() != nullptr && sampling.candidates.has_data()) {
+            ggml_tensor * t = res->get_dspark_topk(); // [k, n_rows] I32
+            const int64_t kk    = t->ne[0];
+            const int64_t nrows = t->ne[1];
+            ggml_backend_t backend_tk = ggml_backend_sched_get_tensor_backend(sched.get(), t);
+            GGML_ASSERT(backend_tk != nullptr);
+            for (int64_t r = 0; r < nrows; ++r) {
+                const size_t out_row = (size_t) n_outputs_prev + (size_t) r;
+                if (out_row >= sampling.candidates_count.size()) {
+                    break;
+                }
+                llama_token * dst = sampling.candidates.data + out_row * (size_t) n_vocab;
+                ggml_backend_tensor_get_async(backend_tk, t, dst, (size_t) r * t->nb[1], (size_t) kk * sizeof(int32_t));
+                sampling.candidates_count[out_row] = (uint32_t) kk;
+            }
+        }
+
         n_outputs_prev += n_outputs;
         n_tokens_prev  += ubatch.n_tokens;
     } while (mctx->next());
@@ -2291,9 +2313,19 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
 
     // Allocate backend sampling output buffers if there are backend samplers configured.
     const bool has_sampling = !sampling.samplers.empty();
+    // Opt-in dspark on-device verify top-K: when no per-seq backend samplers are
+    // configured but LLAMA_DSPARK_VERIFY_TOPK_GPU > 0, allocate just the per-row
+    // candidates buffer so the copy path can drop the on-device top-K ids there.
+    static const int dspark_topk_gpu = []() {
+        const char * s = getenv("LLAMA_DSPARK_VERIFY_TOPK_GPU");
+        return s ? atoi(s) : 0;
+    }();
+    const bool has_dspark_topk = !has_sampling && dspark_topk_gpu > 0;
     if (has_sampling) {
         backend_float_count = 2 * n_vocab * n_outputs_max;      // logits + probs
         backend_token_count = (1 + n_vocab) * n_outputs_max;    // sampled + candidates
+    } else if (has_dspark_topk) {
+        backend_token_count = n_vocab * n_outputs_max;          // candidates only
     }
 
     if (output_ids.empty()) {
@@ -2392,6 +2424,22 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
         std::fill(sampling.candidates_count.begin(), sampling.candidates_count.end(), 0);
 
         std::fill_n(sampling.sampled.data, sampling.sampled.size, LLAMA_TOKEN_NULL);
+    } else if (has_dspark_topk) {
+        // candidates-only layout for the dspark on-device verify top-K path.
+        sampling.logits  = {nullptr, 0};
+        sampling.probs   = {nullptr, 0};
+        sampling.sampled = {nullptr, 0};
+
+        sampling.candidates = {(llama_token *) (base + offset), (size_t)(n_vocab*n_outputs_max)};
+        offset += sampling.candidates.size * sizeof(llama_token);
+
+        sampling.logits_count.resize(n_outputs_max);
+        sampling.probs_count.resize(n_outputs_max);
+        sampling.candidates_count.resize(n_outputs_max);
+
+        std::fill(sampling.logits_count.begin(),     sampling.logits_count.end(),     0);
+        std::fill(sampling.probs_count.begin(),      sampling.probs_count.end(),      0);
+        std::fill(sampling.candidates_count.begin(), sampling.candidates_count.end(), 0);
     } else {
         sampling.logits     = {nullptr, 0};
         sampling.probs      = {nullptr, 0};
@@ -2507,6 +2555,14 @@ void llama_context::output_reorder() {
             std::swap(sampling.sampled.data[i0],     sampling.sampled.data[i1]);
             std::swap(sampling.logits_count[i0],     sampling.logits_count[i1]);
             std::swap(sampling.probs_count[i0],      sampling.probs_count[i1]);
+            std::swap(sampling.candidates_count[i0], sampling.candidates_count[i1]);
+        } else if (sampling.candidates.size > 0) {
+            // dspark on-device verify top-K allocates a candidates-only buffer
+            // (no per-seq samplers). Keep its rows consistent with the reordered
+            // logits so get_sampled_candidates_ith and get_logits_ith agree.
+            for (uint64_t k = 0; k < n_vocab; ++k) {
+                std::swap(sampling.candidates.data[i0*n_vocab + k], sampling.candidates.data[i1*n_vocab + k]);
+            }
             std::swap(sampling.candidates_count[i0], sampling.candidates_count[i1]);
         }
     }

@@ -794,6 +794,7 @@ public:
     ggml_tensor * get_h_capture()   const { return t_h_capture; }
     // dspark in-graph vanilla Markov resample: [block_size] I32 argmax draft ids
     ggml_tensor * get_dspark_draft() const { return t_dspark_draft; }
+    ggml_tensor * get_dspark_topk()  const { return t_dspark_topk;  }
 
     ggml_cgraph  * get_gf()  const { return gf; }
     ggml_context * get_ctx() const { return ctx_compute.get(); }
@@ -829,6 +830,9 @@ public:
     // [block_size] I32 draft token ids from the dspark in-graph markov resample,
     // set by the dspark graph builder when the drafter carries a markov head.
     ggml_tensor * t_dspark_draft = nullptr;
+    // [k, n_outputs] I32 top-k token ids over the verify logits, produced by
+    // build_dspark_verify_topk() when LLAMA_DSPARK_VERIFY_TOPK_GPU > 0.
+    ggml_tensor * t_dspark_topk = nullptr;
 
     std::vector<ggml_tensor *> t_layer_inp;
 
@@ -1227,6 +1231,7 @@ struct llm_graph_context {
     //
 
     void build_sampling() const;
+    void build_dspark_verify_topk() const;
 
     //
     // dense (out)

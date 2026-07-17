@@ -940,6 +940,7 @@ void llm_graph_result::reset() {
     t_h_nextn  = nullptr;
     t_h_capture   = nullptr;
     t_dspark_draft = nullptr;
+    t_dspark_topk  = nullptr;
     t_sampled.clear();
     t_sampled_probs.clear();
     t_sampled_logits.clear();
@@ -995,6 +996,9 @@ void llm_graph_result::set_outputs(const llm_graph_params & params) {
     }
     if (t_dspark_draft != nullptr) {
         ggml_set_output(t_dspark_draft);
+    }
+    if (t_dspark_topk != nullptr) {
+        ggml_set_output(t_dspark_topk);
     }
     for (auto & [seq_id, t] : t_sampled) {
         if (t != nullptr) {
@@ -3303,6 +3307,40 @@ void llm_graph_context::build_sampling() const {
         }
     }
     */
+}
+
+void llm_graph_context::build_dspark_verify_topk() const {
+    // Opt-in on-device top-K for the dspark speculative verify sampling.
+    // When enabled, we compute the top-K token ids over the full verify logits
+    // on the backend (a single ggml_top_k over [n_vocab, n_outputs]) and hand
+    // only those ids back to the host sampler. The host sampler reads their logit
+    // values from the already-resident full-logits output buffer, so it can build
+    // a pre-truncated candidate list without the O(n_vocab) host scan that
+    // otherwise dominates the CPU verify sampler chain. Off by default; the guard
+    // (grammar / xtc / mirostat / n_probs / top_k bound) is enforced host-side in
+    // common_sampler::set_logits so the truncated result stays selection-identical.
+    static const int k = []() {
+        const char * s = getenv("LLAMA_DSPARK_VERIFY_TOPK_GPU");
+        return s ? atoi(s) : 0;
+    }();
+
+    if (k <= 0 || res->t_logits == nullptr) {
+        return;
+    }
+
+    // res->t_logits is [n_vocab, n_outputs]. ggml_top_k asserts ne[0] >= k; require
+    // a strictly larger vocab so truncation is meaningful.
+    if (res->t_logits->ne[0] <= k) {
+        return;
+    }
+
+    ggml_tensor * topk = ggml_top_k(ctx0, res->t_logits, k); // [k, n_outputs] I32 ids
+    ggml_set_name(topk, "dspark_verify_topk");
+    ggml_set_output(topk);
+
+    res->t_dspark_topk = topk;
+
+    ggml_build_forward_expand(gf, topk);
 }
 
 int32_t llama_relative_position_bucket(llama_pos x, llama_pos y, uint64_t n_buckets, bool bidirectional) {
