@@ -39,6 +39,20 @@
 #include <windows.h>
 #endif
 
+// Opt-in per-round timing for the dspark speculative loop (LLAMA_DSPARK_PROFILE).
+// Localizes GPU-idle: draft decode+sync vs target verify sync-wait vs host
+// sample/accept over the full vocab. Averages are logged every g_dspark_prof_win
+// verify rounds. Single-threaded (server update loop), so plain statics are fine.
+namespace {
+    const bool  g_dspark_prof     = getenv("LLAMA_DSPARK_PROFILE") != nullptr;
+    const int   g_dspark_prof_win = 64;
+    int64_t     g_dspark_prof_draft_us  = 0;
+    int64_t     g_dspark_prof_sync_us   = 0;
+    int64_t     g_dspark_prof_accept_us = 0;
+    int64_t     g_dspark_prof_ckpt_us   = 0;
+    int64_t     g_dspark_prof_rounds    = 0;
+}
+
 using json = nlohmann::ordered_json;
 
 constexpr int HTTP_POLLING_SECONDS = 1;
@@ -2766,7 +2780,11 @@ private:
 
         // generate the actual drafts (if any)
         {
+            const int64_t t_prof0 = g_dspark_prof ? ggml_time_us() : 0;
             common_speculative_draft(spec.get());
+            if (g_dspark_prof) {
+                g_dspark_prof_draft_us += ggml_time_us() - t_prof0;
+            }
         }
 
         // make checkpoints if needed
@@ -2798,12 +2816,13 @@ private:
                    (ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && draft.size() > llama_n_rs_seq(ctx_dft.get()));
 
                 if (use_ckpt_tgt) {
-                    //const int64_t t_start = ggml_time_us();
+                    const int64_t t_prof_ck = g_dspark_prof ? ggml_time_us() : 0;
 
                     ckpt.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
 
-                    //const int64_t t_total = ggml_time_us() - t_start;
-                    //printf("checkpoint total: %f ms\n", t_total / 1000.0);
+                    if (g_dspark_prof) {
+                        g_dspark_prof_ckpt_us += ggml_time_us() - t_prof_ck;
+                    }
 
                     SLT_DBG(slot, "created speculative checkpoint (pos_min = %d, pos_max = %d, n_tokens = %d, size = %.3f MiB, draft = %.3f MiB)\n",
                             ckpt.pos_min, ckpt.pos_max, slot.prompt.n_tokens(),
@@ -3685,8 +3704,32 @@ private:
                     common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
 
                     GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
+
+                    // split the target verify wait (GPU still busy) from the host
+                    // sample+accept over the full vocab (GPU idle) to localize the gap.
+                    int64_t t_prof_s = 0;
+                    if (g_dspark_prof) {
+                        const int64_t ta = ggml_time_us();
+                        llama_synchronize(slot.ctx_tgt);
+                        t_prof_s = ggml_time_us();
+                        g_dspark_prof_sync_us += t_prof_s - ta;
+                    }
+
                     auto accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
                     slot.spec_i_batch.clear();
+
+                    if (g_dspark_prof) {
+                        g_dspark_prof_accept_us += ggml_time_us() - t_prof_s;
+                        if (++g_dspark_prof_rounds % g_dspark_prof_win == 0) {
+                            const double n = (double) g_dspark_prof_rounds;
+                            SRV_INF("[dspark-prof] per round avg: draft=%.2fms tgt_sync_wait=%.2fms host_sample_accept=%.2fms ckpt_save=%.2fms (rounds=%lld)\n",
+                                    g_dspark_prof_draft_us  / 1e3 / n,
+                                    g_dspark_prof_sync_us   / 1e3 / n,
+                                    g_dspark_prof_accept_us / 1e3 / n,
+                                    g_dspark_prof_ckpt_us   / 1e3 / n,
+                                    (long long) g_dspark_prof_rounds);
+                        }
+                    }
 
                     GGML_ASSERT(accepted.size() >= 1);
 
