@@ -1587,6 +1587,26 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
             GGML_ASSERT(pos.front() == (int32_t) L        && "dspark: staged rows do not start at the drafter's cache position");
             GGML_ASSERT(pos.back()  == (int32_t) start - 1 && "dspark: staged rows do not end just before the anchor position");
 
+            // The chunk batch below writes context rows starting at position L,
+            // which the batch allocator requires to be exactly (drafter cache max
+            // pos for this seq) + 1. Prompt-cache reuse breaks that invariant: the
+            // target can restore a cached prefix without re-decoding it, so the
+            // tokens generated at the tail of the previous task were never fed
+            // back through the target and process() never captured their tap
+            // features -- the drafter cache stays behind n_cache with an
+            // unfillable gap in between. When the cache and our bookkeeping
+            // disagree, drop the stale drafter sequence so this round rebuilds
+            // context from the freshly staged rows against an empty cache (the
+            // allocator skips the continuity check for an empty sequence, and the
+            // cache regrows as generation proceeds).
+            const llama_pos cache_pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_dft), seq_id);
+            if (cache_pos_max + 1 != (llama_pos) L) {
+                LOG_WRN("%s: seq %d drafter cache ends at %d but staged context starts at %lld -- "
+                        "dropping the stale drafter sequence to resync (prompt-reuse gap)\n",
+                        __func__, (int) seq_id, (int) cache_pos_max, (long long) L);
+                llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, -1, -1);
+            }
+
             // dspark conditions the draft block on the whole staged context in a
             // single non-causal decode, which llama.cpp bounds by n_ubatch. When
             // the context is larger than one ubatch, prefill it into the drafter
