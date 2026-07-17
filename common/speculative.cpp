@@ -1573,6 +1573,15 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
         auto * ctx_dft = params.ctx_dft;
         const int64_t n_ubatch_max = (int64_t) llama_n_ubatch(ctx_dft);
 
+        // opt-in draft-internal attribution (LLAMA_DSPARK_PROFILE): splits the
+        // per-draft cost into the ctx_dft decode (feature H2D + forward + fused
+        // resample) vs the on-device draft-id drain sync, and tracks the ctx_len
+        // shape spread (constant shape => the per-key CUDA graph cache reuses;
+        // wide spread => padding to a constant n_tokens could help).
+        static const bool prof = getenv("LLAMA_DSPARK_PROFILE") != nullptr;
+        static int64_t prof_decode_us = 0, prof_drain_us = 0, prof_n = 0;
+        static int64_t prof_ctxlen_sum = 0, prof_ctxlen_min = INT64_MAX, prof_ctxlen_max = 0;
+
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             auto & dp = dparams[seq_id];
             if (!dp.drafting) {
@@ -1678,7 +1687,9 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
                     common_batch_add(batch, mask_token_id, (llama_pos)(cend + k), { seq_id }, /* logits = */ block_logits);
                 }
 
+                const int64_t prof_t_dec = prof ? ggml_time_us() : 0;
                 const int32_t rc = llama_decode(ctx_dft, batch);
+                if (prof) { prof_decode_us += ggml_time_us() - prof_t_dec; }
 
                 // always clear the staged ctx immediately after use, success or not.
                 llama_set_dspark_ctx(ctx_dft, nullptr, 0, 0);
@@ -1724,6 +1735,19 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
             pos.clear();
             rows_since_accept[seq_id] = 0; // this round's rows were just consumed
 
+            if (prof) {
+                prof_ctxlen_sum += ctx_len;
+                if (ctx_len < prof_ctxlen_min) { prof_ctxlen_min = ctx_len; }
+                if (ctx_len > prof_ctxlen_max) { prof_ctxlen_max = ctx_len; }
+                if (++prof_n % 64 == 0) {
+                    LOG_INF("[dspark-prof/draft] per draft avg: decode=%.2fms drain_sync=%.2fms | ctx_len avg=%.2f min=%lld max=%lld (n=%lld)\n",
+                            (double) prof_decode_us / (double) prof_n / 1000.0,
+                            (double) prof_drain_us  / (double) prof_n / 1000.0,
+                            (double) prof_ctxlen_sum / (double) prof_n,
+                            (long long) prof_ctxlen_min, (long long) prof_ctxlen_max, (long long) prof_n);
+                }
+            }
+
             // --- in-graph markov resample fast path -----------------------
             // When the drafter fused the whole block_size sequential resample
             // into its decode graph (vanilla markov head + the default
@@ -1735,7 +1759,9 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
             // host/CUDA resample below.
             {
                 int32_t n_draft_ids = 0;
+                const int64_t prof_t_drn = prof ? ggml_time_us() : 0;
                 const int32_t * draft_ids = llama_get_dspark_draft_ids(ctx_dft, &n_draft_ids);
+                if (prof) { prof_drain_us += ggml_time_us() - prof_t_drn; }
                 if (draft_ids != nullptr && n_draft_ids >= block_size) {
                     // A resample can legitimately emit mask_token_id (a real vocab
                     // id) at a chained position; that only yields a poor draft the

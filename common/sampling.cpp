@@ -121,6 +121,9 @@ struct common_sampler {
 
     llama_token_data_array cur_p;
 
+    // scratch logit buffer for optional host-side top-K pre-truncation (set_logits)
+    std::vector<float> topk_scratch;
+
     void reset() {
         prev.clear();
 
@@ -152,9 +155,57 @@ struct common_sampler {
         } else {
             const auto * logits = llama_get_logits_ith(ctx, idx);
             GGML_ASSERT(logits != nullptr);
-            cur.resize(n_vocab);
-            for (llama_token token_id = 0; token_id < n_vocab; token_id++) {
-                cur[token_id] = llama_token_data{token_id, logits[token_id], 0.0f};
+
+            // Optional host-side top-K pre-truncation before the sampler chain.
+            // The chain used for verification is monotone-shrinking: penalties
+            // (DRY/repeat/freq/presence) only DECREASE logits and top_k/top_p/min_p/
+            // typical/top_n_sigma only REMOVE candidates - none can promote a token.
+            // So selecting the top-K by raw logit first yields an identical result as
+            // long as K exceeds any downstream keep count. Off by default. Skipped when
+            // a grammar is active (rejection resampling needs the full vocab), when
+            // reordering/expanding samplers are in use (xtc, mirostat), or when more
+            // probabilities than K are requested (n_probs).
+            static const int verify_topk = []() {
+                const char * s = getenv("LLAMA_DSPARK_VERIFY_TOPK");
+                return s ? atoi(s) : 0;
+            }();
+
+            // Requires an explicit top_k bound <= K: top_k selects the highest-logit
+            // tokens, which are guaranteed to be inside the top-K, so the final
+            // candidate set is identical. Without a top_k bound, top_p/min_p could
+            // keep a nucleus larger than K and truncation would change the result.
+            const bool can_truncate =
+                verify_topk > 0 &&
+                verify_topk < n_vocab &&
+                grmr == nullptr &&
+                params.mirostat == 0 &&
+                params.xtc_probability <= 0.0f &&
+                params.n_probs <= verify_topk &&
+                params.top_k > 0 &&
+                verify_topk >= params.top_k;
+
+            if (can_truncate) {
+                const int k = verify_topk;
+                // Cache-friendly top-K: find the k-th largest logit as a threshold on a
+                // sequential copy (no per-element indirection), then collect in one pass.
+                // Boundary ties may yield slightly more than k entries, which is harmless
+                // (they rank far below the downstream top_k and cannot be selected).
+                topk_scratch.assign(logits, logits + n_vocab);
+                std::nth_element(topk_scratch.begin(), topk_scratch.begin() + (k - 1), topk_scratch.end(),
+                        [](float a, float b) { return a > b; });
+                const float thresh = topk_scratch[k - 1];
+                cur.clear();
+                cur.reserve(k + 16);
+                for (int t = 0; t < n_vocab; t++) {
+                    if (logits[t] >= thresh) {
+                        cur.push_back(llama_token_data{ t, logits[t], 0.0f });
+                    }
+                }
+            } else {
+                cur.resize(n_vocab);
+                for (llama_token token_id = 0; token_id < n_vocab; token_id++) {
+                    cur[token_id] = llama_token_data{token_id, logits[token_id], 0.0f};
+                }
             }
         }
 
@@ -547,7 +598,16 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     auto & chain = gsmpl->chain;
     auto & cur_p = gsmpl->cur_p; // initialized by set_logits
 
+    static const bool prof = getenv("LLAMA_DSPARK_PROFILE") != nullptr;
+    static int64_t prof_setlogits_us = 0;
+    static int64_t prof_chain_us     = 0;
+    static int64_t prof_cur_sum      = 0;
+    static int64_t prof_n            = 0;
+    const int64_t prof_t0 = prof ? ggml_time_us() : 0;
+
     gsmpl->set_logits(ctx, idx);
+
+    const int64_t prof_t1 = prof ? ggml_time_us() : 0;
 
     // Check if a backend sampler has already sampled a token in which case we
     // return that token id directly.
@@ -581,6 +641,19 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     llama_sampler_apply(chain, &cur_p);
 
     id = cur_p.data[cur_p.selected].id;
+
+    if (prof) {
+        const int64_t prof_t2 = ggml_time_us();
+        prof_setlogits_us += prof_t1 - prof_t0;
+        prof_chain_us     += prof_t2 - prof_t1;
+        prof_cur_sum      += (int64_t) cur_p.size;
+        if (++prof_n % 512 == 0) {
+            LOG_INF("[dspark-prof/sample] per sample avg: set_logits=%.3fms chain=%.3fms | cur avg=%lld (n=%lld)\n",
+                    (double) prof_setlogits_us / prof_n / 1e3,
+                    (double) prof_chain_us     / prof_n / 1e3,
+                    (long long) (prof_cur_sum / prof_n), (long long) prof_n);
+        }
+    }
 
     if (grammar_first || !grammar_should_apply(gsmpl)) {
         return id;
