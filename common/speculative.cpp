@@ -1581,6 +1581,12 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
         static const bool prof = getenv("LLAMA_DSPARK_PROFILE") != nullptr;
         static int64_t prof_decode_us = 0, prof_drain_us = 0, prof_n = 0;
         static int64_t prof_ctxlen_sum = 0, prof_ctxlen_min = INT64_MAX, prof_ctxlen_max = 0;
+        // per-decode time bucketed by batch n_tokens: reveals whether the ctx_dft
+        // decode is overhead-bound (flat vs n_tokens => padding to a constant shape
+        // for CUDA-graph reuse would help) or compute-bound (scales with n_tokens).
+        static const int PROF_HIST_CAP = 64;
+        static int64_t prof_hist_us[PROF_HIST_CAP] = {0};
+        static int64_t prof_hist_n [PROF_HIST_CAP] = {0};
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             auto & dp = dparams[seq_id];
@@ -1689,7 +1695,13 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
 
                 const int64_t prof_t_dec = prof ? ggml_time_us() : 0;
                 const int32_t rc = llama_decode(ctx_dft, batch);
-                if (prof) { prof_decode_us += ggml_time_us() - prof_t_dec; }
+                if (prof) {
+                    const int64_t dec_us = ggml_time_us() - prof_t_dec;
+                    prof_decode_us += dec_us;
+                    const int b = batch.n_tokens < PROF_HIST_CAP ? batch.n_tokens : PROF_HIST_CAP - 1;
+                    prof_hist_us[b] += dec_us;
+                    prof_hist_n [b] += 1;
+                }
 
                 // always clear the staged ctx immediately after use, success or not.
                 llama_set_dspark_ctx(ctx_dft, nullptr, 0, 0);
@@ -1745,6 +1757,17 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
                             (double) prof_drain_us  / (double) prof_n / 1000.0,
                             (double) prof_ctxlen_sum / (double) prof_n,
                             (long long) prof_ctxlen_min, (long long) prof_ctxlen_max, (long long) prof_n);
+
+                    std::string hist;
+                    char buf[64];
+                    for (int b = 0; b < PROF_HIST_CAP; ++b) {
+                        if (prof_hist_n[b] == 0) { continue; }
+                        snprintf(buf, sizeof(buf), " n_tok=%d:%.2fms(x%lld)", b,
+                                (double) prof_hist_us[b] / (double) prof_hist_n[b] / 1000.0,
+                                (long long) prof_hist_n[b]);
+                        hist += buf;
+                    }
+                    LOG_INF("[dspark-prof/draft] decode by batch n_tokens:%s\n", hist.c_str());
                 }
             }
 
