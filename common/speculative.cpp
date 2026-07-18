@@ -1321,6 +1321,13 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
     // regardless of who proposed a given round's tokens.
     std::vector<int64_t> rows_since_accept;
 
+    // true from reset() until the first draft()/accept() of a generation, i.e.
+    // while a prompt is being prefilled. During that window every buffered row
+    // is a committed prompt token, so maybe_flush_prefill_ctx() can safely drain
+    // the front of ctx_feat into the drafter cache without racing the rollback
+    // window accept() may trim (that window only exists once generation starts).
+    std::vector<bool> prefilling;
+
     // process()'s per-seq contiguous-range bookkeeping (mirrors draft-mtp).
     std::vector<int32_t> i_batch_beg;
     std::vector<int32_t> i_batch_end;
@@ -1434,6 +1441,7 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
         ctx_feat.assign(n_seq, {});
         ctx_pos.assign(n_seq, {});
         rows_since_accept.assign(n_seq, 0);
+        prefilling.assign(n_seq, false);
         i_batch_beg.assign(n_seq, -1);
         i_batch_end.assign(n_seq, -1);
     }
@@ -1470,8 +1478,106 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
         ctx_feat[seq_id].clear();
         ctx_pos[seq_id].clear();
         rows_since_accept[seq_id] = 0;
+        prefilling[seq_id] = true;
 
         llama_memory_seq_rm(llama_get_memory(params.ctx_dft), seq_id, n_keep, -1);
+    }
+
+    // Append `chunk` context rows (row-major tap features at feat_ptr, absolute
+    // positions [cbeg, cbeg+chunk)) to the drafter KV cache, then crop away the
+    // throwaway draft block the graph requires. Mirrors draft()'s per-chunk
+    // context write; returns false if the decode or the tail crop fails.
+    bool write_ctx_chunk(llama_seq_id seq_id, const float * feat_ptr, int64_t chunk, int64_t cbeg) {
+        auto * ctx_dft = params.ctx_dft;
+        const int64_t cend = cbeg + chunk;
+
+        llama_set_dspark_ctx(ctx_dft, feat_ptr, chunk, n_embd_cap);
+
+        common_batch_clear(batch);
+        for (int64_t i = 0; i < chunk; ++i) {
+            common_batch_add(batch, /* token = */ 0, (llama_pos)(cbeg + i), { seq_id }, /* logits = */ false);
+        }
+        // throwaway block: the graph needs >= 1 draft row, but it is cropped
+        // right after and context rows never query it, so token ids and logits
+        // are irrelevant.
+        common_batch_add(batch, /* token = */ 0, (llama_pos) cend, { seq_id }, /* logits = */ false);
+        for (int32_t k = 1; k < block_size; ++k) {
+            common_batch_add(batch, mask_token_id, (llama_pos)(cend + k), { seq_id }, /* logits = */ false);
+        }
+
+        const int32_t rc = llama_decode(ctx_dft, batch);
+        llama_set_dspark_ctx(ctx_dft, nullptr, 0, 0);
+        if (rc != 0) {
+            LOG_WRN("%s: llama_decode(ctx_dft) failed rc=%d for seq %d at ctx pos %lld\n",
+                    __func__, rc, (int) seq_id, (long long) cbeg);
+            return false;
+        }
+        return llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, (llama_pos) cend, -1);
+    }
+
+    // Bound host memory during a long prompt prefill: incrementally write
+    // already-committed context rows into the drafter KV cache instead of
+    // letting process() pile the whole prompt's tap features up in ctx_feat
+    // (n_embd_cap floats per row) until the first draft() drains them -- that
+    // buffer alone is ~n_embd_cap*4 bytes per prompt token and OOM-kills the
+    // server well before a 100k+ context. The rows written here are identical
+    // to what draft()'s non-final chunks write later (context rows issue no
+    // query; their K/V is a pure function of their own tap features), so
+    // draining them early is equivalent to one big prefill. Guarded by
+    // prefilling[]: only runs before the first draft()/accept(), where every
+    // buffered row is a committed prompt token and none can be rolled back.
+    void maybe_flush_prefill_ctx(llama_seq_id seq_id) {
+        if (!prefilling[seq_id]) {
+            return;
+        }
+
+        auto & feat = ctx_feat[seq_id];
+        auto & pos  = ctx_pos[seq_id];
+
+        auto * ctx_dft = params.ctx_dft;
+        const int64_t ctx_per_chunk = (int64_t) llama_n_ubatch(ctx_dft) - block_size;
+        if (ctx_per_chunk < 1) {
+            return; // draft() reports this fatal config; nothing to drain here
+        }
+
+        // keep the host buffer within ~2 chunks; leave a one-chunk tail so the
+        // remaining rows still form a valid in-order range for the first draft().
+        const int64_t trigger = 2 * ctx_per_chunk;
+        if ((int64_t) pos.size() <= trigger) {
+            return;
+        }
+        int64_t n_drain = (int64_t) pos.size() - ctx_per_chunk;
+        n_drain -= n_drain % ctx_per_chunk; // whole chunks only
+        if (n_drain <= 0) {
+            return;
+        }
+
+        // throwaway blocks are cropped and never queried by context rows, so the
+        // anchor is irrelevant; pin it to 0 for determinism.
+        llama_set_dspark_anchor(ctx_dft, 0);
+        for (int64_t off = 0; off < n_drain; off += ctx_per_chunk) {
+            const int64_t chunk = std::min<int64_t>(ctx_per_chunk, n_drain - off);
+            if (!write_ctx_chunk(seq_id, feat.data() + (size_t) off * (size_t) n_embd_cap,
+                        chunk, n_cache[seq_id])) {
+                // mirror draft()'s deterministic recovery: wipe the drafter
+                // sequence and staged rows so generation still proceeds (dspark
+                // just under-drafts this prompt) instead of desyncing the cache.
+                llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, -1, -1);
+                n_cache[seq_id] = 0;
+                feat.clear();
+                pos.clear();
+                rows_since_accept[seq_id] = 0;
+                prefilling[seq_id] = false;
+                return;
+            }
+            n_cache[seq_id] += chunk;
+        }
+
+        // drop the drained front rows; the remaining tail keeps pos.front() ==
+        // n_cache and pos.back() unchanged, exactly what draft() asserts.
+        feat.erase(feat.begin(), feat.begin() + (size_t) n_drain * (size_t) n_embd_cap);
+        pos.erase(pos.begin(), pos.begin() + (size_t) n_drain);
+        rows_since_accept[seq_id] = std::max<int64_t>(0, rows_since_accept[seq_id] - n_drain);
     }
 
     bool process(const llama_batch & batch_in) override {
@@ -1564,6 +1670,10 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
             }
 
             rows_since_accept[seq_id] += n_rows;
+
+            // drain committed prompt rows into the drafter cache as they arrive,
+            // so the host ctx_feat buffer stays bounded on long contexts.
+            maybe_flush_prefill_ctx(seq_id);
         }
 
         return true;
@@ -1593,6 +1703,11 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
             if (!dp.drafting) {
                 continue;
             }
+
+            // generation has started for this seq: prompt prefill is over, so no
+            // more prefill-time draining (its committed-rows-only invariant no
+            // longer holds once accept() can roll back the verify tail).
+            prefilling[seq_id] = false;
 
             auto & feat = ctx_feat[seq_id];
             auto & pos  = ctx_pos[seq_id];
@@ -1956,6 +2071,10 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
             return;
         }
+
+        // an accept() means the target has verified a generation round: prefill
+        // is definitively over, so prefill-time draining must stay disabled.
+        prefilling[seq_id] = false;
 
         const int64_t n_round_rows = rows_since_accept[seq_id];
         rows_since_accept[seq_id] = 0;
